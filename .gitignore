@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.zip
+
+# Local source references used while building this integration.
+upstream-hass-localtuya/
+upstream-tuya-local/
+
+# Home Assistant local/runtime files.
+.storage/
+deps/
+home-assistant.log*
+known_devices.yaml
+secrets.yaml

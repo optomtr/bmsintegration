@@ -1,0 +1,13 @@
+{
+  "domain": "bms_integration",
+  "name": "BMS Integration",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/xZetsubou/hass-localtuya/",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/xZetsubou/hass-localtuya/issues",
+  "requirements": [],
+  "version": "2025.11.0-bms.1"
+}
