@@ -13,7 +13,7 @@ from homeassistant.util.yaml import load_yaml, dump
 from homeassistant.const import CONF_PLATFORM, CONF_ENTITIES
 
 
-import custom_components.localtuya.templates as templates_dir
+from .. import templates as templates_dir
 
 JSON_TYPE = list | dict | str
 
