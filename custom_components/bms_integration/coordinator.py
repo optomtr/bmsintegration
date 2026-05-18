@@ -3,9 +3,10 @@
 from __future__ import annotations
 import asyncio
 import errno
+import json
 import logging
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, NamedTuple
 
 
@@ -49,6 +50,7 @@ RECONNECT_INTERVAL = timedelta(seconds=5)
 # filters Wi-Fi micro-outages from HA history without hiding longer outages.
 AVAILABILITY_GRACE_PERIOD = 120
 RECONNECT_BACKOFF_SECONDS = (1, 2, 5, 10, 20, 30, 60)
+AVAILABILITY_REPORT_FILE = "bms_integration_availability.jsonl"
 # Subdevice: Offline events before disconnecting the device, around 5 minutes
 MIN_OFFLINE_EVENTS = 5 * 60 // HEARTBEAT_INTERVAL
 
@@ -95,6 +97,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._last_update_time = time.monotonic() - 5
         self._last_successful_update_time: float | None = None
         self._disconnect_started_at: float | None = None
+        self._last_disconnect_reason: str | None = None
         self._consecutive_connection_failures = 0
         self._pending_status: dict[str, dict[str, Any]] = {}
 
@@ -175,6 +178,50 @@ class TuyaDevice(TuyaListener, ContextualLogger):
     def add_entities(self, entities):
         """Set the entities associated with this device."""
         self._entities.extend(entities)
+
+    def _availability_report(self, event: str, reason: str = "", **extra):
+        """Write a local availability report entry for troubleshooting."""
+        now = time.monotonic()
+        last_success_age = (
+            round(now - self._last_successful_update_time, 3)
+            if self._last_successful_update_time is not None
+            else None
+        )
+        disconnect_age = (
+            round(now - self._disconnect_started_at, 3)
+            if self._disconnect_started_at is not None
+            else None
+        )
+        payload = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            "reason": str(reason or ""),
+            "device_id": self.id,
+            "name": self._device_config.name,
+            "host": self._device_config.host,
+            "node_id": self._node_id,
+            "gateway_id": self._device_config.device_config.get(CONF_GATEWAY_ID),
+            "is_subdevice": self.is_subdevice,
+            "connected": bool(self.connected),
+            "reconnecting": bool(self.reconnecting),
+            "last_success_age_sec": last_success_age,
+            "disconnect_age_sec": disconnect_age,
+            "connection_failures": self._consecutive_connection_failures,
+            "subdevice_state": str(self.subdevice_state),
+            **extra,
+        }
+        self.hass.async_create_task(self._async_write_availability_report(payload))
+
+    async def _async_write_availability_report(self, payload: dict[str, Any]):
+        """Append an availability report entry to a JSONL file."""
+
+        def _append_report():
+            path = self.hass.config.path(AVAILABILITY_REPORT_FILE)
+            with open(path, "a", encoding="utf-8") as report_file:
+                report_file.write(json.dumps(payload, ensure_ascii=False, default=str))
+                report_file.write("\n")
+
+        await self.hass.async_add_executor_job(_append_report)
 
     async def async_connect(self, _now=None) -> None:
         """Connect to device if not already connected."""
@@ -475,6 +522,11 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 if self.connected:
                     if not self.is_sleep and attempts > 0:
                         self.info(f"Reconnect succeeded on attempt: {attempts}")
+                        self._availability_report(
+                            "reconnect_succeeded",
+                            self._last_disconnect_reason or "",
+                            attempts=attempts,
+                        )
                     break
 
                 if self.is_closing:
@@ -516,6 +568,11 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 return
 
         signal = f"{DOMAIN}_{self._device_config.id}"
+        self._availability_report(
+            "marked_unavailable",
+            exc,
+            grace_period_sec=AVAILABILITY_GRACE_PERIOD,
+        )
         dispatcher_send(self.hass, signal, None)
 
         if self.is_closing:
@@ -634,6 +691,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._last_update_time = time.monotonic()
         self._last_successful_update_time = self._last_update_time
         self._disconnect_started_at = None
+        self._last_disconnect_reason = None
         self._consecutive_connection_failures = 0
         if self._task_shutdown_entities is not None:
             self._task_shutdown_entities.cancel()
@@ -650,6 +708,8 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._interface = None
         if self._disconnect_started_at is None:
             self._disconnect_started_at = time.monotonic()
+            self._last_disconnect_reason = str(exc or "Connection lost")
+            self._availability_report("disconnect_detected", exc)
 
         if self._unsub_refresh:
             self._unsub_refresh()

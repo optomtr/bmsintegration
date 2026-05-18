@@ -140,6 +140,7 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
         self._device_config = DeviceConfig(device_config)
         self._config = get_entity_config(device_config, dp_id)
         self._dp_id = dp_id
+        self._tracked_dp_ids = self._collect_tracked_dp_ids()
         self._status = {}
         self._state = None
         self._last_state = None
@@ -159,6 +160,16 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
         self.set_logger(logger, dev.id, dev.enable_debug, dev.name)
         self.debug(f"Initialized {self._config.get(CONF_PLATFORM)} [{self.name}]")
 
+    def _collect_tracked_dp_ids(self) -> set[str]:
+        """Return datapoints that can affect this entity state or attributes."""
+        tracked = {str(self._dp_id)}
+        for value in self._config.values():
+            if isinstance(value, int):
+                tracked.add(str(value))
+            elif isinstance(value, str) and value.isdigit():
+                tracked.add(value)
+        return tracked
+
     async def async_added_to_hass(self):
         """Subscribe localtuya events."""
         await super().async_added_to_hass()
@@ -172,15 +183,31 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
 
         def _update_handler(status: dict | None):
             """Update entity state when status was updated."""
-            last_status = self._status.copy()
+            old_status = self._status.copy()
+            was_loaded = self._loaded
+            changed_dps = set()
 
-            self._status = {} if status is None else {**self._status, **status}
+            if status is None:
+                self._status = {}
+            else:
+                missing = object()
+                for dp_id, value in status.items():
+                    old_value = old_status.get(dp_id, old_status.get(str(dp_id), missing))
+                    if old_value != value:
+                        changed_dps.add(str(dp_id))
+                self._status = {**self._status, **status}
 
             if not self._loaded:
                 self._loaded = True
                 self.connection_made()
 
-            if status != last_status:
+            should_update = (
+                status is None
+                or not was_loaded
+                or bool(changed_dps & self._tracked_dp_ids)
+            )
+
+            if should_update:
                 if status:
                     self.status_updated()
 

@@ -7,6 +7,7 @@ Custom Home Assistant integration branded for BMS Smart Home. It is based on `xZ
 - Local Tuya control for Wi-Fi devices and Tuya hub sub-devices.
 - BMS Smart Home branding and Home Assistant integration metadata.
 - Anti-flap availability handling for short Wi-Fi or hub reconnects.
+- Availability diagnostics are written to `/config/bms_integration_availability.jsonl`.
 - Local reconnect backoff to reduce noisy unavailable/available history entries.
 - Cloud-assisted setup support inherited from LocalTuya.
 
@@ -41,6 +42,16 @@ After publishing this repository, add its GitHub URL to HACS as a custom reposit
 Add one Tuya hub and several sub-devices through `BMS Integration`. Then briefly interrupt Wi-Fi or hub connectivity for less than 120 seconds. Entities should keep their last known state instead of producing one-second `unavailable` entries in history.
 
 If a device is truly offline for more than 120 seconds, it should still become unavailable.
+
+## Availability Diagnostics
+
+When a device disconnects, reconnects, or is finally marked unavailable after the grace period, BMS Integration appends a JSON line to:
+
+```text
+/config/bms_integration_availability.jsonl
+```
+
+Each entry includes the UTC timestamp, device id/name, host, node id, gateway id, disconnect reason, disconnect duration, reconnect attempts, and whether the device was a Tuya hub sub-device. Use this file to compare Home Assistant availability events with router/Wi-Fi logs.
 
 ## License
 
