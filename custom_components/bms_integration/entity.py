@@ -170,6 +170,20 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
                 tracked.add(value)
         return tracked
 
+    def _primary_state_signature(self) -> tuple:
+        """Return the state parts that should create a HA history entry."""
+        attrs = (
+            "_state",
+            "_attr_is_on",
+            "_attr_native_value",
+            "_attr_current_option",
+            "_attr_current_operation",
+            "_attr_hvac_mode",
+            "_attr_percentage",
+            "_attr_current_cover_position",
+        )
+        return tuple((attr, getattr(self, attr, None)) for attr in attrs if hasattr(self, attr))
+
     async def async_added_to_hass(self):
         """Subscribe localtuya events."""
         await super().async_added_to_hass()
@@ -185,6 +199,8 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
             """Update entity state when status was updated."""
             old_status = self._status.copy()
             was_loaded = self._loaded
+            old_available = self.available
+            old_primary_state = self._primary_state_signature()
             changed_dps = set()
 
             if status is None:
@@ -211,7 +227,17 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
                 if status:
                     self.status_updated()
 
-                self.schedule_update_ha_state()
+                primary_state_changed = (
+                    old_available != self.available
+                    or old_primary_state != self._primary_state_signature()
+                )
+                if status is None or not was_loaded or primary_state_changed:
+                    self.schedule_update_ha_state()
+                else:
+                    self.debug(
+                        f"Suppressing duplicate HA update for {self.name}; "
+                        f"changed DPS {sorted(changed_dps)} did not change primary state"
+                    )
 
         signal = f"{DOMAIN}_{self._device_config.id}"
 
