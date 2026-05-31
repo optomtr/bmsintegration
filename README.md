@@ -1,6 +1,6 @@
 # BMS Integration
 
-Custom Home Assistant integration branded for BMS Smart Home. It is based on `xZetsubou/hass-localtuya`, with a more tolerant availability model inspired by the behavior goal of `make-all/tuya-local`.
+Custom Home Assistant integration branded for BMS Smart Home, focused on stable local Tuya device control.
 
 ## Features
 
@@ -10,18 +10,18 @@ Custom Home Assistant integration branded for BMS Smart Home. It is based on `xZ
 - Availability diagnostics are written to `/config/bms_integration_availability.jsonl`.
 - Local reconnect backoff to reduce noisy unavailable/available history entries.
 - Gate/garage cover support with a separate open/closed sensor DP.
-- Cloud-assisted setup support inherited from LocalTuya.
+- Cloud-assisted setup support.
 
 ## What changed
 
-- Integration domain is `bms_integration`, so it can live next to the original `localtuya`.
+- Integration domain is `bms_integration`.
 - BMS Smart Home brand assets are included under `brand/`.
 - Entity availability no longer drops immediately on a short socket/Wi-Fi disconnect.
 - Devices enter a reconnecting grace window for 120 seconds before entities are marked unavailable.
 - Successful status updates cancel pending shutdown/unavailable tasks.
 - Reconnect attempts use a softer backoff: 1, 2, 5, 10, 20, 30, then 60 seconds.
-- Cover entities can use a dedicated gate sensor DP, similar to `tuya-local` gate profiles.
-- Dispatcher signals and remote storage/service domain were moved away from `localtuya` to avoid conflicts.
+- Cover entities can use a dedicated gate sensor DP.
+- Dispatcher signals and remote storage/service domain use the BMS Integration domain.
 
 ## Install
 
@@ -63,4 +63,4 @@ Each entry includes the UTC timestamp, device id/name, host, node id, gateway id
 
 ## License
 
-This integration is derived from `xZetsubou/hass-localtuya`, which is GPL-3.0 licensed. This repository is distributed under GPL-3.0 as well.
+This repository is distributed under GPL-3.0.

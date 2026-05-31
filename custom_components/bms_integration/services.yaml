@@ -1,6 +1,6 @@
 reload:
   name: "Reload"
-  description: Reload localtuya and reconnect to all devices.
+  description: Reload BMS Integration and reconnect to all devices.
 
 set_dp:
   name: "Set DP Value"

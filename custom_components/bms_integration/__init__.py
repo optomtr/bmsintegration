@@ -374,7 +374,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         _LOGGER.debug(
             "%s: Connecting %s during %s", entry.title, dev.friendly_name, reason
         )
-        dev._availability_report(reason)
+        if reason != "startup_connect":
+            dev._availability_report(reason)
         await dev.async_connect()
 
     for index, dev in enumerate(connect_to_devices):

@@ -29,15 +29,15 @@
 # --[ Keep in mind there is no valid check atm ]
 
 # - 2nd is to export ur device file from config flow. [ Recommended ]:
-# -- in HA Dashboard go to [ Devices -> localtuya -> Configure -> Edit Device * choose the device u want to export
+# -- in HA Dashboard go to [ Devices -> BMS Integration -> Configure -> Edit Device * choose the device u want to export
 # --- Export the device config then submit]
 
 # Templates DIR:
-#   the configs will be exported in [custom_components/localtuya/templates]
+#   the configs will be exported in [custom_components/bms_integration/templates]
 
 # How to import:
 # -- When u add new device when the form [ Pick Entity type selection ]
 # --- Import template Form will show up showing available templates in templates folder.
 
-# -- templates in [custom_components/localtuya/templates]
+# -- templates in [custom_components/bms_integration/templates]
 # -- Templates files will load up with HA so adding files will require restarting HA to show up.
