@@ -9,6 +9,7 @@ Custom Home Assistant integration branded for BMS Smart Home. It is based on `xZ
 - Anti-flap availability handling for short Wi-Fi or hub reconnects.
 - Availability diagnostics are written to `/config/bms_integration_availability.jsonl`.
 - Local reconnect backoff to reduce noisy unavailable/available history entries.
+- Gate/garage cover support with a separate open/closed sensor DP.
 - Cloud-assisted setup support inherited from LocalTuya.
 
 ## What changed
@@ -19,6 +20,7 @@ Custom Home Assistant integration branded for BMS Smart Home. It is based on `xZ
 - Devices enter a reconnecting grace window for 120 seconds before entities are marked unavailable.
 - Successful status updates cancel pending shutdown/unavailable tasks.
 - Reconnect attempts use a softer backoff: 1, 2, 5, 10, 20, 30, then 60 seconds.
+- Cover entities can use a dedicated gate sensor DP, similar to `tuya-local` gate profiles.
 - Dispatcher signals and remote storage/service domain were moved away from `localtuya` to avoid conflicts.
 
 ## Install
@@ -42,6 +44,12 @@ After publishing this repository, add its GitHub URL to HACS as a custom reposit
 Add one Tuya hub and several sub-devices through `BMS Integration`. Then briefly interrupt Wi-Fi or hub connectivity for less than 120 seconds. Entities should keep their last known state instead of producing one-second `unavailable` entries in history.
 
 If a device is truly offline for more than 120 seconds, it should still become unavailable.
+
+## Gate/Garage Covers
+
+For gate relays that have a separate open/closed sensor DP, configure the entity as a cover and set `Gate open/closed sensor DP` to the sensor DP. By default, `true` means open and `false` means closed, matching common Tuya gate sensors. If your device uses text values, set `Gate sensor/action value for open` and `Gate sensor/action value for closed` accordingly.
+
+If the device also exposes a movement/action DP, set `Gate movement/action DP`. The default movement values are `opening` and `closing`.
 
 ## Availability Diagnostics
 

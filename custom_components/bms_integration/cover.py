@@ -19,6 +19,12 @@ from .entity import LocalTuyaEntity, async_setup_entry
 from .const import (
     CONF_COMMANDS_SET,
     CONF_CURRENT_POSITION_DP,
+    CONF_GATE_ACTION_DP,
+    CONF_GATE_CLOSED_STATE,
+    CONF_GATE_CLOSING_STATE,
+    CONF_GATE_OPEN_STATE,
+    CONF_GATE_OPENING_STATE,
+    CONF_GATE_STATE_DP,
     CONF_POSITION_INVERTED,
     CONF_POSITIONING_MODE,
     CONF_SET_POSITION_DP,
@@ -62,6 +68,10 @@ COVER_TIMEOUT_TOLERANCE = 3.0
 DEF_CMD_SET = list(COVER_COMMANDS.values())[0]
 DEF_POS_MODE = list(COVER_MODES.values())[0]
 DEFAULT_SPAN_TIME = 25.0
+DEFAULT_GATE_OPEN_STATE = "true"
+DEFAULT_GATE_CLOSED_STATE = "false"
+DEFAULT_GATE_OPENING_STATE = "opening"
+DEFAULT_GATE_CLOSING_STATE = "closing"
 
 
 def flow_schema(dps):
@@ -75,6 +85,12 @@ def flow_schema(dps):
         ),
         vol.Optional(CONF_CURRENT_POSITION_DP): col_to_select(dps, is_dps=True),
         vol.Optional(CONF_SET_POSITION_DP): col_to_select(dps, is_dps=True),
+        vol.Optional(CONF_GATE_STATE_DP): col_to_select(dps, is_dps=True),
+        vol.Optional(CONF_GATE_ACTION_DP): col_to_select(dps, is_dps=True),
+        vol.Optional(CONF_GATE_OPEN_STATE, default=DEFAULT_GATE_OPEN_STATE): str,
+        vol.Optional(CONF_GATE_CLOSED_STATE, default=DEFAULT_GATE_CLOSED_STATE): str,
+        vol.Optional(CONF_GATE_OPENING_STATE, default=DEFAULT_GATE_OPENING_STATE): str,
+        vol.Optional(CONF_GATE_CLOSING_STATE, default=DEFAULT_GATE_CLOSING_STATE): str,
         vol.Optional(CONF_POSITION_INVERTED, default=False): bool,
         vol.Optional(CONF_SPAN_TIME, default=DEFAULT_SPAN_TIME): vol.All(
             vol.Coerce(float), vol.Range(min=1.0, max=300.0)
@@ -104,7 +120,63 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
         self._set_new_position = int | None
         self._stop_switch = self._config.get(CONF_STOP_SWITCH_DP)
         self._position_inverted = self._config.get(CONF_POSITION_INVERTED)
+        self._gate_state_dp = self._config.get(CONF_GATE_STATE_DP)
+        self._gate_action_dp = self._config.get(CONF_GATE_ACTION_DP)
         self._current_task = None
+
+    @property
+    def _has_gate_state_sensor(self):
+        """Return if this cover has a separate gate open/closed sensor DP."""
+        return self._gate_state_dp is not None
+
+    def _matches_config_value(self, value, config_key):
+        """Compare a raw Tuya value with a configured value."""
+        expected = self._config.get(config_key)
+        if expected is None:
+            return False
+        expected = str(expected).strip().lower()
+        if isinstance(value, bool):
+            return (
+                expected in ("true", "1", "yes", "on", "open")
+                if value
+                else expected
+                in (
+                    "false",
+                    "0",
+                    "no",
+                    "off",
+                    "closed",
+                )
+            )
+        return str(value).strip().lower() == expected
+
+    @property
+    def _gate_sensor_state(self):
+        """Return gate sensor state from the dedicated open/closed DP."""
+        if not self._has_gate_state_sensor:
+            return None
+        value = self.dp_value(CONF_GATE_STATE_DP)
+        if self._matches_config_value(value, CONF_GATE_OPEN_STATE):
+            return "opened"
+        if self._matches_config_value(value, CONF_GATE_CLOSED_STATE):
+            return "closed"
+        return None
+
+    @property
+    def _gate_action_state(self):
+        """Return gate movement state from the dedicated action DP."""
+        if self._gate_action_dp is None:
+            return None
+        value = self.dp_value(CONF_GATE_ACTION_DP)
+        if self._matches_config_value(value, CONF_GATE_OPENING_STATE):
+            return STATE_OPENING
+        if self._matches_config_value(value, CONF_GATE_CLOSING_STATE):
+            return STATE_CLOSING
+        if self._matches_config_value(value, CONF_GATE_OPEN_STATE):
+            return "opened"
+        if self._matches_config_value(value, CONF_GATE_CLOSED_STATE):
+            return "closed"
+        return None
 
     @property
     def supported_features(self):
@@ -119,6 +191,16 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
     @property
     def _current_state(self) -> str:
         """Return the current state of the cover."""
+        if (action_state := self._gate_action_state) in (
+            STATE_OPENING,
+            STATE_CLOSING,
+            "opened",
+            "closed",
+        ):
+            return action_state
+        if (sensor_state := self._gate_sensor_state) in ("opened", "closed"):
+            return STATE_STOPPED
+
         state = self._current_state_action
         curr_pos = self._current_cover_position
 
@@ -138,6 +220,8 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
     @property
     def current_cover_position(self):
         """Return current cover position in percent."""
+        if (sensor_state := self._gate_sensor_state) is not None:
+            return 100 if sensor_state == "opened" else 0
         if self._config[CONF_POSITIONING_MODE] == MODE_NONE:
             return None
         return self._current_cover_position
@@ -145,16 +229,24 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
     @property
     def is_opening(self):
         """Return if cover is opening."""
-        return self._current_state in (STATE_OPENING, STATE_SET_OPENING)
+        state = self._current_state
+        return state in (STATE_OPENING, STATE_SET_OPENING)
 
     @property
     def is_closing(self):
         """Return if cover is closing."""
-        return self._current_state in (STATE_CLOSING, STATE_SET_CLOSING)
+        state = self._current_state
+        return state in (STATE_CLOSING, STATE_SET_CLOSING)
 
     @property
     def is_closed(self):
         """Return if the cover is closed or not."""
+        if (sensor_state := self._gate_sensor_state) is not None:
+            return sensor_state == "closed"
+        if self._gate_action_state == "closed":
+            return True
+        if self._gate_action_state == "opened":
+            return False
         if isinstance(self._open_cmd, bool):
             return self._current_cover_position == 0
         if self._config[CONF_POSITIONING_MODE] == MODE_NONE:
@@ -277,7 +369,28 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
         self._previous_state = self._state
         self._state = self.dp_value(self._dp_id)
 
-        if self.has_config(CONF_CURRENT_POSITION_DP):
+        if self._has_gate_state_sensor:
+            gate_sensor_state = self._gate_sensor_state
+            if gate_sensor_state == "opened":
+                self._current_cover_position = 100
+                self._current_state_action = STATE_STOPPED
+            elif gate_sensor_state == "closed":
+                self._current_cover_position = 0
+                self._current_state_action = STATE_STOPPED
+
+        gate_action_state = self._gate_action_state
+        if gate_action_state == "opened":
+            self._current_cover_position = 100
+            self._current_state_action = STATE_STOPPED
+        elif gate_action_state == "closed":
+            self._current_cover_position = 0
+            self._current_state_action = STATE_STOPPED
+        elif gate_action_state == STATE_OPENING:
+            self._current_state_action = STATE_OPENING
+        elif gate_action_state == STATE_CLOSING:
+            self._current_state_action = STATE_CLOSING
+
+        if self.has_config(CONF_CURRENT_POSITION_DP) and self._gate_sensor_state is None:
             curr_pos = self.dp_value(CONF_CURRENT_POSITION_DP)
             if isinstance(curr_pos, (bool, str)):
                 closed = curr_pos in (True, "fully_close")

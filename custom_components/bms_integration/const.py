@@ -112,6 +112,12 @@ CONF_SET_POSITION_DP = "set_position_dp"
 CONF_STOP_SWITCH_DP = "stop_switch_dp"
 CONF_POSITION_INVERTED = "position_inverted"
 CONF_SPAN_TIME = "span_time"
+CONF_GATE_STATE_DP = "gate_state_dp"
+CONF_GATE_ACTION_DP = "gate_action_dp"
+CONF_GATE_OPEN_STATE = "gate_open_state"
+CONF_GATE_CLOSED_STATE = "gate_closed_state"
+CONF_GATE_OPENING_STATE = "gate_opening_state"
+CONF_GATE_CLOSING_STATE = "gate_closing_state"
 
 # fan
 CONF_FAN_SPEED_CONTROL = "fan_speed_control"
