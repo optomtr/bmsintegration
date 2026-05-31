@@ -49,6 +49,7 @@ RECONNECT_INTERVAL = timedelta(seconds=5)
 # Keep entities available while a device is in a short reconnect window. This
 # filters Wi-Fi micro-outages from HA history without hiding longer outages.
 AVAILABILITY_GRACE_PERIOD = 120
+STARTUP_AVAILABILITY_GRACE_PERIOD = 300
 RECONNECT_BACKOFF_SECONDS = (1, 2, 5, 10, 20, 30, 60)
 AVAILABILITY_REPORT_FILE = "bms_integration_availability.jsonl"
 # Subdevice: Offline events before disconnecting the device, around 5 minutes
@@ -96,6 +97,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         # last_update_time: Sleep timer, a device that reports the status every x seconds then goes into sleep.
         self._last_update_time = time.monotonic() - 5
         self._last_successful_update_time: float | None = None
+        self._startup_started_at: float = time.monotonic()
         self._disconnect_started_at: float | None = None
         self._last_disconnect_reason: str | None = None
         self._consecutive_connection_failures = 0
@@ -143,9 +145,18 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         ) < AVAILABILITY_GRACE_PERIOD
 
     @property
+    def starting(self):
+        """Return if the device is still inside the initial startup grace period."""
+        if self.connected or self.is_closing or self._status:
+            return False
+        return (
+            time.monotonic() - self._startup_started_at
+        ) < STARTUP_AVAILABILITY_GRACE_PERIOD
+
+    @property
     def available(self):
         """Return if entities should still be considered available."""
-        return self.connected or self.reconnecting
+        return self.connected or self.reconnecting or self.starting
 
     @property
     def is_connecting(self):
@@ -204,6 +215,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             "is_subdevice": self.is_subdevice,
             "connected": bool(self.connected),
             "reconnecting": bool(self.reconnecting),
+            "starting": bool(self.starting),
             "last_success_age_sec": last_success_age,
             "disconnect_age_sec": disconnect_age,
             "connection_failures": self._consecutive_connection_failures,

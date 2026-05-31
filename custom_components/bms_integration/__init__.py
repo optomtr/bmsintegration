@@ -27,7 +27,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import Event, HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 
 from .coordinator import TuyaDevice, HassLocalTuyaData, TuyaCloudApi
 from .config_flow import ENTRIES_VERSION
@@ -49,6 +49,9 @@ _LOGGER = logging.getLogger(__name__)
 
 CONF_DP = "dp"
 CONF_VALUE = "value"
+STARTUP_CONNECT_STAGGER_SECONDS = 0.2
+STARTUP_RECOVERY_DELAYS = (30, 90, 180)
+STARTUP_RECOVERY_STAGGER_SECONDS = 0.3
 
 SERVICE_SET_DP = "set_dp"
 SERVICE_SET_DP_SCHEMA = vol.Schema(
@@ -362,9 +365,74 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     # Note: entry.async_on_unload items are called in LIFO order!
 
-    for dev in connect_to_devices:
-        entry.async_create_task(hass, dev.async_connect())
+    async def _delayed_connect(dev: TuyaDevice, delay: float, reason: str):
+        """Connect a device after a small delay to avoid startup storms."""
+        if delay > 0:
+            await asyncio.sleep(delay)
+        if dev.is_closing or dev.connected or dev.is_connecting:
+            return
+        _LOGGER.debug(
+            "%s: Connecting %s during %s", entry.title, dev.friendly_name, reason
+        )
+        dev._availability_report(reason)
+        await dev.async_connect()
+
+    for index, dev in enumerate(connect_to_devices):
+        delay = index * STARTUP_CONNECT_STAGGER_SECONDS
+        entry.async_create_task(
+            hass,
+            _delayed_connect(dev, delay, "startup_connect"),
+            f"{DOMAIN}-startup-connect-{dev.id}",
+        )
         entry.async_on_unload(dev.close)
+
+    def _devices_needing_startup_recovery() -> list[TuyaDevice]:
+        """Return devices that still have no active connection after startup."""
+        pending: list[TuyaDevice] = []
+        seen = set()
+        for dev in hass_localtuya.devices.values():
+            key = (dev.id, dev._node_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            if dev.is_closing or dev.connected or dev.is_connecting:
+                continue
+            if dev.gateway and (not dev.gateway.connected or dev.gateway.is_connecting):
+                continue
+            pending.append(dev)
+        return pending
+
+    async def _startup_recovery(_now=None):
+        """Retry devices that missed their initial state during HA startup."""
+        pending = _devices_needing_startup_recovery()
+        if not pending:
+            return
+
+        _LOGGER.warning(
+            "%s: Startup recovery reconnecting %s BMS device(s) without initial status",
+            entry.title,
+            len(pending),
+        )
+        for index, dev in enumerate(pending):
+            entry.async_create_task(
+                hass,
+                _delayed_connect(
+                    dev,
+                    index * STARTUP_RECOVERY_STAGGER_SECONDS,
+                    "startup_recovery",
+                ),
+                f"{DOMAIN}-startup-recovery-{dev.id}",
+            )
+
+    def _schedule_startup_recovery(_now):
+        entry.async_create_task(
+            hass,
+            _startup_recovery(_now),
+            f"{DOMAIN}-startup-recovery-check",
+        )
+
+    for delay in STARTUP_RECOVERY_DELAYS:
+        entry.async_on_unload(async_call_later(hass, delay, _schedule_startup_recovery))
 
     entry.async_on_unload(entry.add_update_listener(update_listener))
 
