@@ -15,6 +15,9 @@ CONF_CURRENT_POSITION_DP = "current_position_dp"
 CONF_SET_POSITION_DP = "set_position_dp"
 CONF_POSITION_INVERTED = "position_inverted"
 CONF_SPAN_TIME = "span_time"
+CONF_GATE_STATE_DP = "gate_state_dp"
+CONF_GATE_OPEN_STATE = "gate_open_state"
+CONF_GATE_CLOSED_STATE = "gate_closed_state"
 
 
 def localtuya_cover(cmd_set, position_mode=None, inverted=False, timed=25):
@@ -90,22 +93,34 @@ COVERS: dict[str, tuple[LocalTuyaEntity, ...]] = {
         LocalTuyaEntity(
             id=DPCode.SWITCH_1,
             name="Door",
-            custom_configs=localtuya_cover("open_close_stop", "none", True),
-            current_position_dp=DPCode.DOORCONTACT_STATE,
+            custom_configs={
+                **localtuya_cover("open_close_stop", "none", True),
+                CONF_GATE_OPEN_STATE: "true",
+                CONF_GATE_CLOSED_STATE: "false",
+            },
+            gate_state_dp=DPCode.DOORCONTACT_STATE,
             device_class=CoverDeviceClass.GARAGE,
         ),
         LocalTuyaEntity(
             id=DPCode.SWITCH_2,
             name="Door 2",
-            custom_configs=localtuya_cover("open_close_stop", "none", True),
-            current_position_dp=DPCode.DOORCONTACT_STATE_2,
+            custom_configs={
+                **localtuya_cover("open_close_stop", "none", True),
+                CONF_GATE_OPEN_STATE: "true",
+                CONF_GATE_CLOSED_STATE: "false",
+            },
+            gate_state_dp=DPCode.DOORCONTACT_STATE_2,
             device_class=CoverDeviceClass.GARAGE,
         ),
         LocalTuyaEntity(
             id=DPCode.SWITCH_3,
             name="Door 3",
-            custom_configs=localtuya_cover("open_close_stop", "none", True),
-            current_position_dp=DPCode.DOORCONTACT_STATE_3,
+            custom_configs={
+                **localtuya_cover("open_close_stop", "none", True),
+                CONF_GATE_OPEN_STATE: "true",
+                CONF_GATE_CLOSED_STATE: "false",
+            },
+            gate_state_dp=DPCode.DOORCONTACT_STATE_3,
             device_class=CoverDeviceClass.GARAGE,
         ),
     ),
