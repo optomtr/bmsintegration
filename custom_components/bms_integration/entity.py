@@ -5,6 +5,7 @@ from typing import Any, Coroutine, Callable
 
 from homeassistant.core import HomeAssistant, State
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.exceptions import HomeAssistantError
 
 from homeassistant.const import (
     CONF_DEVICES,
@@ -37,6 +38,7 @@ from .const import (
     CONF_DEFAULT_VALUE,
     CONF_ID,
     CONF_NODE_ID,
+    CONF_OPTIMISTIC,
     CONF_PASSIVE_ENTITY,
     CONF_RESTORE_ON_RECONNECT,
     CONF_SCALING,
@@ -457,3 +459,38 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
 
         # Manually initialise
         await self._device.set_dp(restore_state, self._dp_id)
+
+    @property
+    def optimistic(self) -> bool:
+        """Return whether commands should assume success immediately."""
+        return bool(self._config.get(CONF_OPTIMISTIC, False))
+
+    def _apply_optimistic_status(self, status: dict) -> None:
+        """Apply an expected status locally until the real device status arrives."""
+        self._status.update({str(dp): value for dp, value in status.items()})
+        self.status_updated()
+        self.async_write_ha_state()
+
+    async def _send_dps_background(self, status: dict) -> None:
+        """Send DPS in the background and let normal status updates self-correct."""
+        try:
+            await self._device.set_dps(status)
+        except Exception as ex:  # pylint: disable=broad-except
+            self.warning(f"Optimistic command failed: {ex}")
+
+    async def async_set_dps(self, status: dict, optimistic_status: dict | None = None):
+        """Set DPS, optionally returning to Home Assistant optimistically."""
+        if not self.optimistic:
+            await self._device.set_dps(status)
+            return
+
+        if not self._device.connected:
+            raise HomeAssistantError(f"Device {self._device_config.name} is not connected")
+
+        optimistic_status = optimistic_status or status
+        self._apply_optimistic_status(optimistic_status)
+        self.hass.async_create_task(self._send_dps_background(status))
+
+    async def async_set_dp(self, value, dp_id):
+        """Set a single DP, optionally returning to Home Assistant optimistically."""
+        await self.async_set_dps({dp_id: value}, {dp_id: value})

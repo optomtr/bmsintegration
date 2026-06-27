@@ -34,6 +34,7 @@ from .const import (
     CONF_COLOR_TEMP_MIN_KELVIN,
     CONF_COLOR_TEMP_REVERSE,
     CONF_MUSIC_MODE,
+    CONF_OPTIMISTIC,
     CONF_SCENE_VALUES,
     DictSelector,
 )
@@ -199,6 +200,7 @@ def flow_schema(dps):
         vol.Optional(CONF_SCENE): col_to_select(dps, is_dps=True),
         vol.Optional(CONF_SCENE_VALUES, default={}): selector.ObjectSelector(),
         vol.Optional(CONF_MUSIC_MODE, default=False): selector.BooleanSelector(),
+        vol.Optional(CONF_OPTIMISTIC, default=False): selector.BooleanSelector(),
     }
 
 
@@ -614,11 +616,11 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
         if color_mode is not None:
             states[self._config.get(CONF_COLOR_MODE)] = color_mode
 
-        await self._device.set_dps(states)
+        await self.async_set_dps(states)
 
     async def async_turn_off(self, **kwargs):
         """Turn Tuya light off."""
-        await self._device.set_dp(False, self._dp_id)
+        await self.async_set_dp(False, self._dp_id)
 
     def status_updated(self):
         """Device status was updated."""

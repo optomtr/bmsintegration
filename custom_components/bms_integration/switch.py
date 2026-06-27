@@ -22,6 +22,7 @@ from .const import (
     CONF_CURRENT,
     CONF_CURRENT_CONSUMPTION,
     CONF_DEFAULT_VALUE,
+    CONF_OPTIMISTIC,
     CONF_PASSIVE_ENTITY,
     CONF_RESTORE_ON_RECONNECT,
     CONF_VOLTAGE,
@@ -38,6 +39,7 @@ def flow_schema(dps):
         vol.Optional(CONF_VOLTAGE): col_to_select(dps, is_dps=True),
         vol.Required(CONF_RESTORE_ON_RECONNECT): bool,
         vol.Required(CONF_PASSIVE_ENTITY): bool,
+        vol.Optional(CONF_OPTIMISTIC, default=False): bool,
         vol.Optional(CONF_DEFAULT_VALUE): str,
         vol.Optional(CONF_DEVICE_CLASS): col_to_select(
             [sc.value for sc in SwitchDeviceClass]
@@ -88,11 +90,11 @@ class LocalTuyaSwitch(LocalTuyaEntity, SwitchEntity):
 
     async def async_turn_on(self, **kwargs):
         """Turn Tuya switch on."""
-        await self._device.set_dp(True, self._dp_id)
+        await self.async_set_dp(True, self._dp_id)
 
     async def async_turn_off(self, **kwargs):
         """Turn Tuya switch off."""
-        await self._device.set_dp(False, self._dp_id)
+        await self.async_set_dp(False, self._dp_id)
 
     # Default value is the "OFF" state
     def entity_default_value(self):

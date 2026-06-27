@@ -233,6 +233,7 @@
                     "heuristic_action": "(Optional) Enable heuristic action",
                     "dps_default_value": "(Optional) Default value when un-initialised",
                     "restore_on_reconnect": "Restore the last value set in Home Assistant after lost connection?",
+                    "optimistic": "Optimistic command state",
                     "min_value": "Minimum Value",
                     "max_value": "Maximum Value",
                     "step_size": "Minimum increment between numbers",

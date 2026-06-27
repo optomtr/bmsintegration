@@ -78,6 +78,7 @@ CONF_DEFAULT_VALUE = "dps_default_value"
 CONF_RESET_DPIDS = "reset_dpids"
 CONF_PASSIVE_ENTITY = "is_passive_entity"
 CONF_DEVICE_SLEEP_TIME = "device_sleep_time"
+CONF_OPTIMISTIC = "optimistic"
 
 # ALARM
 CONF_ALARM_SUPPORTED_STATES = "alarm_supported_states"
