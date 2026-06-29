@@ -26,6 +26,7 @@ from .const import (
     CONF_PASSIVE_ENTITY,
     CONF_RESTORE_ON_RECONNECT,
     CONF_VOLTAGE,
+    DEFAULT_OPTIMISTIC,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -39,7 +40,7 @@ def flow_schema(dps):
         vol.Optional(CONF_VOLTAGE): col_to_select(dps, is_dps=True),
         vol.Required(CONF_RESTORE_ON_RECONNECT): bool,
         vol.Required(CONF_PASSIVE_ENTITY): bool,
-        vol.Optional(CONF_OPTIMISTIC, default=False): bool,
+        vol.Optional(CONF_OPTIMISTIC, default=DEFAULT_OPTIMISTIC): bool,
         vol.Optional(CONF_DEFAULT_VALUE): str,
         vol.Optional(CONF_DEVICE_CLASS): col_to_select(
             [sc.value for sc in SwitchDeviceClass]

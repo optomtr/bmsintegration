@@ -42,6 +42,7 @@ from .const import (
     CONF_PASSIVE_ENTITY,
     CONF_RESTORE_ON_RECONNECT,
     CONF_SCALING,
+    DEFAULT_OPTIMISTIC,
     DOMAIN,
     RESTORE_STATES,
     DeviceConfig,
@@ -463,7 +464,7 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
     @property
     def optimistic(self) -> bool:
         """Return whether commands should assume success immediately."""
-        return bool(self._config.get(CONF_OPTIMISTIC, False))
+        return bool(self._config.get(CONF_OPTIMISTIC, DEFAULT_OPTIMISTIC))
 
     def _apply_optimistic_status(self, status: dict) -> None:
         """Apply an expected status locally until the real device status arrives."""

@@ -36,6 +36,7 @@ from .const import (
     CONF_MUSIC_MODE,
     CONF_OPTIMISTIC,
     CONF_SCENE_VALUES,
+    DEFAULT_OPTIMISTIC,
     DictSelector,
 )
 
@@ -200,7 +201,7 @@ def flow_schema(dps):
         vol.Optional(CONF_SCENE): col_to_select(dps, is_dps=True),
         vol.Optional(CONF_SCENE_VALUES, default={}): selector.ObjectSelector(),
         vol.Optional(CONF_MUSIC_MODE, default=False): selector.BooleanSelector(),
-        vol.Optional(CONF_OPTIMISTIC, default=False): selector.BooleanSelector(),
+        vol.Optional(CONF_OPTIMISTIC, default=DEFAULT_OPTIMISTIC): selector.BooleanSelector(),
     }
 
 
