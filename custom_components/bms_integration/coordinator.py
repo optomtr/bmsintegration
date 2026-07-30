@@ -52,6 +52,11 @@ AVAILABILITY_GRACE_PERIOD = 120
 STARTUP_AVAILABILITY_GRACE_PERIOD = 300
 RECONNECT_BACKOFF_SECONDS = (1, 2, 5, 10, 20, 30, 60)
 AVAILABILITY_REPORT_FILE = "bms_integration_availability.jsonl"
+# A gateway may leave its TCP socket open after its Zigbee service has stopped.
+# Probe the gateway periodically so that a stale session is re-created instead
+# of leaving its sub-devices apparently available but unable to receive commands.
+GATEWAY_WATCHDOG_INTERVAL = timedelta(seconds=30)
+GATEWAY_WATCHDOG_STAGGER_SECONDS = 0.5
 # Subdevice: Offline events before disconnecting the device, around 5 minutes
 MIN_OFFLINE_EVENTS = 5 * 60 // HEARTBEAT_INTERVAL
 
@@ -107,6 +112,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._task_connect: asyncio.Task | None = None
         self._task_reconnect: asyncio.Task | None = None
         self._task_shutdown_entities: asyncio.Task | None = None
+        self._health_check_lock = asyncio.Lock()
         self._unsub_refresh: CALLBACK_TYPE | None = None
         self._unsub_new_entity: CALLBACK_TYPE | None = None
 
@@ -472,8 +478,13 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 # NOTE: This will override the status if the BLE device fails to receive the signal.
                 if self.is_write_only:
                     self.status_updated(payload)
-            except (TimeoutError, Exception) as ex:
-                self.debug(f"Failed to set values {payload} --> {ex}", force=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:  # pylint: disable=broad-except
+                self.warning(f"Failed to set values {payload} --> {ex}")
+                await self._async_reset_stale_connection(
+                    f"Command failed: {ex}", "command_failed"
+                )
         elif not self.connected:
             self.error(f"Device is not connected.")
 
@@ -505,6 +516,72 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 await self._interface.update_dps(cid=self._node_id)
             except TimeoutError:
                 pass
+
+    async def async_gateway_health_check(self) -> bool:
+        """Verify that a connected gateway can still answer a real status query.
+
+        A TCP transport may remain open even when a gateway's Zigbee service has
+        stopped responding.  The normal socket state would then report connected,
+        but commands to every child device fail until a manual integration reload.
+        """
+        if (
+            self.is_closing
+            or self.is_subdevice
+            or self.is_connecting
+            or self._task_reconnect is not None
+            or not self.connected
+        ):
+            return self.connected
+
+        async with self._health_check_lock:
+            interface = self._interface
+            if (
+                interface is None
+                or interface is not self._interface
+                or not interface.is_connected
+                or self.is_closing
+            ):
+                return False
+
+            try:
+                # Use the same query that validates a freshly connected gateway.
+                # It requires a response, unlike an update-DPS write-only refresh.
+                await interface.status(cid=self._node_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:  # pylint: disable=broad-except
+                reason = f"Gateway watchdog status probe failed: {ex}"
+                self.warning(reason)
+                await self._async_reset_stale_connection(
+                    reason, "gateway_watchdog_failed"
+                )
+                return False
+
+        return True
+
+    async def _async_reset_stale_connection(self, reason: str, event: str) -> None:
+        """Close a stale transport and start the existing reconnect flow."""
+        # Sub-devices share the gateway transport, so only a gateway can reset it.
+        if self.gateway:
+            await self.gateway._async_reset_stale_connection(reason, event)
+            return
+
+        interface = self._interface
+        if interface is None:
+            return
+
+        self._availability_report(event, reason)
+        try:
+            await interface.close()
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # pylint: disable=broad-except
+            self.debug(f"Failed to close stale connection: {ex}", force=True)
+
+        # A transport close normally calls disconnected() asynchronously.  Calling
+        # it here too guarantees that reconnect starts even if that callback is late.
+        if self._interface is interface:
+            self.disconnected(reason)
 
     async def _async_reconnect(self):
         """Task: continuously attempt to reconnect to the device."""

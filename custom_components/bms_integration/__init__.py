@@ -29,7 +29,13 @@ from homeassistant.core import Event, HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_call_later, async_track_time_interval
 
-from .coordinator import TuyaDevice, HassLocalTuyaData, TuyaCloudApi
+from .coordinator import (
+    GATEWAY_WATCHDOG_INTERVAL,
+    GATEWAY_WATCHDOG_STAGGER_SECONDS,
+    HassLocalTuyaData,
+    TuyaCloudApi,
+    TuyaDevice,
+)
 from .config_flow import ENTRIES_VERSION
 from .const import (
     ATTR_UPDATED_AT,
@@ -434,6 +440,54 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     for delay in STARTUP_RECOVERY_DELAYS:
         entry.async_on_unload(async_call_later(hass, delay, _schedule_startup_recovery))
+
+    watchdog_task: asyncio.Task | None = None
+
+    async def _run_gateway_watchdog():
+        """Probe each physical Zigbee gateway without polling every child device."""
+        gateways: list[TuyaDevice] = []
+        seen = set()
+        for dev in hass_localtuya.devices.values():
+            if dev.is_subdevice or not dev.sub_devices or dev.id in seen:
+                continue
+            seen.add(dev.id)
+            gateways.append(dev)
+
+        if not gateways:
+            return
+
+        async def _check_gateway(dev: TuyaDevice, delay: float):
+            if delay:
+                await asyncio.sleep(delay)
+            await dev.async_gateway_health_check()
+
+        await asyncio.gather(
+            *[
+                _check_gateway(dev, index * GATEWAY_WATCHDOG_STAGGER_SECONDS)
+                for index, dev in enumerate(gateways)
+            ],
+            return_exceptions=True,
+        )
+
+    def _schedule_gateway_watchdog(_now):
+        """Do not overlap slow probes from consecutive watchdog intervals."""
+        nonlocal watchdog_task
+        if watchdog_task and not watchdog_task.done():
+            return
+        watchdog_task = entry.async_create_task(
+            hass,
+            _run_gateway_watchdog(),
+            f"{DOMAIN}-gateway-watchdog",
+        )
+
+    def _stop_gateway_watchdog():
+        if watchdog_task and not watchdog_task.done():
+            watchdog_task.cancel()
+
+    entry.async_on_unload(
+        async_track_time_interval(hass, _schedule_gateway_watchdog, GATEWAY_WATCHDOG_INTERVAL)
+    )
+    entry.async_on_unload(_stop_gateway_watchdog)
 
     entry.async_on_unload(entry.add_update_listener(update_listener))
 
