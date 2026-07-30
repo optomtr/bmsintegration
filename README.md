@@ -70,3 +70,12 @@ Use the `bms_integration.update_dps` service to ask a connected device to publis
 ## License
 
 This repository is distributed under GPL-3.0.
+
+## Team Documentation
+
+Shared project documentation for contributors and partners:
+
+- [Project status](docs/PROJECT_STATUS.md)
+- [Contributor onboarding](docs/ONBOARDING.md)
+- [Engineering rules](docs/ENGINEERING_RULES.md)
+- [BMS Control Center design brief](docs/CONTROL_CENTER_BRIEF_RU.md)
