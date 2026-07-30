@@ -9,7 +9,9 @@ Custom Home Assistant integration branded for BMS Smart Home, focused on stable 
 - Anti-flap availability handling for short Wi-Fi or hub reconnects.
 - Availability diagnostics are written to `/config/bms_integration_availability.jsonl`.
 - Local reconnect backoff to reduce noisy unavailable/available history entries.
+- A connected Tuya gateway is actively checked every 30 seconds and reconnects automatically if it stops answering.
 - Gate/garage cover support with a separate open/closed sensor DP.
+- On-demand DP refresh service for supported Tuya devices.
 - Cloud-assisted setup support.
 
 ## What changed
@@ -60,6 +62,10 @@ When a device disconnects, reconnects, or is finally marked unavailable after th
 ```
 
 Each entry includes the UTC timestamp, device id/name, host, node id, gateway id, disconnect reason, disconnect duration, reconnect attempts, and whether the device was a Tuya hub sub-device. Use this file to compare Home Assistant availability events with router/Wi-Fi logs.
+
+## On-Demand DPS Refresh
+
+Use the `bms_integration.update_dps` service to ask a connected device to publish its current datapoint values. The optional `dps` field accepts a list such as `[18, 19, 20]`; omit it to use the device defaults. This is useful for a dashboard or targeted automation, but it does not replace the automatic gateway watchdog.
 
 ## License
 

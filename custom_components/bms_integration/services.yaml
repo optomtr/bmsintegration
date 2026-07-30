@@ -29,6 +29,25 @@ set_dp:
       selector:
         object:
 
+update_dps:
+  name: "Update DPs"
+  description: Request current datapoint values from a connected device.
+  fields:
+    device_id:
+      name: "Device ID"
+      description: The device ID that should publish its current state.
+      required: true
+      example: 11100118278aab4de001
+      selector:
+        text:
+    dps:
+      name: "DPs"
+      description: Optional list of datapoint IDs to refresh. Omit to use the device defaults.
+      required: false
+      example: "[18, 19, 20]"
+      selector:
+        object:
+
 remote_add_code:
   name: "Add Remote Code"
   description: Add the remote code to the device's remote storage.

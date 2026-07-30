@@ -54,17 +54,25 @@ from .discovery import TuyaDiscovery
 _LOGGER = logging.getLogger(__name__)
 
 CONF_DP = "dp"
+CONF_DPS = "dps"
 CONF_VALUE = "value"
 STARTUP_CONNECT_STAGGER_SECONDS = 0.2
 STARTUP_RECOVERY_DELAYS = (30, 90, 180)
 STARTUP_RECOVERY_STAGGER_SECONDS = 0.3
 
 SERVICE_SET_DP = "set_dp"
+SERVICE_UPDATE_DPS = "update_dps"
 SERVICE_SET_DP_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_DEVICE_ID): cv.string,
         vol.Optional(CONF_DP): int,
         vol.Required(CONF_VALUE): object,
+    }
+)
+SERVICE_UPDATE_DPS_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_DEVICE_ID): cv.string,
+        vol.Optional(CONF_DPS): [vol.Coerce(int)],
     }
 )
 
@@ -106,6 +114,27 @@ async def async_setup(hass: HomeAssistant, config: dict):
             await device.set_dps(value)
         else:
             await device.set_dp(value, event.data[CONF_DP])
+
+    async def _handle_update_dps(event: ServiceCall):
+        """Request an on-demand status update from a Tuya device."""
+        dev_id = event.data[CONF_DEVICE_ID]
+        entry: ConfigEntry = async_config_entry_by_device_id(hass, dev_id)
+        if not entry or not entry.entry_id:
+            raise HomeAssistantError("unknown device id")
+
+        host = entry.data[CONF_DEVICES][dev_id].get(CONF_HOST)
+        if node_id := entry.data[CONF_DEVICES][dev_id].get(CONF_NODE_ID):
+            host = f"{host}_{node_id}"
+        device: TuyaDevice = hass.data[DOMAIN][entry.entry_id].devices[host]
+        if not device.connected:
+            raise HomeAssistantError("not connected to device")
+
+        try:
+            await device.async_update_dps(event.data.get(CONF_DPS))
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # pylint: disable=broad-except
+            raise HomeAssistantError(f"Failed to request DPS update: {ex}") from ex
 
     def _device_discovered(device: dict):
         """Update address of device if it has changed."""
@@ -179,6 +208,12 @@ async def async_setup(hass: HomeAssistant, config: dict):
 
     hass.services.async_register(
         DOMAIN, SERVICE_SET_DP, _handle_set_dp, schema=SERVICE_SET_DP_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_UPDATE_DPS,
+        _handle_update_dps,
+        schema=SERVICE_UPDATE_DPS_SCHEMA,
     )
 
     discovery = TuyaDiscovery(_device_discovered)

@@ -508,6 +508,23 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             if self.is_sleep:
                 return self._pending_status.update(states)
 
+    async def async_update_dps(self, dps: list[int] | None = None) -> None:
+        """Request a device to publish the current values of its DPS."""
+        await self.check_connection()
+        interface = self._interface
+        if interface is None or not self.connected:
+            raise ConnectionError(f"Device {self._device_config.name} is not connected")
+
+        try:
+            await interface.update_dps(dps=dps, cid=self._node_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # pylint: disable=broad-except
+            await self._async_reset_stale_connection(
+                f"DPS refresh failed: {ex}", "dps_refresh_failed"
+            )
+            raise
+
     async def _async_refresh(self, _now):
         if self.connected:
             self.debug("Refreshing dps for device")

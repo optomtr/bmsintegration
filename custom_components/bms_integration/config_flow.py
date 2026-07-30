@@ -1226,6 +1226,10 @@ async def validate_input(entry_runtime: HassLocalTuyaData, data):
                         conf_protocol = version
                         break
 
+                except ConnectionAbortedError:
+                    # A v3.4 session negotiation can be rejected by a v3.5
+                    # device. Continue auto detection with the next protocol.
+                    continue
                 # If connection to host is failed raise wrong address.
                 except (OSError, ValueError) as ex:
                     logger.error(f"Connection failed! {ex}")
