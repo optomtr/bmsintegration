@@ -10,6 +10,7 @@ from typing import Any, Iterable
 from .config_flow import col_to_select
 
 import voluptuous as vol
+import homeassistant.helpers.config_validation as cv
 from homeassistant.components.remote import (
     ATTR_ACTIVITY,
     ATTR_COMMAND,
@@ -29,7 +30,7 @@ from homeassistant.exceptions import ServiceValidationError, NoEntitySpecifiedEr
 from homeassistant.helpers.storage import Store
 
 from .entity import LocalTuyaEntity, async_setup_entry
-from .const import CONF_RECEIVE_DP, CONF_KEY_STUDY_DP, DOMAIN
+from .const import CONF_RECEIVE_DP, CONF_KEY_STUDY_DP, DATA_REMOTE_ENTITIES, DOMAIN
 
 NSDP_CONTROL = "control"  # The control commands
 NSDP_TYPE = "type"  # The identifier of an IR library
@@ -481,13 +482,47 @@ class LocalTuyaRemote(LocalTuyaEntity, RemoteEntity):
         self._attr_is_on = state is None or state.state != STATE_OFF
 
 
+SERVICE_ADD_CODE = "remote_add_code"
+# Required fields are enforced here as well as in services.yaml, so a
+# programmatic call without them fails with a clear validation error
+# instead of a KeyError inside the handler.
+SERVICE_ADD_CODE_SCHEMA = vol.Schema(
+    {
+        vol.Required("target"): cv.string,
+        vol.Required("device_name"): cv.string,
+        vol.Required("command_name"): cv.string,
+        vol.Optional("base64"): cv.string,
+        vol.Optional("head"): cv.string,
+        vol.Optional("key"): cv.string,
+    }
+)
+
+
 async def async_setup_services(hass: HomeAssistant, entities: list[LocalTuyaRemote]):
-    """Setup remote services."""
+    """Setup remote services.
+
+    This runs once per config entry. The service itself is registered only
+    once and resolves the target against every loaded entry: re-registering
+    it per entry used to replace the handler, so only the entry set up last
+    could be targeted, and the service was never removed on unload.
+    """
+    registry: list[LocalTuyaRemote] = hass.data[DOMAIN].setdefault(
+        DATA_REMOTE_ENTITIES, []
+    )
+    registry.extend(entities)
+
+    for entity in entities:
+        entity.async_on_remove(
+            lambda ent=entity: ent in registry and registry.remove(ent)
+        )
+
+    if hass.services.has_service(DOMAIN, SERVICE_ADD_CODE):
+        return
 
     async def _handle_add_key(call: ServiceCall):
         """Handle add remote key service's action."""
         entity = None
-        for ent in entities:
+        for ent in hass.data[DOMAIN].get(DATA_REMOTE_ENTITIES, []):
             if call.data.get("target") == ent.device_entry.id:
                 entity = ent
         if not entity:
@@ -507,7 +542,9 @@ async def async_setup_services(hass: HomeAssistant, entities: list[LocalTuyaRemo
                 "Ensure that the fields for Raw Base64 code or header/key are valid"
             )
 
-    hass.services.async_register(DOMAIN, "remote_add_code", _handle_add_key)
+    hass.services.async_register(
+        DOMAIN, SERVICE_ADD_CODE, _handle_add_key, schema=SERVICE_ADD_CODE_SCHEMA
+    )
 
 
 async_setup_entry = partial(

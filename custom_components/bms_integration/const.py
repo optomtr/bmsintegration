@@ -15,6 +15,9 @@ from homeassistant.const import (
 
 DOMAIN = "bms_integration"
 DATA_DISCOVERY = "discovery"
+# Remote entities of every loaded entry, so the remote_add_code service can
+# be registered once and still resolve a target from any of them.
+DATA_REMOTE_ENTITIES = "remote_entities"
 
 # Order on priority
 SUPPORTED_PROTOCOL_VERSIONS = ["3.3", "3.1", "3.2", "3.4", "3.5"]
