@@ -429,14 +429,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         entry.async_on_unload(dev.close)
 
     def _devices_needing_startup_recovery() -> list[TuyaDevice]:
-        """Return devices that still have no active connection after startup."""
+        """Return devices that still have no active connection after startup.
+
+        Note: a fake gateway and the sub-device it was created from share the
+        same device id and node id but are separate connections, so every
+        entry of the devices dict has to be considered on its own.
+        """
         pending: list[TuyaDevice] = []
-        seen = set()
         for dev in hass_localtuya.devices.values():
-            key = (dev.id, dev._node_id)
-            if key in seen:
-                continue
-            seen.add(key)
             if dev.is_closing or dev.connected or dev.is_connecting:
                 continue
             if dev.gateway and (not dev.gateway.connected or dev.gateway.is_connecting):
@@ -479,14 +479,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     watchdog_task: asyncio.Task | None = None
 
     async def _run_gateway_watchdog():
-        """Probe each physical Zigbee gateway without polling every child device."""
+        """Probe Zigbee gateways and rescue devices stuck without recovery."""
         gateways: list[TuyaDevice] = []
+        stalled: list[TuyaDevice] = []
         seen = set()
         for dev in hass_localtuya.devices.values():
-            if dev.is_subdevice or not dev.sub_devices or dev.id in seen:
+            # Whatever the failure path was, a disconnected device with no
+            # connect/reconnect task left would stay unavailable until a manual
+            # reload of the integration; restart its recovery instead.
+            if dev.needs_recovery:
+                stalled.append(dev)
+            # Fake gateways are probed by their own heartbeat loop already.
+            if (
+                dev.is_subdevice
+                or dev.is_fake_gateway
+                or not dev.sub_devices
+                or dev.id in seen
+            ):
                 continue
             seen.add(dev.id)
             gateways.append(dev)
+
+        async def _rescue_device(dev: TuyaDevice, delay: float):
+            if delay:
+                await asyncio.sleep(delay)
+            await dev.async_recover("connection watchdog")
+
+        for index, dev in enumerate(stalled):
+            entry.async_create_task(
+                hass,
+                _rescue_device(dev, index * STARTUP_RECOVERY_STAGGER_SECONDS),
+                f"{DOMAIN}-watchdog-recovery-{dev.id}",
+            )
 
         if not gateways:
             return
