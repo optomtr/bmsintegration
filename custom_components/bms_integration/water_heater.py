@@ -206,17 +206,17 @@ class LocalTuyaWaterHeater(LocalTuyaEntity, WaterHeaterEntity):
         """Device status was updated."""
         self._state = self.dp_value(self._dp_id)
 
-        # Update target temperature
+        # Update target temperature. The DP can be absent from the status
+        # (restored sleeping devices, partial updates): multiplying None
+        # used to raise a TypeError and abort the whole status update.
         if self.has_config(CONF_TARGET_TEMPERATURE_DP):
-            self._target_temperature = (
-                self.dp_value(CONF_TARGET_TEMPERATURE_DP) * self._precision_target
-            )
+            if (target := self.dp_value(CONF_TARGET_TEMPERATURE_DP)) is not None:
+                self._target_temperature = target * self._precision_target
 
         # Update current temperature
         if self.has_config(CONF_CURRENT_TEMPERATURE_DP):
-            self._current_temperature = (
-                self.dp_value(CONF_CURRENT_TEMPERATURE_DP) * self._precision
-            )
+            if (current := self.dp_value(CONF_CURRENT_TEMPERATURE_DP)) is not None:
+                self._current_temperature = current * self._precision
 
         # Update modes states
         if not self._state:

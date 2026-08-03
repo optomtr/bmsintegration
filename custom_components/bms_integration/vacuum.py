@@ -135,6 +135,11 @@ class LocalTuyaVacuum(LocalTuyaEntity, StateVacuumEntity):
             supported_features |= VacuumEntityFeature.FAN_SPEED
         if self.has_config(CONF_LOCATE_DP):
             supported_features |= VacuumEntityFeature.LOCATE
+        if self.has_config(CONF_MODE_DP):
+            # Without this flag HA rejects vacuum.send_command, making
+            # async_send_command (the only way to change the cleaning mode)
+            # unreachable.
+            supported_features |= VacuumEntityFeature.SEND_COMMAND
 
         return supported_features
 
@@ -164,8 +169,11 @@ class LocalTuyaVacuum(LocalTuyaEntity, StateVacuumEntity):
 
     async def async_stop(self, **kwargs):
         """Turn the vacuum off stopping the cleaning."""
+        # The mode DP is optional: sending the stop status requires it, so
+        # fall back to the power DP instead of raising KeyError.
         if (
             self.has_config(CONF_STOP_STATUS)
+            and self.has_config(CONF_MODE_DP)
             and self._config[CONF_STOP_STATUS] in self._modes_list
         ):
             await self._device.set_dp(
@@ -173,7 +181,6 @@ class LocalTuyaVacuum(LocalTuyaEntity, StateVacuumEntity):
             )
         else:
             await self._device.set_dp(False, self._config[CONF_POWERGO_DP])
-            # _LOGGER.error("Missing command for stop in commands set.")
 
     async def async_pause(self, **kwargs):
         """Stop the vacuum cleaner, do not return to base."""
@@ -184,7 +191,9 @@ class LocalTuyaVacuum(LocalTuyaEntity, StateVacuumEntity):
 
     async def async_return_to_base(self, **kwargs):
         """Set the vacuum cleaner to return to the dock."""
-        if self.has_config(CONF_RETURN_MODE):
+        # CONF_RETURN_MODE has a default, so it is always "configured": the
+        # mode DP is the one that actually has to be present.
+        if self.has_config(CONF_RETURN_MODE) and self.has_config(CONF_MODE_DP):
             await self._device.set_dp(
                 self._config[CONF_RETURN_MODE], self._config[CONF_MODE_DP]
             )
@@ -206,7 +215,10 @@ class LocalTuyaVacuum(LocalTuyaEntity, StateVacuumEntity):
 
     async def async_send_command(self, command, params=None, **kwargs):
         """Send a command to a vacuum cleaner."""
-        if command == "set_mode" and "mode" in params:
+        if command == "set_mode" and params and "mode" in params:
+            if not self.has_config(CONF_MODE_DP):
+                _LOGGER.error("Cannot set mode: no mode DP configured.")
+                return
             mode = params["mode"]
             await self._device.set_dp(mode, self._config[CONF_MODE_DP])
 
@@ -222,9 +234,10 @@ class LocalTuyaVacuum(LocalTuyaEntity, StateVacuumEntity):
             self._state = VacuumActivity.DOCKED
         elif state_value in self._returning_status_list:
             self._state = VacuumActivity.RETURNING
-        elif state_value in [self._config[CONF_PAUSED_STATE], "pause"] or (
-            self.dp_value(CONF_PAUSE_DP) is True
-        ):
+        elif state_value in [
+            self._config.get(CONF_PAUSED_STATE, DEFAULT_PAUSED_STATE),
+            "pause",
+        ] or (self.dp_value(CONF_PAUSE_DP) is True):
             self._state = VacuumActivity.PAUSED
         else:
             self._state = VacuumActivity.CLEANING
@@ -248,9 +261,13 @@ class LocalTuyaVacuum(LocalTuyaEntity, StateVacuumEntity):
             self._attrs[CLEAN_RECORD] = self.dp_value(CONF_CLEAN_RECORD_DP)
 
         if self.has_config(CONF_FAULT_DP):
-            self._attrs[FAULT] = self.dp_value(CONF_FAULT_DP)
-            if self._attrs[FAULT] != 0:
-                self._state = VacuumActivity.ERROR
+            fault = self.dp_value(CONF_FAULT_DP)
+            self._attrs[FAULT] = fault
+            # Only a real, non-zero fault code means an error: a missing DP
+            # (None) or a non-numeric value used to be reported as ERROR.
+            if isinstance(fault, (int, float)) and not isinstance(fault, bool):
+                if fault != 0:
+                    self._state = VacuumActivity.ERROR
 
 
 async_setup_entry = partial(async_setup_entry, DOMAIN, LocalTuyaVacuum, flow_schema)

@@ -192,17 +192,31 @@ class LocaltuyaConfigFlow(ConfigFlow, domain=DOMAIN):
                     user_input[i] = ""
                 return await self._create_entry(user_input)
 
-            cloud_api, res = await attempt_cloud_connection(user_input)
+            missing = [
+                field
+                for field in (CONF_CLIENT_ID, CONF_CLIENT_SECRET, CONF_USER_ID)
+                if not user_input.get(field)
+            ]
+            if missing:
+                # Empty optional fields are not submitted at all: without this
+                # the cloud client was built with None and crashed on
+                # user_id[:3].
+                errors["base"] = "authentication_failed"
+                placeholders = {"msg": f"Missing required fields: {', '.join(missing)}"}
+            else:
+                cloud_api, res = await attempt_cloud_connection(user_input)
 
-            if not res:
-                return await self._create_entry(user_input)
-            errors["base"] = res["reason"]
-            # 1004 = Secret, 1106 = USER ID, 2009 = Client ID
-            if "1106" in res["msg"]:
-                res["msg"] = f"{res['msg']} Check UserID or country code!"
-            if "1004" in res["msg"]:
-                res["msg"] = f"{res['msg']} Check Secret Key!"
-            placeholders = {"msg": res["msg"]}
+                if not res:
+                    return await self._create_entry(user_input)
+                errors["base"] = res["reason"]
+                # The message is None when the cloud is simply unreachable.
+                msg = str(res.get("msg") or "Tuya Cloud is unreachable")
+                # 1004 = Secret, 1106 = USER ID, 2009 = Client ID
+                if "1106" in msg:
+                    msg = f"{msg} Check UserID or country code!"
+                if "1004" in msg:
+                    msg = f"{msg} Check Secret Key!"
+                placeholders = {"msg": msg}
 
         defaults = {}
         defaults.update(user_input or {})
@@ -931,9 +945,13 @@ async def setup_localtuya_devices(
 
     # Configure entities.
     for dev_id, dev_data in copy.deepcopy(devices).items():
+        # Reset per device: leaving the previous iteration's value here
+        # raised UnboundLocalError for the first device without a category,
+        # and assigned another device's entities to every later one.
+        dev_entites = None
         category = devices_cloud_data[dev_id].get("category")
         dev_data[DEVICE_CLOUD_DATA] = devices_cloud_data[dev_id]
-        if category and (dps_strings := dev_data.get(CONF_DPS_STRINGS, False)):
+        if category and dev_data.get(CONF_DPS_STRINGS, False):
             dev_entites = gen_localtuya_entities(dev_data, category)
 
         # Configure entities fails
@@ -1332,6 +1350,14 @@ async def attempt_cloud_connection(user_input):
     msg, res = await cloud_api.async_connect()
 
     if res != "ok":
-        return cloud_api, {"reason": msg, "msg": res}
+        # `msg` is True and `res` is None when the cloud is unreachable
+        # (network/DNS failure): normalize both so the UI shows a
+        # translatable error instead of the literal "true" / crashing on
+        # a None message.
+        reason = msg if isinstance(msg, str) else "cloud_unreachable"
+        return cloud_api, {
+            "reason": reason,
+            "msg": str(res or "Tuya Cloud is unreachable"),
+        }
 
     return cloud_api, {}

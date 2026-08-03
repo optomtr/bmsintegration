@@ -7,6 +7,7 @@ from .config_flow import col_to_select
 
 import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.components.fan import (
     DIRECTION_FORWARD,
     DIRECTION_REVERSE,
@@ -168,16 +169,25 @@ class LocalTuyaFan(LocalTuyaEntity, FanEntity):
         )
         self.schedule_update_ha_state()
 
-    async def async_set_direction(self, direction):
+    async def async_set_direction(self, direction: str | None = None):
         """Set the direction of the fan."""
         _LOGGER.debug("Fan async_set_direction: %s", direction)
 
-        if direction == DIRECTION_FORWARD:
-            value = self._config.get(CONF_FAN_DIRECTION_FWD)
+        # The fan.set_direction service accepts any string, so an unknown
+        # value must be rejected instead of raising UnboundLocalError.
+        directions = {
+            DIRECTION_FORWARD: self._config.get(CONF_FAN_DIRECTION_FWD),
+            DIRECTION_REVERSE: self._config.get(CONF_FAN_DIRECTION_REV),
+        }
+        if direction not in directions:
+            raise ServiceValidationError(
+                f"Unsupported fan direction '{direction}': "
+                f"expected one of {sorted(directions)}"
+            )
 
-        if direction == DIRECTION_REVERSE:
-            value = self._config.get(CONF_FAN_DIRECTION_REV)
-        await self._device.set_dp(value, self._config.get(CONF_FAN_DIRECTION))
+        await self._device.set_dp(
+            directions[direction], self._config.get(CONF_FAN_DIRECTION)
+        )
         self.schedule_update_ha_state()
 
     @property
@@ -233,9 +243,17 @@ class LocalTuyaFan(LocalTuyaEntity, FanEntity):
                 self._speed_range,
             )
             if current_speed is not None:
-                self._percentage = ranged_value_to_percentage(
-                    self._speed_range, int(current_speed)
-                )
+                try:
+                    self._percentage = ranged_value_to_percentage(
+                        self._speed_range, int(current_speed)
+                    )
+                except (TypeError, ValueError):
+                    # A non-numeric speed value must not abort the update and
+                    # freeze the entity for good.
+                    _LOGGER.warning(
+                        "Fan speed value %r is not numeric: ignoring", current_speed
+                    )
+                    self._percentage = None
 
         _LOGGER.debug("Fan current_percentage: %s", self._percentage)
 

@@ -47,13 +47,20 @@ class LocalTuyaLock(LocalTuyaEntity, LockEntity):
     def status_updated(self):
         """Device status was updated."""
         state = self.dp_value(self._dp_id)
-        if (lock_state := self.dp_value(CONF_LOCK_STATE_DP)) or lock_state is not None:
+        if (lock_state := self.dp_value(CONF_LOCK_STATE_DP)) is not None:
             state = lock_state
 
-        self._attr_is_locked = state in (False, "closed", "close", None)
+        if state is None:
+            # No data yet: report "unknown" rather than a definite "locked".
+            self._attr_is_locked = None
+        else:
+            # async_lock sends True, async_unlock sends False; read the same
+            # direction back (the previous mapping was inverted, so a locked
+            # device showed as unlocked and vice versa).
+            self._attr_is_locked = state in (True, "closed", "close", "locked", "lock")
 
-        if jammed := self.dp_value(CONF_JAMMED_DP, False):
-            self._attr_is_jammed = jammed
+        # Always reflect the jam DP so a cleared jam resets is_jammed to False.
+        self._attr_is_jammed = bool(self.dp_value(CONF_JAMMED_DP, False))
 
     # No need to restore state for a Lock
     async def restore_state_when_connected(self):

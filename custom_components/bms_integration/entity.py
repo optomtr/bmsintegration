@@ -51,6 +51,9 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Sentinel marking "this DP had no cached value" for an optimistic rollback.
+_MISSING = object()
+
 
 async def async_setup_entry(
     domain: str,
@@ -345,8 +348,15 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
             if self._dp_id in self._status:
                 return
             if stored_data.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-                self.debug(f"{self.name}: Restore state: {stored_data.state}")
-                self._status[self._dp_id] = stored_data.state
+                # Prefer the raw DP value kept in the attributes: the HA state
+                # is a string ("on"/"off"), and writing that into the DP cache
+                # made bool("off") true - a restored "off" switch showed as ON,
+                # and the string was later sent back to a device expecting a
+                # native value.
+                raw_value = stored_data.attributes.get(ATTR_STATE)
+                value = raw_value if raw_value is not None else stored_data.state
+                self.debug(f"{self.name}: Restore state: {value}")
+                self._status[self._dp_id] = value
 
     def default_value(self):
         """Return default value of this entity.
@@ -433,16 +443,28 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
         self.status_updated()
         self.async_write_ha_state()
 
-    async def _send_dps_background(self, status: dict) -> None:
-        """Send DPS in the background and let normal status updates self-correct."""
+    async def _send_dps_background(self, status: dict, rollback: dict) -> None:
+        """Send DPS in the background, restoring the state if it fails."""
         try:
             await self._device.set_dps(status)
         except Exception as ex:  # pylint: disable=broad-except
             self.warning(f"Optimistic command failed: {ex}")
+            # The device never changed, so it will not send a status update
+            # to correct us: roll the optimistic values back ourselves.
+            for dp, value in rollback.items():
+                if value is _MISSING:
+                    self._status.pop(dp, None)
+                else:
+                    self._status[dp] = value
+            self.status_updated()
+            self.async_write_ha_state()
 
     async def async_set_dps(self, status: dict, optimistic_status: dict | None = None):
         """Set DPS, optionally returning to Home Assistant optimistically."""
-        if not self.optimistic:
+        # Sleeping devices are handled by the device layer, which queues the
+        # command until the device wakes up. Going through the optimistic
+        # path would reject the command instead.
+        if not self.optimistic or self._device.is_sleep:
             await self._device.set_dps(status)
             return
 
@@ -450,8 +472,11 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
             raise HomeAssistantError(f"Device {self._device_config.name} is not connected")
 
         optimistic_status = optimistic_status or status
+        rollback = {
+            str(dp): self._status.get(str(dp), _MISSING) for dp in optimistic_status
+        }
         self._apply_optimistic_status(optimistic_status)
-        self.hass.async_create_task(self._send_dps_background(status))
+        self.hass.async_create_task(self._send_dps_background(status, rollback))
 
     async def async_set_dp(self, value, dp_id):
         """Set a single DP, optionally returning to Home Assistant optimistically."""

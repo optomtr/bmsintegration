@@ -8,7 +8,8 @@
             "cannot_connect": "Cannot connect to device. Verify that address is correct.",
             "invalid_auth": "Failed to authenticate with device. Verify that device id and local key are correct.",
             "unknown": "An unknown error occurred. See log for details.",
-            "switch_already_configured": "Switch with this ID has already been configured."
+            "switch_already_configured": "Switch with this ID has already been configured.",
+            "cloud_unreachable": "Cannot reach Tuya Cloud.\n{msg}"
         },
         "step": {
             "user": {
@@ -23,7 +24,7 @@
             },
             "power_outlet": {
                 "title": "Add subswitch",
-		"description": "You are about to add subswitch number `{number}`. If you want to add another, tick `Add another switch` before continuing.",
+                "description": "You are about to add subswitch number `{number}`. If you want to add another, tick `Add another switch` before continuing.",
                 "data": {
                     "id": "ID",
                     "name": "Name",
@@ -110,7 +111,7 @@
                     "fan_speed_min": "minimum fan speed integer",
                     "fan_speed_max": "maximum fan speed integer",
                     "fan_speed_ordered_list": "Fan speed modes list (overrides speed min/max)",
-                    "fan_direction":"fan direction dps",
+                    "fan_direction": "fan direction dps",
                     "fan_direction_forward": "forward dps string",
                     "fan_direction_reverse": "reverse dps string",
                     "fan_dps_type": "DP value type",

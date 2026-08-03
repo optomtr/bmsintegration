@@ -56,11 +56,23 @@ async def async_get_device_diagnostics(
 ) -> dict[str, Any]:
     """Return diagnostics for a device entry."""
     data = {}
-    dev_id = list(device.identifiers)[0][1].split("_")[-1]
-    data[DEVICE_CONFIG] = entry.data[CONF_DEVICES][dev_id].copy()
-    # NOT censoring private information on device diagnostic data
-    # local_key = data[DEVICE_CONFIG][CONF_LOCAL_KEY]
-    # data[DEVICE_CONFIG][CONF_LOCAL_KEY] = f"{local_key[0:3]}...{local_key[-3:]}"
+    # identifiers is a set: pick this integration's identifier explicitly,
+    # otherwise a device merged with another integration could yield a
+    # foreign identifier (and a KeyError below).
+    dev_id = next(
+        (ident for domain, ident in device.identifiers if domain == DOMAIN),
+        None,
+    )
+    if dev_id is None:
+        return {"error": "device does not belong to this integration"}
+    dev_id = dev_id.split("_")[-1]
+
+    device_config = entry.data[CONF_DEVICES].get(dev_id, {}).copy()
+    # Censor the local key: diagnostics are routinely attached to public
+    # bug reports, and this key grants full local control of the device.
+    if local_key := device_config.get(CONF_LOCAL_KEY):
+        device_config[CONF_LOCAL_KEY] = obfuscate(local_key)
+    data[DEVICE_CONFIG] = device_config
 
     hass_localtuya: HassLocalTuyaData = hass.data[DOMAIN][entry.entry_id]
     tuya_api = hass_localtuya.cloud_data
@@ -70,10 +82,8 @@ async def async_get_device_diagnostics(
         for obf, obf_len in DATA_OBFUSCATE.items():
             if ob := data[DEVICE_CLOUD_INFO].get(obf):
                 data[DEVICE_CLOUD_INFO][obf] = obfuscate(ob, obf_len, obf_len)
-        # NOT censoring private information on device diagnostic data
-        # local_key = data[DEVICE_CLOUD_INFO][CONF_LOCAL_KEY]
-        # local_key_obfuscated = "{local_key[0:3]}...{local_key[-3:]}"
-        # data[DEVICE_CLOUD_INFO][CONF_LOCAL_KEY] = local_key_obfuscated
+        if cloud_key := data[DEVICE_CLOUD_INFO].get(CONF_LOCAL_KEY):
+            data[DEVICE_CLOUD_INFO][CONF_LOCAL_KEY] = obfuscate(cloud_key)
 
     # data["log"] = hass.data[DOMAIN][CONF_DEVICES][dev_id].logger.retrieve_log()
     if discovery := hass.data[DOMAIN].get(DATA_DISCOVERY):

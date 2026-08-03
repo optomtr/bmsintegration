@@ -5,6 +5,7 @@ import asyncio
 import errno
 import json
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, NamedTuple
@@ -52,6 +53,9 @@ AVAILABILITY_GRACE_PERIOD = 120
 STARTUP_AVAILABILITY_GRACE_PERIOD = 300
 RECONNECT_BACKOFF_SECONDS = (1, 2, 5, 10, 20, 30, 60)
 AVAILABILITY_REPORT_FILE = "bms_integration_availability.jsonl"
+# The report is a troubleshooting aid, not an archive: rotate it so a
+# flapping device cannot fill the (often SD-card) disk over months.
+AVAILABILITY_REPORT_MAX_BYTES = 2 * 1024 * 1024
 # A gateway may leave its TCP socket open after its Zigbee service has stopped.
 # Probe the gateway periodically so that a stale session is re-created instead
 # of leaving its sub-devices apparently available but unable to receive commands.
@@ -259,11 +263,21 @@ class TuyaDevice(TuyaListener, ContextualLogger):
 
         def _append_report():
             path = self.hass.config.path(AVAILABILITY_REPORT_FILE)
+            try:
+                if os.path.getsize(path) >= AVAILABILITY_REPORT_MAX_BYTES:
+                    # Keep exactly one previous generation.
+                    os.replace(path, f"{path}.1")
+            except FileNotFoundError:
+                pass
             with open(path, "a", encoding="utf-8") as report_file:
                 report_file.write(json.dumps(payload, ensure_ascii=False, default=str))
                 report_file.write("\n")
 
-        await self.hass.async_add_executor_job(_append_report)
+        try:
+            await self.hass.async_add_executor_job(_append_report)
+        except OSError as ex:
+            # A full or read-only disk must never break device handling.
+            self.debug(f"Failed to write the availability report: {ex}", force=True)
 
     async def async_connect(self, _now=None) -> None:
         """Connect to device if not already connected."""
@@ -368,7 +382,12 @@ class TuyaDevice(TuyaListener, ContextualLogger):
 
                 self.debug("Retrieving initial state")
                 status = await self._interface.status(cid=self._node_id)
-                if status is None:
+                if not status and self.dps_to_request:
+                    # status() returns {} (never None) when the reply could
+                    # not be decrypted or the device answered with an error
+                    # frame - typically a rotated local key. Treating that as
+                    # a successful connect left a permanent "zombie" session
+                    # with an empty status and no key refresh.
                     raise Exception("Failed to retrieve status")
 
                 self.status_updated(status)

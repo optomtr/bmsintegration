@@ -92,6 +92,11 @@ SEND_DEFAULTS = (
 CODE_STORAGE_VERSION = 1
 SOTRAGE_KEY = "bms_integration_remotes_codes"
 
+# Every remote entity writes the SAME storage file from its own in-memory
+# snapshot. Serialize those read-modify-write cycles so two remotes learning
+# codes cannot overwrite each other's commands with a stale snapshot.
+_CODES_STORAGE_LOCK = asyncio.Lock()
+
 
 def flow_schema(dps):
     """Return schema used in config flow."""
@@ -366,9 +371,11 @@ class LocalTuyaRemote(LocalTuyaEntity, RemoteEntity):
 
         # For now this only works if the command is in the list of commands of this device.
         devices_data[device].pop(command)
-        if device in self._global_codes:
-            self._global_codes.pop(device)
-        await self._codes_storage.async_save(codes_data)
+        # Only this device's own commands were removed: drop just that entry
+        # from the per-device view instead of the whole device.
+        if device in self._global_codes and command in self._global_codes[device]:
+            self._global_codes[device].pop(command)
+        await self._async_persist_codes()
 
     async def save_new_command(self, device, command, code) -> None:
         """Store new code into stoarge."""
@@ -389,8 +396,30 @@ class LocalTuyaRemote(LocalTuyaEntity, RemoteEntity):
         else:
             codes[device_unqiue_id][device] = device_data
 
-        self._global_codes[device] = device_data
-        await self._codes_storage.async_save(codes)
+        self._global_codes.setdefault(device, {}).update(device_data)
+        await self._async_persist_codes()
+
+    async def _async_persist_codes(self) -> None:
+        """Persist this remote's codes without clobbering the other remotes.
+
+        The storage file is shared by every remote entity, but each keeps its
+        own snapshot: writing that snapshot verbatim used to drop commands
+        another remote had learned meanwhile. Re-read the file under a lock
+        and merge only this controller's branch back in.
+        """
+        async with _CODES_STORAGE_LOCK:
+            try:
+                stored = await self._codes_storage.async_load() or {}
+            except Exception as ex:  # pylint: disable=broad-except
+                self.debug(f"Failed to re-read the codes storage: {ex}")
+                stored = {}
+
+            stored[self._device_id] = self._codes.get(self._device_id, {})
+            # Keep in sync with what is now on disk.
+            self._codes.update(
+                {k: v for k, v in stored.items() if k != self._device_id}
+            )
+            await self._codes_storage.async_save(stored)
 
     async def _async_load_storage(self):
         """Load code and flag storage from disk."""

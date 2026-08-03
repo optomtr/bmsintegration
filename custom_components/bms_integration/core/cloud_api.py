@@ -89,8 +89,11 @@ class TuyaCloudApi:
 
     def __init__(self, region_code, client_id, secret, user_id):
         """Initialize the class."""
+        # user_id can be missing when the user submitted an empty cloud form.
+        uid = str(user_id or "")
         self._logger = CustomAdapter(
-            logging.getLogger(__name__), {"prefix": user_id[:3] + "..." + user_id[-3:]}
+            logging.getLogger(__name__),
+            {"prefix": f"{uid[:3]}...{uid[-3:]}" if uid else "no-uid"},
         )
 
         self._session = AioHttpSession()
@@ -154,13 +157,23 @@ class TuyaCloudApi:
         }
         full_url = self._base_url + url
 
+        async def _read_json(resp):
+            """Return the JSON body, tolerating non-JSON error pages."""
+            if resp.status >= 400:
+                self._logger.debug(
+                    "Tuya cloud returned HTTP %s for %s", resp.status, url
+                )
+            # Gateways and CDNs answer with HTML on 5xx: do not let the
+            # content-type check raise.
+            return await resp.json(content_type=None)
+
         async with self._session as session:
             try:
                 if method == "GET":
                     async with session.get(
                         full_url, headers=dict(default_par, **headers)
                     ) as resp:
-                        return await resp.json()
+                        return await _read_json(resp)
 
                 if method == "POST":
                     async with session.post(
@@ -168,7 +181,7 @@ class TuyaCloudApi:
                         headers=dict(default_par, **headers),
                         data=json.dumps(body),
                     ) as resp:
-                        return await resp.json()
+                        return await _read_json(resp)
 
                 if method == "PUT":
                     async with session.put(
@@ -176,33 +189,48 @@ class TuyaCloudApi:
                         headers=dict(default_par, **headers),
                         data=json.dumps(body),
                     ) as resp:
-                        return await resp.json()
-            except (aiohttp.ClientConnectionError, TimeoutError) as ex:
+                        return await _read_json(resp)
+            except asyncio.CancelledError:
+                raise
+            except (aiohttp.ClientError, TimeoutError, ValueError) as ex:
+                # ValueError covers a body that is not valid JSON. Anything
+                # escaping here would leave the token sentinel below stuck.
                 self._logger.debug(f"Failed to send request to tuya cloud: {ex}")
                 return False
 
     async def async_get_access_token(self) -> str | None:
         """Obtain a valid access token."""
-        # Reset access token
+        # The -1 sentinel suppresses re-entrant refreshes while this request
+        # is in flight. The try/finally guarantees it is cleared even on an
+        # unexpected error: leaving it set permanently disabled every future
+        # refresh, so all later cloud calls went out with an empty token.
         self._token_expire_time = -1
         self._access_token = ""
+        succeeded = False
+        try:
+            if not (
+                resp := await self.async_make_request("GET", "/v1.0/token?grant_type=1")
+            ):
+                return self._logger.debug(f"Failed to retrieve a valid token")
 
-        if not (
-            resp := await self.async_make_request("GET", "/v1.0/token?grant_type=1")
-        ):
-            self._token_expire_time = 0
-            return self._logger.debug(f"Failed to retrieve a valid token")
+            if not isinstance(resp, dict) or not resp.get("success"):
+                code = resp.get("code") if isinstance(resp, dict) else "unknown"
+                msg = resp.get("msg") if isinstance(resp, dict) else resp
+                return f"Error {code}: {msg}"
 
-        if not resp["success"]:
-            self._token_expire_time = 0
-            return f"Error {resp['code']}: {resp['msg']}"
+            req_results = resp.get("result") or {}
+            if not (access_token := req_results.get("access_token")):
+                return self._logger.debug("Token response contained no access token")
 
-        req_results = resp["result"]
-
-        expire_time = int(req_results.get("expire_time", 3600))
-        self._token_expire_time = int(time.time()) + expire_time
-        self._access_token = resp["result"]["access_token"]
-        return "ok"
+            expire_time = int(req_results.get("expire_time", 3600))
+            self._token_expire_time = int(time.time()) + expire_time
+            self._access_token = access_token
+            succeeded = True
+            return "ok"
+        finally:
+            if not succeeded:
+                # 0 means "expired": the next request retries the refresh.
+                self._token_expire_time = 0
 
     async def async_get_devices_list(self, force_update=False) -> str | None:
         """Obtain the list of devices associated to a user. - force_update will ignore last update check."""
@@ -323,7 +351,11 @@ class TuyaCloudApi:
                     # "code": dp_data.get("code"),
                     "accessMode": dp_data.get("accessMode"),
                     # values: json.loads later
-                    "values": str(dp_data.get("typeSpec")).replace("'", '"'),
+                    # json.dumps instead of str().replace("'", '"'): the old
+                    # form produced the literal "None" (invalid JSON) for a
+                    # missing typeSpec and corrupted any value containing a
+                    # quote or apostrophe (e.g. a unit of "'C").
+                    "values": json.dumps(dp_data.get("typeSpec") or {}),
                 }
                 if str(dp_data["abilityId"]) in device_data:
                     device_data[str(dp_data["abilityId"])].update(refactored)

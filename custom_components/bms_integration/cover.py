@@ -288,14 +288,37 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
             await asyncio.sleep(0.1)
             self.update_state(STATE_SET_CMD, int(kwargs[ATTR_POSITION]))
 
+    async def async_will_remove_from_hass(self):
+        """Cancel a pending stop timer when the entity goes away.
+
+        Without this a timer scheduled before a reload kept running and
+        sent a stop command to the device from a dead entity.
+        """
+        if self._current_task is not None:
+            self._current_task.cancel()
+            self._current_task = None
+        await super().async_will_remove_from_hass()
+
+    def _clear_own_task(self):
+        """Drop the task reference only if it still points at this task.
+
+        A cancelled task receives its CancelledError on a later event loop
+        iteration, by which time a new timer may already be registered:
+        clearing the reference unconditionally orphaned that new timer
+        (it could no longer be cancelled) and eventually made it stop a
+        cover in the middle of a movement.
+        """
+        if self._current_task is asyncio.current_task():
+            self._current_task = None
+
     async def async_stop_after_timeout(self, delay_sec):
         """Stop the cover if timeout (max movement span) occurred."""
         try:
             await asyncio.sleep(delay_sec)
-            self._current_task = None
+            self._clear_own_task()
             await self.async_stop_cover()
         except asyncio.CancelledError:
-            self._current_task = None
+            self._clear_own_task()
 
     async def async_open_cover(self, **kwargs):
         """Open the cover."""

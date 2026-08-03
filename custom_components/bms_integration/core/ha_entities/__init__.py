@@ -139,7 +139,19 @@ def gen_localtuya_entities(localtuya_data: dict, tuya_category: str) -> list[dic
                 for k, v in localtuya_entity_configs.items():
                     if isinstance(v, CLOUD_VALUE):
                         config_dp = entity.get(v.dp_config)
-                        dp_values = get_dp_values(config_dp, dps_data, v) or {}
+                        try:
+                            dp_values = get_dp_values(config_dp, dps_data, v) or {}
+                        except Exception as ex:  # pylint: disable=broad-except
+                            # Cloud DP specifications are frequently malformed
+                            # (missing min/max, invalid JSON). One bad DP must
+                            # not abort configuring the whole device.
+                            _LOGGER.debug(
+                                "%s: Failed to read cloud values for %s: %s",
+                                device_name,
+                                config_dp,
+                                ex,
+                            )
+                            dp_values = {}
 
                         # special case for lights
                         # if v.value_key in dp_values and "kelvin" in k:
@@ -194,7 +206,15 @@ def get_dp_values(dp: str, dps_data: dict, req_info: CLOUD_VALUE = None) -> dict
     dp_values = dp_data.get("values")
     dp_type = dp_data.get("type", "").capitalize()
 
-    if not dp_values or not (dp_values := json.loads(dp_values)):
+    if not dp_values:
+        return
+    if isinstance(dp_values, str):
+        try:
+            dp_values = json.loads(dp_values)
+        except (ValueError, TypeError):
+            # The cloud sometimes reports non-JSON specifications.
+            return
+    if not isinstance(dp_values, dict) or not dp_values:
         return
 
     # Some DPS doesn't have the type, in high level data.
@@ -210,9 +230,15 @@ def get_dp_values(dp: str, dps_data: dict, req_info: CLOUD_VALUE = None) -> dict
         valid_type = req_info.prefer_type and req_info.prefer_type in (str, float, int)
         pref_type = req_info.prefer_type if valid_type else int
         val_scale = dp_values.get("scale", 1)
-        dp_values["min"] = pref_type(dp_values.get("min"))
-        dp_values["max"] = pref_type(dp_values.get("max"))
-        dp_values["step"] = pref_type(dp_values.get("step"))
+        # A specification may omit min/max/step entirely: converting None
+        # used to raise TypeError and abort the whole auto-configure step.
+        defaults = {"min": 0, "max": 0, "step": 1}
+        for key, fallback in defaults.items():
+            value = dp_values.get(key)
+            try:
+                dp_values[key] = pref_type(fallback if value is None else value)
+            except (TypeError, ValueError):
+                dp_values[key] = pref_type(fallback)
 
         pref_type = req_info.prefer_type if valid_type else float
         dp_values["scale"] = pref_type(scale(1, val_scale, float))
