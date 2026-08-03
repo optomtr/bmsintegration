@@ -710,6 +710,12 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
             while self.last_command_sent < 0.050:
                 await asyncio.sleep(0.010)
 
+            if not self.is_connected:
+                # Writing to a closed transport is a silent no-op, so the
+                # caller would sit through the full reply timeout instead of
+                # learning immediately that the link is gone.
+                raise ConnectionResetError("Connection to the device is closed")
+
             self._last_command_sent = time.monotonic()
             self.transport.write(data)
 
@@ -1074,7 +1080,10 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
             rkey = await self.exchange_quick(
                 MessagePayload(CMDType.SESS_KEY_NEG_START, self.local_nonce), 2
             )
-        except:
+        except asyncio.CancelledError:
+            # A bare except used to swallow cancellation here.
+            raise
+        except Exception:  # pylint: disable=broad-except
             # Device may instantly disconnect if we sent send wrong localkey.
             if not self.is_connected:
                 raise ConnectionAbortedError("Session key negotiation failed on step 1")
@@ -1148,7 +1157,8 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
                 self.local_key, use_base64=False, pad=False, iv=iv
             )[12:28]
 
-        self.debug("Session key negotiate success! session key: %r", self.local_key)
+        # The derived session key is a secret: log only that it succeeded.
+        self.debug("Session key negotiated successfully")
         return True
 
     # adds protocol header (if needed) and encrypts
@@ -1215,7 +1225,7 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         msg = TuyaMessage(
             self.seqno, msg.cmd, 0, payload, 0, True, Affix.prefix_55aa.value, False
         )
-        self.seqno += 1  # increase message sequence number
+        self.seqno = (self.seqno + 1) & 0xFFFFFFFF  # u32 wrap-around
         buffer = parser.pack_message(msg, hmac_key=hmac_key)
         # self.debug("payload encrypted with key %r => %r", self.local_key, binascii.hexlify(buffer))
         return buffer
@@ -1246,18 +1256,20 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         """
         json_data = command_override = None
 
-        # Create a deep copy of payload_dict. otherwise, the original references will be overwritten
+        # Only the selected template is copied (deeply), instead of cloning
+        # the whole payload_dict on every single command - including every
+        # heartbeat, which happens once per 8.3 s per device.
         def deepcopy_dict(_dict: dict):
             output = _dict.copy()
             for key, value in output.items():
                 output[key] = deepcopy_dict(value) if isinstance(value, dict) else value
             return output
 
-        payloads = deepcopy_dict(payload_dict)
+        payloads = payload_dict
 
         if command in payloads[self.dev_type]:
             if "command" in payloads[self.dev_type][command]:
-                json_data = payloads[self.dev_type][command]["command"].copy()
+                json_data = deepcopy_dict(payloads[self.dev_type][command]["command"])
             if "command_override" in payloads[self.dev_type][command]:
                 command_override = payloads[self.dev_type][command]["command_override"]
 
@@ -1267,7 +1279,7 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
                 and command in payloads["type_0a"]
                 and "command" in payloads["type_0a"][command]
             ):
-                json_data = payloads["type_0a"][command]["command"].copy()
+                json_data = deepcopy_dict(payloads["type_0a"][command]["command"])
             if (
                 command_override is None
                 and command in payloads["type_0a"]
