@@ -2,6 +2,21 @@
 
 Custom Home Assistant integration branded for BMS Smart Home, focused on stable local Tuya device control.
 
+## Attribution and license
+
+This project is a fork of [LocalTuya](https://github.com/xZetsubou/hass-localtuya)
+by xZetsubou, itself derived from
+[rospogrigio/localtuya](https://github.com/rospogrigio/localtuya) and the
+original [pytuya](https://github.com/clach04/python-tuya) work. The bundled
+protocol layer under `custom_components/bms_integration/core/pytuya/` also
+carries work from [TinyTuya](https://github.com/jasonacox/tinytuya), and the
+device preset tables under `core/ha_entities/` originate from the official
+Home Assistant Tuya integration.
+
+Like its upstream, this integration is distributed under the **GPL-3.0**
+license (see `LICENSE`). Any redistribution must keep this attribution and
+the license text.
+
 ## Features
 
 - Local Tuya control for Wi-Fi devices and Tuya hub sub-devices.
@@ -21,7 +36,11 @@ Custom Home Assistant integration branded for BMS Smart Home, focused on stable 
 - Entity availability no longer drops immediately on a short socket/Wi-Fi disconnect.
 - Devices enter a reconnecting grace window for 120 seconds before entities are marked unavailable.
 - Successful status updates cancel pending shutdown/unavailable tasks.
-- Reconnect attempts use a softer backoff: 1, 2, 5, 10, 20, 30, then 60 seconds.
+- Reconnect attempts use a softer backoff: 1, 2, 5, 10, 20, 30, then 60 seconds
+  and stay at 60 seconds for as long as the device remains unreachable.
+- Lights and switches apply commands optimistically by default (the new state
+  shows immediately and is corrected by the device's own status update); the
+  state is rolled back if the command fails.
 - Cover entities can use a dedicated gate sensor DP.
 - Dispatcher signals and remote storage/service domain use the BMS Integration domain.
 
@@ -70,3 +89,15 @@ Use the `bms_integration.update_dps` service to ask a connected device to publis
 ## License
 
 This repository is distributed under GPL-3.0.
+
+## Development
+
+Run the test suites (no Home Assistant installation required):
+
+```bash
+pip install cryptography
+python3 tests/run_all.py
+```
+
+See `tests/README.md` for what each suite covers. CI runs these suites plus
+`hassfest` and HACS validation on every push.

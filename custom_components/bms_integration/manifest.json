@@ -1,7 +1,9 @@
 {
   "domain": "bms_integration",
   "name": "BMS Integration",
-  "codeowners": [],
+  "codeowners": [
+    "@optomtr"
+  ],
   "config_flow": true,
   "dependencies": [],
   "documentation": "https://github.com/optomtr/bmsintegration/",
