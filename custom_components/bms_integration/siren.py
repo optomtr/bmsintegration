@@ -61,10 +61,15 @@ class LocalTuyaSiren(LocalTuyaEntity, SirenEntity):
         super().status_updated()
 
         state = str(self.dp_value(self._dp_id)).lower()
-        if state == self._config[CONF_STATE_ON].lower() or state == "true":
-            self._is_on = True
-        else:
-            self._is_on = False
+        # Accept a comma separated list, like binary_sensor does: users
+        # configure "on,1" and expected it to work here too.
+        on_values = {
+            value.strip().lower()
+            for value in str(self._config.get(CONF_STATE_ON, "true")).split(",")
+            if value.strip()
+        }
+        on_values.add("true")
+        self._is_on = state in on_values
 
 
 async_setup_entry = partial(async_setup_entry, DOMAIN, LocalTuyaSiren, flow_schema)

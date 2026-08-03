@@ -782,7 +782,7 @@ SENSORS: dict[str, tuple[LocalTuyaEntity, ...]] = {
             custom_configs=localtuya_sensor(UnitOfPower.KILO_WATT, 0.1),
         ),
         LocalTuyaEntity(
-            id=DPCode.DEVICEKW,
+            id=DPCode.DEVICEKWH,
             name="Device kWh",
             device_class=SensorDeviceClass.ENERGY,
             state_class=SensorStateClass.TOTAL,

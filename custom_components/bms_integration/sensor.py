@@ -2,6 +2,7 @@
 
 import logging
 import base64
+import binascii
 from functools import partial
 from .config_flow import col_to_select
 
@@ -106,11 +107,10 @@ class LocalTuyaSensor(LocalTuyaEntity, SensorEntity):
                     self.hass.async_create_task, self.__create_sub_sensors()
                 )
 
-            if None not in (
-                sub_sensor := getattr(self, "_attr_sub_sensor", None),
-                sub_sensor_state := self.decode_base64(state).get(sub_sensor),
-            ):
-                self._state = sub_sensor_state
+            sub_sensor = getattr(self, "_attr_sub_sensor", None)
+            decoded = self.decode_base64(state) if sub_sensor else None
+            if sub_sensor and decoded and decoded.get(sub_sensor) is not None:
+                self._state = decoded[sub_sensor]
             else:
                 self._state = state
         else:
@@ -129,16 +129,23 @@ class LocalTuyaSensor(LocalTuyaEntity, SensorEntity):
 
     def is_base64(self, data):
         """Return if the data is valid Tuya raw Base64 encoded data."""
-        return (
-            (data and isinstance(data, str))
-            and len(data) >= 12
-            and len(data) % 2 == 0
-            and data.endswith("=")
-        )
+        # Base64 length is a multiple of 4 (the old "% 2" let odd-length
+        # strings through), and the payload must be long enough to hold the
+        # 8 bytes decode_base64 reads.
+        if not data or not isinstance(data, str):
+            return False
+        if len(data) < 12 or len(data) % 4 != 0 or not data.endswith("="):
+            return False
+        return self.decode_base64(data) is not None
 
     def decode_base64(self, data):
-        """Decode data base64 such as DPS phase_a."""
-        buf = base64.b64decode(data)
+        """Decode data base64 such as DPS phase_a. None if not decodable."""
+        try:
+            buf = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError):
+            return None
+        if len(buf) < 8:
+            return None
         voltage = (buf[1] | buf[0] << 8) / 10
         current = (buf[4] | buf[3] << 8) / 1000
         power = (buf[7] | buf[6] << 8) / 1000

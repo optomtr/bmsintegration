@@ -76,8 +76,11 @@ class LocalTuyaHumidifier(LocalTuyaEntity, HumidifierEntity):
             self._config.get(self._dp_mode)
         ):
             self._attr_supported_features |= HumidifierEntityFeature.MODES
+            # Fall back to a prettified key when the friendly name is empty.
+            # The condition used to test the key (almost always truthy), so
+            # empty names reached the UI and a None name raised AttributeError.
             modes = {
-                k: v if k else v.replace("_", " ").capitalize()
+                k: str(v) if v else str(k).replace("_", " ").capitalize()
                 for k, v in modes.copy().items()
             }
         self._available_modes = DictSelector(modes)

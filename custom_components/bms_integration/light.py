@@ -427,8 +427,19 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
                 return ColorMode.COLOR_TEMP
             else:
                 return ColorMode.WHITE
-        if self._brightness:
+
+        # Scene/music mode: neither white nor color. Report a mode the entity
+        # actually supports - HA rejects a color_mode outside
+        # supported_color_modes.
+        supported = self.supported_color_modes or set()
+        if ColorMode.HS in supported:
+            return ColorMode.HS
+        if ColorMode.COLOR_TEMP in supported:
+            return ColorMode.COLOR_TEMP
+        if self._brightness and ColorMode.BRIGHTNESS in supported:
             return ColorMode.BRIGHTNESS
+        if ColorMode.WHITE in supported:
+            return ColorMode.WHITE
 
         return ColorMode.ONOFF
 
@@ -576,8 +587,8 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
                     self._hs, brightness
                 )
                 color_mode = self._modes.color
-            else:
-                states[self._config.get(CONF_BRIGHTNESS)] = brightness
+            elif (bright_dp := self._config.get(CONF_BRIGHTNESS)) is not None:
+                states[bright_dp] = brightness
                 color_mode = self._modes.white
 
         if ATTR_HS_COLOR in kwargs and ColorMode.HS in color_modes:
@@ -605,7 +616,11 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
             )
 
             color_mode = self._modes.white
-            states[self._config.get(CONF_BRIGHTNESS)] = brightness
+            # A CCT lamp may have no brightness DP at all: writing the None
+            # key produced a "null" JSON key and the device rejected the
+            # whole command.
+            if (bright_dp := self._config.get(CONF_BRIGHTNESS)) and brightness is not None:
+                states[bright_dp] = brightness
             states[self._config.get(CONF_COLOR_TEMP)] = color_temp
 
         if ATTR_WHITE in kwargs and ColorMode.WHITE in color_modes:
@@ -658,6 +673,10 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
     def status_restored(self, stored_state) -> None:
         """Device status was restored."""
+        # The base implementation is what populates _last_state from the
+        # stored attributes: without it _last_state was always None here.
+        super().status_restored(stored_state)
+
         restore_attrs = (CONF_COLOR_MODE, CONF_COLOR, CONF_BRIGHTNESS, CONF_COLOR_TEMP)
         if self._write_only:
             for attr in restore_attrs:
@@ -666,7 +685,7 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
                 if None in (dp, restored_value):
                     continue
                 self._cached_status[dp] = restored_value
-                self._state = self._last_state
+            self._state = self._last_state
 
 
 async_setup_entry = partial(async_setup_entry, DOMAIN, LocalTuyaLight, flow_schema)

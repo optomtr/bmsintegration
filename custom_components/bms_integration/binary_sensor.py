@@ -77,15 +77,21 @@ class LocalTuyaBinarySensor(LocalTuyaEntity, BinarySensorEntity):
             @callback
             def async_reset_state(now):
                 """Set the state of the entity to off."""
-                # "_update_handler" logic, if status hasn't changed "status_updated" will not be called.
-                # Maybe we can find better solution then this workaround?
-                self._status[self._dp_id] = "reset_state_binary_sensor"
+                self._reset_timer_interval = None
+                # Drop the cached DP instead of writing a sentinel into it:
+                # the sentinel leaked into dp_value() and was stored as the
+                # restored ATTR_STATE. Removing the key makes the next
+                # identical trigger from the device count as a change again.
+                self._status.pop(self._dp_id, None)
                 self._is_on = False
                 self.async_write_ha_state()
 
             self._reset_timer_interval = async_call_later(
                 self.hass, self._reset_timer, async_reset_state
             )
+            # Cancel a pending reset when the entity is removed, otherwise it
+            # would write state on a dead entity after a reload.
+            self.async_on_remove(self._reset_timer_interval)
 
     # No need to restore state for a sensor
     async def restore_state_when_connected(self):

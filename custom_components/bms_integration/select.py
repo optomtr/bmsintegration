@@ -92,7 +92,9 @@ class LocalTuyaSelect(LocalTuyaEntity, SelectEntity):
     # Default value is the first option
     def entity_default_value(self):
         """Return the first option as the default value for this entity type."""
-        return self._options.names[0]
+        # An empty options dict is allowed by the config schema: raising
+        # IndexError here used to abort the whole device connection.
+        return self._options.names[0] if self._options.names else None
 
 
 async_setup_entry = partial(async_setup_entry, DOMAIN, LocalTuyaSelect, flow_schema)

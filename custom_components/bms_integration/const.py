@@ -256,12 +256,12 @@ class DictSelector:
     @property
     def values(self) -> list:
         """Return options Tuya keys."""
-        return getattr(self, "_cached_keys__tuya_ha", list(self.tuya_ha.keys()))
+        return list(self.tuya_ha.keys())
 
     @property
     def names(self) -> list:
         """Return options HA values."""
-        return getattr(self, "_cached_values_tuya_ha", list(self.tuya_ha.values()))
+        return list(self.tuya_ha.values())
 
     def to_ha(self, value: str, default=None):
         """Return the friendly name."""
@@ -269,13 +269,22 @@ class DictSelector:
 
     def to_tuya(self, name: str):
         """Return the tuya value."""
-        reversed_dict = getattr(
-            self, "_cached_reverse_tuya_ha", {v: k for k, v in self.tuya_ha.items()}
-        )
-        return reversed_dict.get(name)
+        return {v: k for k, v in self.tuya_ha.items()}.get(name)
+
+    def __bool__(self) -> bool:
+        """An empty selector is falsy.
+
+        Several `if dp and modes:` feature checks relied on this. Without
+        __bool__ every instance was truthy, so features such as PRESET,
+        SWING and FAN were advertised with an empty option list.
+        """
+        return bool(self.tuya_ha)
+
+    def __len__(self) -> int:
+        return len(self.tuya_ha)
 
     def __repr__(self) -> str:
-        return "valid" if self.tuya_ha else ""
+        return f"DictSelector({self.tuya_ha})"
 
 
 @dataclass

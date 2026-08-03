@@ -81,7 +81,17 @@ class LocalTuyaNumber(LocalTuyaEntity, NumberEntity):
         # Override standard default value handling to cast to a float
         default_value = self._config.get(CONF_DEFAULT_VALUE)
         if default_value is not None:
-            self._default_value = float(default_value)
+            try:
+                self._default_value = float(default_value)
+            except (TypeError, ValueError):
+                # The config schema accepts a free-form string: a bad value
+                # must not abort setting up the whole number platform.
+                _LOGGER.warning(
+                    "Ignoring non-numeric default value %r for DP %s",
+                    default_value,
+                    self._dp_id,
+                )
+                self._default_value = None
 
     @property
     def native_value(self) -> float:
@@ -120,7 +130,9 @@ class LocalTuyaNumber(LocalTuyaEntity, NumberEntity):
         if scale_factor := self._config.get(CONF_SCALING):
             value = value / float(scale_factor)
 
-        await self._device.set_dp(int(value), self._dp_id)
+        # round(), not int(): floating point division commonly yields
+        # X.9999..., and truncating it sent 4.2 to the device for a 4.3 request.
+        await self._device.set_dp(round(value), self._dp_id)
 
     # Default value is the minimum value
     def entity_default_value(self):

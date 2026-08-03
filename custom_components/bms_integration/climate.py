@@ -80,9 +80,9 @@ RENAME_ACTION_SETS = {  # Migrate to 3
 RENAME_PRESET_SETS = {  # Migrate to 3
     "Holiday": (PRESET_AWAY),
     "Program": (PRESET_HOME),
+    # "Manual" used to be declared twice; the first mapping was dead.
     "Manual": (PRESET_NONE, "manual"),
     "Auto": "auto",
-    "Manual": "manual",
     "Smart": "smart",
     "Comfort": "comfortable",
     "ECO": "eco",
@@ -166,11 +166,12 @@ def flow_schema(dps):
 
 # Converters
 def f_to_c(num):
-    return (num - 32) * 5 / 9 if num else num
+    # `if num` would return 0 unchanged: 0 °F is -17.8 °C, not 0 °C.
+    return (num - 32) * 5 / 9 if num is not None else num
 
 
 def c_to_f(num):
-    return (num * 1.8) + 32 if num else num
+    return (num * 1.8) + 32 if num is not None else num
 
 
 def config_unit(unit):
@@ -530,16 +531,17 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
         """Device status was updated."""
         self._state = self.dp_value(self._dp_id)
 
-        # Update target temperature
+        # Update target temperature. `is not None`, not truthiness: a real
+        # reading of 0 degrees used to be discarded as "no data".
         if self.has_config(CONF_TARGET_TEMPERATURE_DP) and (
             target_dp_value := self.dp_value(CONF_TARGET_TEMPERATURE_DP)
-        ):
+        ) is not None:
             self._target_temperature = target_dp_value * self._precision_target
 
         # Update current temperature
         if self.has_config(CONF_CURRENT_TEMPERATURE_DP) and (
             current_dp_temp := self.dp_value(CONF_CURRENT_TEMPERATURE_DP)
-        ):
+        ) is not None:
             self._current_temperature = current_dp_temp * self._precision
 
         # Force the Current temperature and Target temperature to matching the unit.
@@ -567,9 +569,12 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
         if not self._is_on:
             return
 
-        # Update the HVAC Mode
+        # Update the HVAC Mode. Tuya modes that are not HVAC modes (e.g.
+        # "smart") live in the preset set instead: mapping one of those here
+        # returned None and made the whole climate entity "unknown".
         if (mode := self.dp_value(CONF_HVAC_MODE_DP)) is not None:
-            self._hvac_mode = self._hvac_mode_set.to_ha(mode)
+            if (ha_mode := self._hvac_mode_set.to_ha(mode)) is not None:
+                self._hvac_mode = ha_mode
 
         # Update the current action
         if (action := self.dp_value(CONF_HVAC_ACTION_DP)) is not None:
