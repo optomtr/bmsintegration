@@ -11,6 +11,9 @@ import time
 
 DEVICES_UPDATE_INTERVAL = 300
 DEVICES_UPDATE_INTERVAL_FORCED = 10
+# Without an explicit timeout a stalled cloud connection could hang a
+# config flow step or a key refresh indefinitely.
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=20)
 
 TUYA_ENDPOINTS = {
     # Regions code
@@ -171,7 +174,9 @@ class TuyaCloudApi:
             try:
                 if method == "GET":
                     async with session.get(
-                        full_url, headers=dict(default_par, **headers)
+                        full_url,
+                        headers=dict(default_par, **headers),
+                        timeout=REQUEST_TIMEOUT,
                     ) as resp:
                         return await _read_json(resp)
 
@@ -180,6 +185,7 @@ class TuyaCloudApi:
                         full_url,
                         headers=dict(default_par, **headers),
                         data=json.dumps(body),
+                        timeout=REQUEST_TIMEOUT,
                     ) as resp:
                         return await _read_json(resp)
 
@@ -188,6 +194,7 @@ class TuyaCloudApi:
                         full_url,
                         headers=dict(default_par, **headers),
                         data=json.dumps(body),
+                        timeout=REQUEST_TIMEOUT,
                     ) as resp:
                         return await _read_json(resp)
             except asyncio.CancelledError:
@@ -260,10 +267,17 @@ class TuyaCloudApi:
 
     async def async_get_devices_dps_query(self):
         """Update All the devices dps_data."""
-        # Get Devices DPS Data.
-        await asyncio.wait(
-            asyncio.create_task(self.async_get_device_functions(devid))
-            for devid in self.device_list
+        # asyncio.wait() raises on an empty set, and swallowed task
+        # exceptions used to surface as "Task exception was never retrieved".
+        if not self.device_list:
+            return "ok"
+
+        await asyncio.gather(
+            *(
+                self.async_get_device_functions(devid)
+                for devid in list(self.device_list)
+            ),
+            return_exceptions=True,
         )
         return "ok"
 
@@ -333,8 +347,27 @@ class TuyaCloudApi:
             self._logger.debug(f"Failed to get DPS functions for {device_id} - {ex}")
             return
 
+        # Each helper returns None (not a tuple) when its request fails, so
+        # unpacking or indexing it used to raise TypeError and abort the whole
+        # auto-configure step.
+        def _result(value):
+            """Return (data, status) for a helper result, tolerating None."""
+            if isinstance(value, tuple) and len(value) == 2:
+                return value
+            return {}, "failed"
+
+        specs, query_props, query_model = (
+            _result(specs),
+            _result(query_props),
+            _result(query_model),
+        )
+
         if query_props[1] == "ok":
-            device_data = {str(p["dp_id"]): p for p in query_props[0].get("properties")}
+            device_data = {
+                str(p["dp_id"]): p
+                for p in (query_props[0].get("properties") or [])
+                if p.get("dp_id") is not None
+            }
         if specs[1] == "ok":
             for func in specs[0].get("functions", {}):
                 if str(func.get("dp_id")) in device_data:
@@ -342,8 +375,12 @@ class TuyaCloudApi:
                 elif dp_id := func.get("dp_id"):
                     device_data[str(dp_id)] = func
         if query_model[1] == "ok":
-            model_data = json.loads(query_model[0]["model"])
-            services = model_data.get("services", [{}])[0]
+            try:
+                model_data = json.loads(query_model[0]["model"])
+            except (KeyError, TypeError, ValueError) as ex:
+                self._logger.debug(f"Invalid data model for {device_id}: {ex}")
+                model_data = {}
+            services = (model_data.get("services") or [{}])[0]
             properties = services.get("properties")
             for dp_data in properties if properties else {}:
                 refactored = {

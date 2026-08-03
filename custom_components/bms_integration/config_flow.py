@@ -572,11 +572,9 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
             if dev_id in cloud_devs:
                 cloud_local_key = cloud_devs[dev_id].get(CONF_LOCAL_KEY)
                 if defaults[CONF_LOCAL_KEY] != cloud_local_key:
-                    _LOGGER.info(
-                        "New local_key detected: new %s vs old %s",
-                        cloud_local_key,
-                        defaults[CONF_LOCAL_KEY],
-                    )
+                    # Never log the key itself: it grants full local control
+                    # of the device and logs are routinely shared.
+                    _LOGGER.info("New local_key detected for device %s", dev_id)
                     defaults[CONF_LOCAL_KEY] = cloud_devs[dev_id].get(CONF_LOCAL_KEY)
                     note = "\nNOTE: a new local_key has been retrieved using cloud API"
                     placeholders = {"for_device": f" for device `{dev_id}`.{note}"}
@@ -1235,6 +1233,7 @@ async def validate_input(entry_runtime: HassLocalTuyaData, data):
 
                     # Break the loop if input isn't auto.
                     if not auto_protocol:
+                        error = None
                         break
 
                     # If Auto: using DPS detected we will assume this is the correct version if dps found.
@@ -1242,6 +1241,10 @@ async def validate_input(entry_runtime: HassLocalTuyaData, data):
                         # Set the conf_protocol to the worked version to return it and update self.device_data.
                         logger.info(f"Detected DPS: {detected_dps}")
                         conf_protocol = version
+                        # An earlier protocol attempt may have recorded an
+                        # error; this version worked, so it must not make the
+                        # flow report invalid_auth.
+                        error = None
                         break
 
                 except ConnectionAbortedError:
@@ -1253,7 +1256,16 @@ async def validate_input(entry_runtime: HassLocalTuyaData, data):
                     logger.error(f"Connection failed! {ex}")
                     error = ex
                     break
-                except:
+                except asyncio.CancelledError:
+                    raise
+                except Exception as ex:  # pylint: disable=broad-except
+                    logger.debug("Protocol %s did not answer: %s", version, ex)
+                    # Close this attempt's socket before trying the next
+                    # protocol version, otherwise every failed attempt leaks
+                    # a connection to the device.
+                    if interface is not None:
+                        await interface.close()
+                        interface = None
                     continue
                 finally:
                     if not auto_protocol and data.get(CONF_DEVICE_SLEEP_TIME, 0) > 0:
@@ -1317,7 +1329,10 @@ async def validate_input(entry_runtime: HassLocalTuyaData, data):
     cloud_dp_codes = {}
     cloud_data = entry_runtime.cloud_data
     if (dev_id := data.get(CONF_DEVICE_ID)) in cloud_data.device_list:
-        cloud_dp_codes = await cloud_data.async_get_device_functions(dev_id)
+        # A cloud failure must not abort configuring a device that answered
+        # locally: the helper returns None on error, and dps_string_list(None)
+        # then raised.
+        cloud_dp_codes = await cloud_data.async_get_device_functions(dev_id) or {}
 
     # Indicate an error if no datapoints found as the rest of the flow
     # won't work in this case
@@ -1332,6 +1347,12 @@ async def validate_input(entry_runtime: HassLocalTuyaData, data):
         raise EmptyDpsList
 
     logger.info("Total DPS: %s", detected_dps)
+    if conf_protocol == "auto":
+        # Detection never settled on a version (e.g. the handshake was
+        # bypassed). Storing the literal "auto" would break the runtime,
+        # which does float(protocol_version).
+        conf_protocol = SUPPORTED_PROTOCOL_VERSIONS[0]
+        logger.info("Protocol autodetection inconclusive: using %s", conf_protocol)
     return {
         CONF_DPS_STRINGS: dps_string_list(detected_dps, cloud_dp_codes),
         CONF_PROTOCOL_VERSION: conf_protocol,
