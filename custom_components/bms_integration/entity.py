@@ -146,7 +146,6 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
         self._device_config = DeviceConfig(device_config)
         self._config = get_entity_config(device_config, dp_id)
         self._dp_id = dp_id
-        self._tracked_dp_ids = self._collect_tracked_dp_ids()
         self._status = {}
         self._state = None
         self._last_state = None
@@ -166,30 +165,6 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
         self.set_logger(logger, dev.id, dev.enable_debug, dev.name)
         self.debug(f"Initialized {self._config.get(CONF_PLATFORM)} [{self.name}]")
 
-    def _collect_tracked_dp_ids(self) -> set[str]:
-        """Return datapoints that can affect this entity state or attributes."""
-        tracked = {str(self._dp_id)}
-        for value in self._config.values():
-            if isinstance(value, int):
-                tracked.add(str(value))
-            elif isinstance(value, str) and value.isdigit():
-                tracked.add(value)
-        return tracked
-
-    def _primary_state_signature(self) -> tuple:
-        """Return the state parts that should create a HA history entry."""
-        attrs = (
-            "_state",
-            "_attr_is_on",
-            "_attr_native_value",
-            "_attr_current_option",
-            "_attr_current_operation",
-            "_attr_hvac_mode",
-            "_attr_percentage",
-            "_attr_current_cover_position",
-        )
-        return tuple((attr, getattr(self, attr, None)) for attr in attrs if hasattr(self, attr))
-
     async def async_added_to_hass(self):
         """Subscribe localtuya events."""
         await super().async_added_to_hass()
@@ -203,47 +178,27 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
 
         def _update_handler(status: dict | None):
             """Update entity state when status was updated."""
-            old_status = self._status.copy()
-            was_loaded = self._loaded
-            old_available = self.available
-            old_primary_state = self._primary_state_signature()
-            changed_dps = set()
-
             if status is None:
+                # Device was reported unavailable: drop the cached status so
+                # the `available` property reflects it.
                 self._status = {}
             else:
-                missing = object()
-                for dp_id, value in status.items():
-                    old_value = old_status.get(dp_id, old_status.get(str(dp_id), missing))
-                    if old_value != value:
-                        changed_dps.add(str(dp_id))
                 self._status = {**self._status, **status}
 
             if not self._loaded:
                 self._loaded = True
                 self.connection_made()
 
-            should_update = (
-                status is None
-                or not was_loaded
-                or bool(changed_dps & self._tracked_dp_ids)
-            )
+            if status:
+                self.status_updated()
 
-            if should_update:
-                if status:
-                    self.status_updated()
-
-                primary_state_changed = (
-                    old_available != self.available
-                    or old_primary_state != self._primary_state_signature()
-                )
-                if status is None or not was_loaded or primary_state_changed:
-                    self.schedule_update_ha_state()
-                else:
-                    self.debug(
-                        f"Suppressing duplicate HA update for {self.name}; "
-                        f"changed DPS {sorted(changed_dps)} did not change primary state"
-                    )
+            # Always write the state: HA's state machine deduplicates identical
+            # state+attribute writes on its own. Suppressing writes here froze
+            # platform attributes (climate temperatures, light brightness,
+            # cover positions, the entire fan state, lock/water_heater/vacuum
+            # state) and stranded entities in `unavailable` after a reconnect
+            # whenever DP values had not changed while the device was offline.
+            self.schedule_update_ha_state()
 
         signal = f"{DOMAIN}_{self._device_config.id}"
 
