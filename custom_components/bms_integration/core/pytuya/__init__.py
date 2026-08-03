@@ -295,7 +295,11 @@ class MessageDispatcher(ContextualLogger):
             response = await asyncio.wait_for(future, timeout=timeout)
             return response
         except asyncio.TimeoutError:
-            self.abort()
+            # Time out ONLY this waiter. Cancelling every pending listener
+            # here (the old abort()) turned a single missed reply into a
+            # cascade: the heartbeat future got cancelled too, its loop
+            # treated that as a stop request and tore down the whole -
+            # possibly shared gateway - session.
             raise TimeoutError(
                 f"Command {cmd} timed out waiting for sequence number {seqno}"
             )
@@ -313,60 +317,89 @@ class MessageDispatcher(ContextualLogger):
             self.debug(f"{seqno} - Got additional message without request: skip {msg}")
 
     def add_data(self, data: bytes):
-        """Add new data to the buffer and try to parse messages."""
+        """Add new data to the buffer and try to parse messages.
+
+        Parses by the length declared in the message header instead of
+        searching for suffixes: a fragmented message stays in the buffer
+        until the rest arrives, every complete message is dispatched
+        immediately, and garbage between messages is skipped by resyncing
+        on the next known prefix.
+        """
         self.buffer += data
-        prefixes_bin = {prefix.bin for prefix in Affix.prefixes}
-        suffixes_bin = {suffix.bin for suffix in Affix.suffixes}
-        header_len = struct.calcsize(MessagesFormat.END_55AA)
+
         while self.buffer:
+            # Align the buffer to the earliest known prefix.
+            offsets = [
+                off
+                for off in (
+                    self.buffer.find(Affix.prefix_55aa.bin),
+                    self.buffer.find(Affix.prefix_6699.bin),
+                )
+                if off != -1
+            ]
+            if not offsets:
+                # No prefix in the buffer. Keep a short tail: a prefix may
+                # arrive split across two TCP segments.
+                if len(self.buffer) > 3:
+                    self.debug(f"Discarding data without prefix: {self.buffer!r}")
+                    self.buffer = self.buffer[-3:]
+                break
 
-            # Check if enough data for measage header
+            if (prefix_offset := min(offsets)) > 0:
+                self.debug(f"Skipping {prefix_offset} bytes before prefix")
+                self.buffer = self.buffer[prefix_offset:]
+
+            if self.buffer[:4] == Affix.prefix_6699.bin:
+                header_len = struct.calcsize(MessagesFormat.HEADER_6699)
+            else:
+                header_len = struct.calcsize(MessagesFormat.HEADER_55AA)
             if len(self.buffer) < header_len:
-                break
+                break  # wait for the rest of the header
 
-            if (prefix_index := self.buffer.find(Affix.prefix_55aa.bin)) == -1:
-                prefix_index = self.buffer.find(Affix.prefix_6699.bin)
+            try:
+                header = parser.parse_header(self.buffer, logger=self)
+            except parser.DecodeError as ex:
+                # Corrupt header (e.g. insane length): skip this prefix and
+                # resync on the next one instead of dropping the connection.
+                self.debug(f"Corrupt header, resyncing: {ex}")
+                self.buffer = self.buffer[4:]
+                continue
 
-            if prefix_index == -1:
-                self.debug(f"Invalid prefix: {self.buffer!r}")
-                self.buffer = b""
-            elif self.buffer[:4] not in (prefixes_bin) and prefix_index > 0:
-                self.debug(f"prefix is not at the end: {self.buffer}")
-                self.buffer = self.buffer[prefix_index:]
-
-            if (suffix_index := self.buffer.find(Affix.suffix_55aa.bin)) == -1:
-                suffix_index = self.buffer.find(Affix.suffix_6699.bin)
-
-            # if not any (self.buffer.endswith(suffix) for suffix in suffixes)
-            if suffix_index == -1:
-                self.debug(f"Invalid suffix: {self.buffer!r}")
-                self.buffer = b""
-            if not any(self.buffer.endswith(suffix_bin) for suffix_bin in suffixes_bin):
-                self.debug(f"suffix is not at the end: {self.buffer!r}")
-                break
-                # self.buffer = self.buffer[: suffix_index + 4]
-
-            header = parser.parse_header(self.buffer, logger=self)
             if len(self.buffer) < header.total_length:
-                self.debug(f"Not enough data to parse: {self.buffer}")
-                break  # not enough data.
+                break  # fragmented message: wait for the rest, keep the buffer
 
             hmac_key = self.local_key if self.version >= 3.4 else None
-            no_retcode = False
-            msg = parser.unpack_message(
-                self.buffer,
-                header=header,
-                hmac_key=hmac_key,
-                no_retcode=no_retcode,
-                logger=self,
-            )
+            try:
+                msg = parser.unpack_message(
+                    self.buffer,
+                    header=header,
+                    hmac_key=hmac_key,
+                    no_retcode=False,
+                    logger=self,
+                )
+            except parser.DecodeError as ex:
+                self.debug(f"Failed to unpack message, resyncing: {ex}")
+                self.buffer = self.buffer[4:]
+                continue
+
             self.buffer = self.buffer[header.total_length :]
+
+            if not msg.crc_good:
+                # Wrong CRC/HMAC, or an undecryptable 6699 payload (most
+                # likely a wrong local_key): the content cannot be trusted
+                # and must not reach the listeners.
+                self.warning(f"Dropping message with bad CRC/HMAC (cmd {msg.cmd})")
+                continue
+
             self._dispatch(msg)
 
     def _dispatch(self, msg: TuyaMessage):
         """Dispatch a message to someone that is listening."""
 
         self.debug("Dispatching message CMD %r %s", msg.cmd, msg)
+        if msg.retcode:
+            # A non-zero retcode is a device-side error for the command.
+            self.debug("Device returned error retcode %s for CMD %r", msg.retcode, msg.cmd)
 
         if msg.seqno in self.listeners:
             self.debug("Dispatching sequence number %d", msg.seqno)
@@ -493,6 +526,7 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         self.dispatched_dps = {}  # Store payload so we can trigger an event in HA.
         self._last_command_sent = 1  # The time last command was sent
         self._write_lock = asyncio.Lock()  # To serialize writes
+        self._negotiation_lock = asyncio.Lock()  # Single session key negotiation
         self.enable_debug(enable_debug)
 
     def set_version(self, protocol_version):
@@ -760,10 +794,15 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         if not self.is_connected:
             return None
 
-        if self.version >= 3.4 and self.real_local_key == self.local_key:
-            self.debug("3.4 or 3.5 device: negotiating a new session key")
-            if not await self._negotiate_session_key():
-                return self.clean_up_session()
+        if self.version >= 3.4:
+            # The lock closes a check-then-act race: two concurrent commands
+            # (e.g. a user command and the watchdog probe) both saw the
+            # un-negotiated key and started two interleaved negotiations.
+            async with self._negotiation_lock:
+                if self.real_local_key == self.local_key:
+                    self.debug("3.4 or 3.5 device: negotiating a new session key")
+                    if not await self._negotiate_session_key():
+                        return self.clean_up_session()
 
         self.debug(
             "Sending command %s (device type: %s) DPS: %s", command, self.dev_type, dps
@@ -1082,6 +1121,9 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
                 binascii.hexlify(hmac_check),
                 binascii.hexlify(payload[16:48]),
             )
+            # The peer failed to prove knowledge of the local key: negotiating
+            # further would silently derive a garbage session key.
+            return False
 
         # self.debug("session local nonce: %r remote nonce: %r", self.local_nonce, self.remote_nonce)
         rkey_hmac = hmac.new(self.local_key, self.remote_nonce, sha256).digest()
@@ -1275,8 +1317,10 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         if reqType and "reqType" in json_data:
             json_data["reqType"] = reqType
         if "t" in json_data:
-            t = time.time()
-            json_data["uid"] = int(t) if json_data["t"] == "int" else str(int(t))
+            # The timestamp belongs in "t" (upstream tinytuya behavior);
+            # writing it into "uid" corrupted both fields of the payload.
+            t = int(time.time())
+            json_data["t"] = t if json_data["t"] == "int" else str(t)
 
         payload = json.dumps(json_data, separators=(",", ":")) if json_data else ""
 

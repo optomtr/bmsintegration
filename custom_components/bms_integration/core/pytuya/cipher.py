@@ -2,7 +2,7 @@
 
 import logging
 import base64
-import time
+import os
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -22,10 +22,11 @@ class AESCipher:
         """Encrypt data to be sent to device."""
         if iv:
             if iv is True:
-                if _LOGGER.isEnabledFor(logging.DEBUG):
-                    iv = b"0123456789ab"
-                else:
-                    iv = str(time.time() * 10)[:12].encode("utf8")
+                # A GCM nonce must never repeat for the same key. The old
+                # time-based nonce (0.1 s granularity, or a CONSTANT when
+                # debug logging was on) could repeat between two commands
+                # sent within the same 100 ms window.
+                iv = os.urandom(12)
             encryptor = Cipher(algorithms.AES(self.key), modes.GCM(iv)).encryptor()
             if header:
                 encryptor.authenticate_additional_data(header)

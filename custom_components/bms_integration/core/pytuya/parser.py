@@ -178,7 +178,9 @@ def parse_header(data: bytes, logger=_LOGGER):
     elif data[:4] == Affix.prefix_55aa.bin:
         fmt = MessagesFormat.HEADER_55AA
     else:
-        err = f"Prefix Does not match! {prefix} known {set(p for p in Affix.prefixes)}"
+        # NOTE: referencing the (unassigned) `prefix` here used to raise a
+        # NameError instead of the intended DecodeError.
+        err = f"Prefix does not match! {data[:4]!r} known {set(p for p in Affix.prefixes)}"
         logger.error(err)
         raise DecodeError(err)
 
