@@ -265,7 +265,13 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
     @property
     def available(self) -> bool:
         """Return if device is available or not."""
-        return (len(self._status) > 0) or self._device.available
+        # A sleeping device is only reachable in short windows, so cached
+        # values keep it available. For every other device the connection
+        # decides: having a (possibly restored) status must not keep a dead
+        # device available forever.
+        if self._device.is_sleep and self._status:
+            return True
+        return self._device.available
 
     @property
     def entity_category(self) -> str:
@@ -476,7 +482,17 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
             str(dp): self._status.get(str(dp), _MISSING) for dp in optimistic_status
         }
         self._apply_optimistic_status(optimistic_status)
-        self.hass.async_create_task(self._send_dps_background(status, rollback))
+        # Tie the task to the config entry so it is cancelled on unload
+        # instead of outliving the integration.
+        entry = getattr(self, "platform", None) and self.platform.config_entry
+        if entry is not None:
+            entry.async_create_background_task(
+                self.hass,
+                self._send_dps_background(status, rollback),
+                f"{DOMAIN}-optimistic-{self.unique_id}",
+            )
+        else:
+            self.hass.async_create_task(self._send_dps_background(status, rollback))
 
     async def async_set_dp(self, value, dp_id):
         """Set a single DP, optionally returning to Home Assistant optimistically."""

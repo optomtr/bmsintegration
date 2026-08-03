@@ -27,6 +27,8 @@ PREFIX_6699_BIN = b"\x00\x00\x66\x99"
 UDP_COMMAND = b"\x00\x00\x00\x00"
 
 DEFAULT_TIMEOUT = 6.0
+# Upper bound for the discovered-devices cache (unconfigured devices too).
+MAX_TRACKED_DEVICES = 512
 
 
 def decrypt(msg, key):
@@ -77,7 +79,18 @@ class TuyaDiscovery(asyncio.DatagramProtocol):
         # tuyaApp_encrypted_listener = loop.create_datagram_endpoint(
         #     lambda: self, local_addr=("0.0.0.0", 7000), **op_reuse_port
         # )
-        self._listeners = await asyncio.gather(listener, encrypted_listener)
+        # return_exceptions: if the second bind fails, the first socket must
+        # still be closed instead of being leaked for the lifetime of HA.
+        results = await asyncio.gather(
+            listener, encrypted_listener, return_exceptions=True
+        )
+        opened = [res for res in results if not isinstance(res, BaseException)]
+        if errors := [res for res in results if isinstance(res, BaseException)]:
+            for transport, _ in opened:
+                transport.close()
+            raise errors[0]
+
+        self._listeners = opened
         _LOGGER.debug("Listening to broadcasts on UDP port 6666, 6667")
 
     def close(self):
@@ -91,15 +104,25 @@ class TuyaDiscovery(asyncio.DatagramProtocol):
         try:
             try:
                 data = decrypt_udp(data)
-            except Exception as ex:  # pylint: disable=broad-except
+            except Exception:  # pylint: disable=broad-except
                 data = data.decode()
             decoded = json.loads(data)
-            self.device_found(decoded)
-        except (json.JSONDecodeError, Exception) as ex:
-            # _LOGGER.debug("Bordcast from app from ip: %s", addr[0])
+        except Exception as ex:  # pylint: disable=broad-except
             _LOGGER.debug(
                 "Failed to decode broadcast from %r: %r [%s]", addr[0], data, ex
             )
+            return
+
+        if not isinstance(decoded, dict) or not decoded.get("gwId"):
+            _LOGGER.debug("Ignoring malformed broadcast from %r", addr[0])
+            return
+
+        # Separate try: an error raised by the callback used to be reported
+        # as a decoding failure, hiding real bugs downstream.
+        try:
+            self.device_found(decoded)
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.exception("Error handling discovered device from %r", addr[0])
 
     def device_found(self, device):
         """Discover a new device."""
@@ -109,12 +132,19 @@ class TuyaDiscovery(asyncio.DatagramProtocol):
             self.devices.pop(gwid)
 
         if gwid not in self.devices:
+            # Bound the cache: the network can announce devices that are not
+            # (and never will be) configured here.
+            if len(self.devices) >= MAX_TRACKED_DEVICES:
+                self.devices.pop(next(iter(self.devices)))
             self.devices[gwid] = device
-            # Sort devices by ip.
-            sort_devices = sorted(
-                self.devices.items(), key=lambda i: inet_aton(i[1].get("ip", "0"))
-            )
-            self.devices = dict(sort_devices)
+            # Sort devices by ip. A non-IPv4 value must not raise here.
+            def _ip_key(item):
+                try:
+                    return inet_aton(item[1].get("ip") or "0.0.0.0")
+                except OSError:
+                    return inet_aton("255.255.255.255")
+
+            self.devices = dict(sorted(self.devices.items(), key=_ip_key))
 
             _LOGGER.debug("Discovered device: %s", device)
         if self._callback:

@@ -1,11 +1,9 @@
 """The LocalTuya integration."""
 
 import asyncio
-from dataclasses import dataclass
+import copy
 import logging
 import time
-from datetime import timedelta
-from typing import Any, NamedTuple
 
 import homeassistant.helpers.config_validation as cv
 import homeassistant.helpers.device_registry as dr
@@ -19,7 +17,6 @@ from homeassistant.const import (
     CONF_DEVICE_ID,
     CONF_ENTITIES,
     CONF_HOST,
-    CONF_ID,
     CONF_PLATFORM,
     CONF_REGION,
     EVENT_HOMEASSISTANT_STOP,
@@ -59,6 +56,9 @@ CONF_VALUE = "value"
 STARTUP_CONNECT_STAGGER_SECONDS = 0.2
 STARTUP_RECOVERY_DELAYS = (30, 90, 180)
 STARTUP_RECOVERY_STAGGER_SECONDS = 0.3
+# Minimum time between two discovery-driven address changes of one device.
+# Each change reloads the whole config entry, so flapping must be damped.
+DISCOVERY_UPDATE_COOLDOWN = 60.0
 
 SERVICE_SET_DP = "set_dp"
 SERVICE_UPDATE_DPS = "update_dps"
@@ -81,8 +81,9 @@ async def async_setup(hass: HomeAssistant, config: dict):
     """Set up the LocalTuya integration component."""
     hass.data.setdefault(DOMAIN, {})
 
-    current_entries = hass.config_entries.async_entries(DOMAIN)
     device_cache = {}
+    # device_id -> monotonic timestamp of the last address change applied.
+    _last_ip_update: dict[str, float] = {}
 
     async def _handle_reload(service: ServiceCall):
         """Handle reload service call."""
@@ -147,7 +148,9 @@ async def async_setup(hass: HomeAssistant, config: dict):
         if entry is None:
             return
 
-        hass_data: HassLocalTuyaData = hass.data[DOMAIN][entry.entry_id]
+        # The entry may be mid-unload: hass.data no longer holds it.
+        if entry.entry_id not in hass.data.get(DOMAIN, {}):
+            return
 
         if device_id not in device_cache or device_id not in device_cache.get(
             device_id, {}
@@ -172,11 +175,7 @@ async def async_setup(hass: HomeAssistant, config: dict):
         if not entry.state == ConfigEntryState.LOADED:
             return
 
-        if device := hass_data.devices.get(device_ip):
-            ...
-
-        # hass.create_task(hass_data.cloud_data.async_get_devices_list())
-        new_data = entry.data.copy()
+        new_data = copy.deepcopy(dict(entry.data))
         updated = False
         for dev_id, host in device_cache[device_id].items():
             if dev_id not in entry.data[CONF_DEVICES]:
@@ -193,12 +192,30 @@ async def async_setup(hass: HomeAssistant, config: dict):
         # Update settings if something changed, otherwise try to connect. Updating
         # settings triggers a reload of the config entry, which tears down the device
         # so no need to connect in that case.
-        if updated:
+        if not updated:
+            return
+
+        # Rate limit: two hosts claiming the same gwId (a cloned device, a
+        # spoofed broadcast, a dual-homed gateway) used to flip the address
+        # back and forth, and every flip reloaded the whole config entry -
+        # dropping the connection of every device in it.
+        now = time.monotonic()
+        last_update = _last_ip_update.get(device_id)
+        if last_update is not None and (now - last_update) < DISCOVERY_UPDATE_COOLDOWN:
             _LOGGER.debug(
-                "Updating keys for device %s: %s %s", device_id, device_ip, product_key
+                "Ignoring address change for %s to %s: updated %.0fs ago",
+                device_id,
+                device_ip,
+                now - last_update,
             )
-            new_data[ATTR_UPDATED_AT] = str(int(time.time() * 1000))
-            hass.config_entries.async_update_entry(entry, data=new_data)
+            return
+        _last_ip_update[device_id] = now
+
+        _LOGGER.debug(
+            "Updating keys for device %s: %s %s", device_id, device_ip, product_key
+        )
+        new_data[ATTR_UPDATED_AT] = str(int(time.time() * 1000))
+        hass.config_entries.async_update_entry(entry, data=new_data)
 
     def _shutdown(event):
         """Clean up resources when shutting down."""
@@ -230,7 +247,6 @@ async def async_setup(hass: HomeAssistant, config: dict):
 async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry):
     """Migrate old entries merging all of them in one."""
     new_version = ENTRIES_VERSION
-    stored_entries = hass.config_entries.async_entries(DOMAIN)
     if config_entry.version == 1:
         # This an old version of original integration no need to put it here.
         pass
@@ -401,7 +417,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     connect_to_devices = _setup_devices(entry.data[CONF_DEVICES])
 
-    await async_remove_orphan_entities(hass, entry)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS.values())
 
     # Note: entry.async_on_unload items are called in LIFO order!
@@ -615,25 +630,6 @@ async def async_remove_config_entry_device(
     _LOGGER.info("Device %s removed.", dev_id)
 
     return True
-
-
-async def async_remove_orphan_entities(hass, entry):
-    """Remove entities associated with config entry that has been removed."""
-    return
-    ent_reg = er.async_get(hass)
-    entities = {
-        ent.unique_id: ent.entity_id
-        for ent in er.async_entries_for_config_entry(ent_reg, entry.entry_id)
-    }
-    _LOGGER.info("ENTITIES ORPHAN %s", entities)
-    return
-
-    for entity in entry.data[CONF_ENTITIES]:
-        if entity[CONF_ID] in entities:
-            del entities[entity[CONF_ID]]
-
-    for entity_id in entities.values():
-        ent_reg.async_remove(entity_id)
 
 
 def _run_async_listen(hass: HomeAssistant, entry: ConfigEntry):

@@ -13,6 +13,7 @@ from typing import Any, NamedTuple
 
 from homeassistant.core import HomeAssistant, CALLBACK_TYPE, callback, State
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.const import CONF_ID, CONF_DEVICES, CONF_HOST, CONF_DEVICE_ID
 from homeassistant.helpers.event import async_track_time_interval, async_call_later
 from homeassistant.helpers.dispatcher import (
@@ -63,8 +64,10 @@ GATEWAY_WATCHDOG_INTERVAL = timedelta(seconds=30)
 GATEWAY_WATCHDOG_STAGGER_SECONDS = 0.5
 # A single missed status reply must not tear down an otherwise healthy session.
 GATEWAY_WATCHDOG_FAILURE_THRESHOLD = 2
-# Subdevice: Offline events before disconnecting the device, around 5 minutes
-MIN_OFFLINE_EVENTS = 5 * 60 // HEARTBEAT_INTERVAL
+# Subdevice: Offline events before disconnecting the device, around 5 minutes.
+# int(): HEARTBEAT_INTERVAL is a float, so "//" yielded a float that never
+# compared equal to the integer offline counter.
+MIN_OFFLINE_EVENTS = int(5 * 60 // HEARTBEAT_INTERVAL)
 
 
 class HassLocalTuyaData(NamedTuple):
@@ -118,6 +121,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._task_connect: asyncio.Task | None = None
         self._task_reconnect: asyncio.Task | None = None
         self._task_shutdown_entities: asyncio.Task | None = None
+        self._task_subdevices: asyncio.Task | None = None
         self._health_check_lock = asyncio.Lock()
         self._health_check_failures = 0
         self._unsub_refresh: CALLBACK_TYPE | None = None
@@ -458,7 +462,12 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                     await self.set_status()
 
                 if self.sub_devices:
-                    asyncio.create_task(self._connect_subdevices())
+                    # Keep a reference: a bare create_task can be garbage
+                    # collected mid-flight, and close() must be able to
+                    # cancel it.
+                    self._task_subdevices = asyncio.create_task(
+                        self._connect_subdevices()
+                    )
 
                 self._interface.keep_alive(len(self.sub_devices) > 0)
             except asyncio.CancelledError:
@@ -513,7 +522,12 @@ class TuyaDevice(TuyaListener, ContextualLogger):
 
         self.is_closing = True
 
-        tasks = [self._task_shutdown_entities, self._task_reconnect, self._task_connect]
+        tasks = [
+            self._task_shutdown_entities,
+            self._task_reconnect,
+            self._task_connect,
+            self._task_subdevices,
+        ]
         pending_tasks = [task for task in tasks if task and task.cancel()]
         await asyncio.gather(*pending_tasks, return_exceptions=True)
 
@@ -563,9 +577,15 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             self._pending_status.update({dp_index: state})
             await asyncio.sleep(0.001)
             await self.set_status()
+        elif self.is_sleep:
+            # Queue it: the device gets the value when it next wakes up.
+            self._pending_status.update({str(dp_index): state})
         else:
-            if self.is_sleep:
-                return self._pending_status.update({str(dp_index): state})
+            # Do not drop the command silently - the entity may still look
+            # available during the reconnect grace period.
+            raise HomeAssistantError(
+                f"Device {self._device_config.name} is not connected"
+            )
 
     async def set_dps(self, states):
         """Change value of a DPs of the Tuya device."""
@@ -573,9 +593,12 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             self._pending_status.update(states)
             await asyncio.sleep(0.001)
             await self.set_status()
+        elif self.is_sleep:
+            self._pending_status.update(states)
         else:
-            if self.is_sleep:
-                return self._pending_status.update(states)
+            raise HomeAssistantError(
+                f"Device {self._device_config.name} is not connected"
+            )
 
     async def async_update_dps(self, dps: list[int] | None = None) -> None:
         """Request a device to publish the current values of its DPS."""
@@ -713,7 +736,10 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         if attempts <= len(RECONNECT_BACKOFF_SECONDS):
             delay = RECONNECT_BACKOFF_SECONDS[attempts - 1]
         else:
-            delay = RECONNECT_INTERVAL.total_seconds()
+            # Stay at the last (longest) step instead of dropping back to the
+            # much shorter RECONNECT_INTERVAL: a device that has been offline
+            # for hours was otherwise polled every 5 seconds forever.
+            delay = max(RECONNECT_BACKOFF_SECONDS[-1], RECONNECT_INTERVAL.total_seconds())
         return scale * delay
 
     async def _async_reconnect(self):
