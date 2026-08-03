@@ -13,3 +13,6 @@ deps/
 home-assistant.log*
 known_devices.yaml
 secrets.yaml
+
+# Output written by the test suites (stub HA config directory).
+tests/ha_config/
