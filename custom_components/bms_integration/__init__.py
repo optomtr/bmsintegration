@@ -247,9 +247,20 @@ async def async_setup(hass: HomeAssistant, config: dict):
 async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry):
     """Migrate old entries merging all of them in one."""
     new_version = ENTRIES_VERSION
-    if config_entry.version == 1:
-        # This an old version of original integration no need to put it here.
-        pass
+    if config_entry.version == 1 or CONF_DEVICES not in config_entry.data:
+        # Version 1 is the pre-2022 layout of the original integration: one
+        # config entry per device, with no devices dict. Everything below
+        # assumes that dict, so bail out with a clear message instead of
+        # raising KeyError. Reachable when an entry is carried over from
+        # upstream LocalTuya.
+        _LOGGER.error(
+            "Config entry %s uses the old per-device layout (version %s) and "
+            "cannot be migrated automatically. Re-add the device through the "
+            "UI, or migrate it with tools/migrate_from_localtuya.py first",
+            config_entry.title or config_entry.entry_id,
+            config_entry.version,
+        )
+        return False
     # Update to version 3
     if config_entry.version == 2:
         # Switch config flow to selectors convert DP IDs from int to str require HA 2022.4.

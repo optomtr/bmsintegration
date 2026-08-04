@@ -74,6 +74,39 @@ If the device also exposes a movement/action DP, set `Gate movement/action DP`. 
 
 If the reed switch is mounted the other way round - it reports `closed` while the gate is actually open - tick **`Invert gate sensor`** instead of swapping the open/closed values. The inversion applies to the sensor DP only: the reported state, the position (0/100) and `is_closed` all follow it. The movement/action DP is not affected.
 
+## Migrating from LocalTuya
+
+This integration is a fork of LocalTuya and keeps the same config entry
+layout, the same entity `unique_id` format and the same entry version, so an
+existing LocalTuya installation can be carried over by renaming the domain in
+Home Assistant's storage instead of re-adding every device. Entity ids are
+preserved, which keeps automations, dashboards, history and long-term
+statistics working.
+
+1. **Back up Home Assistant** and **stop it** (the storage files must not be
+   written while the script runs).
+2. Put `custom_components/bms_integration` in place and remove
+   `custom_components/localtuya`, so both integrations do not claim the same
+   devices.
+3. Run a dry run, then apply:
+
+   ```bash
+   python3 tools/migrate_from_localtuya.py /config
+   python3 tools/migrate_from_localtuya.py /config --apply
+   ```
+
+   The script backs up every file it touches as `<file>.bak`, only rewrites
+   entries whose domain is `localtuya`, and leaves other integrations alone.
+   Learned IR/RF codes are moved to the new storage key as well.
+4. Start Home Assistant and check the devices under
+   Settings -> Devices & services -> BMS Integration.
+
+Entries created by the pre-2022 version of LocalTuya (one config entry per
+device, entry version 1) cannot be converted automatically - the script
+reports them and those devices have to be re-added through the UI.
+
+To roll back, stop Home Assistant and restore the `.bak` files.
+
 ## Availability Diagnostics
 
 When a device disconnects, reconnects, or is finally marked unavailable after the grace period, BMS Integration appends a JSON line to:

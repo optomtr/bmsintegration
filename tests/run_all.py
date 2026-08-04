@@ -5,7 +5,12 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SUITES = ("test_protocol.py", "test_coordinator.py", "test_platform_logic.py")
+SUITES = (
+    "test_protocol.py",
+    "test_coordinator.py",
+    "test_platform_logic.py",
+    "test_migration.py",
+)
 
 
 def main() -> int:
