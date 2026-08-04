@@ -116,6 +116,53 @@ def main():
         check("сами коды сохранены", rc["data"]["bfIR"]["TV"]["power"] == "CODE")
         check("созданы резервные копии", os.path.exists(os.path.join(storage, "core.config_entries.bak")))
 
+
+        # 4. Запись новее, чем понимает форк -> блокировка, файлы не тронуты
+        tmp2 = tempfile.mkdtemp()
+        try:
+            st2 = os.path.join(tmp2, ".storage")
+            os.makedirs(st2)
+            build_storage(st2)
+            ce_path = os.path.join(st2, "core.config_entries")
+            data = json.load(open(ce_path, encoding="utf-8"))
+            data["data"]["entries"][0]["version"] = 99
+            json.dump(data, open(ce_path, "w", encoding="utf-8"))
+            before2 = open(ce_path, encoding="utf-8").read()
+            res = run(tmp2, "--apply")
+            check("запись новее форка: возврат != 0", res.returncode != 0)
+            check("запись новее форка: сообщение о блокировке", "BLOCKED" in res.stdout)
+            check("запись новее форка: файлы не изменены",
+                  open(ce_path, encoding="utf-8").read() == before2)
+        finally:
+            shutil.rmtree(tmp2, ignore_errors=True)
+
+        # 5. --optimistic off фиксирует прежнее поведение
+        tmp3 = tempfile.mkdtemp()
+        try:
+            st3 = os.path.join(tmp3, ".storage")
+            os.makedirs(st3)
+            build_storage(st3)
+            # шаблон пользователя + служебный sample
+            tpl_src = os.path.join(tmp3, "custom_components", "localtuya", "templates")
+            tpl_dst = os.path.join(tmp3, "custom_components", "bms_integration", "templates")
+            os.makedirs(tpl_src)
+            os.makedirs(tpl_dst)
+            open(os.path.join(tpl_src, "my_house.yaml"), "w").write("x: 1\n")
+            open(os.path.join(tpl_src, "sample_skip.yaml"), "w").write("x: 1\n")
+
+            res = run(tmp3, "--apply", "--optimistic", "off")
+            check("--optimistic off отрабатывает", res.returncode == 0, res.stderr)
+            entry = json.load(open(os.path.join(st3, "core.config_entries"), encoding="utf-8"))
+            ents = entry["data"]["entries"][0]["data"]["devices"]["bfSUB"]["entities"]
+            check("--optimistic off: опция записана явно",
+                  all(e.get("optimistic") is False for e in ents))
+            check("пользовательский шаблон перенесён",
+                  os.path.exists(os.path.join(tpl_dst, "my_house.yaml")))
+            check("служебный sample_* не переносится",
+                  not os.path.exists(os.path.join(tpl_dst, "sample_skip.yaml")))
+        finally:
+            shutil.rmtree(tmp3, ignore_errors=True)
+
         # 3. Повторный запуск безопасен
         res = run(tmp, "--apply")
         check("повторный запуск не ломает ничего", res.returncode == 0 and "nothing to do" in res.stdout)

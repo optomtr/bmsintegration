@@ -97,13 +97,36 @@ statistics working.
 
    The script backs up every file it touches as `<file>.bak`, only rewrites
    entries whose domain is `localtuya`, and leaves other integrations alone.
-   Learned IR/RF codes are moved to the new storage key as well.
+   Learned IR/RF codes and user device templates are carried over as well.
 4. Start Home Assistant and check the devices under
    Settings -> Devices & services -> BMS Integration.
 
-Entries created by the pre-2022 version of LocalTuya (one config entry per
-device, entry version 1) cannot be converted automatically - the script
-reports them and those devices have to be re-added through the UI.
+### What changes in behaviour
+
+The device configuration is carried over unchanged, but this fork does not
+behave exactly like upstream. The differences that show up on a migrated
+system:
+
+- **Optimistic commands.** Upstream entries carry no `optimistic` option, so
+  this fork's default (on) applies to lights and switches: a command shows in
+  the interface immediately, and a command sent to an offline device raises an
+  error instead of being dropped silently. Run the script with
+  `--optimistic off` to write the option out explicitly and keep the previous
+  behaviour; it can be changed per entity later.
+- **Availability.** Entities stay available through a 120 second reconnect
+  window (300 seconds at startup) instead of going unavailable at once, and a
+  connected gateway is probed every 30 seconds.
+- **Diagnostics.** Availability events are appended to
+  `/config/bms_integration_availability.jsonl` (rotated at 2 MiB).
+
+### Limits
+
+- Entries created by the pre-2022 version of LocalTuya (one config entry per
+  device, entry version 1) cannot be converted automatically - the script
+  reports them and those devices have to be re-added through the UI.
+- If the installation runs a **newer** upstream whose entry version is above
+  the one this fork understands, the script refuses to touch anything and says
+  so: relabelling such an entry would leave Home Assistant unable to load it.
 
 To roll back, stop Home Assistant and restore the `.bak` files.
 

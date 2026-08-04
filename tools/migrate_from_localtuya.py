@@ -38,18 +38,35 @@ DEVICE_REGISTRY = "core.device_registry"
 ENTITY_REGISTRY = "core.entity_registry"
 # Per-integration storage files: <domain>_remotes_codes holds learned IR/RF codes.
 STORAGE_SUFFIXES = ("_remotes_codes",)
+# Entry layout this fork understands (config_flow.ENTRIES_VERSION). A newer
+# upstream entry cannot be loaded and must not be silently converted.
+TARGET_ENTRY_VERSION = 4
 
 
 class Migration:
-    def __init__(self, config_dir: str, src: str, dst: str, apply: bool, backup: bool):
+    def __init__(
+        self,
+        config_dir: str,
+        src: str,
+        dst: str,
+        apply: bool,
+        backup: bool,
+        optimistic: str = "keep",
+    ):
+        self.config_dir = config_dir
         self.storage = os.path.join(config_dir, ".storage")
         self.src = src
         self.dst = dst
         self.apply = apply
         self.backup = backup
+        self.optimistic = optimistic
         self.changes: list[str] = []
         self.warnings: list[str] = []
+        self.blockers: list[str] = []
         self.entry_ids: set[str] = set()
+
+    def block(self, message: str) -> None:
+        self.blockers.append(message)
 
     # ---------------------------------------------------------------- helpers
     def _path(self, name: str) -> str:
@@ -93,9 +110,21 @@ class Migration:
             if entry.get("domain") != self.src:
                 continue
             found += 1
-            self.entry_ids.add(entry.get("entry_id"))
             version = entry.get("version")
             devices = (entry.get("data") or {}).get("devices") or {}
+
+            if isinstance(version, int) and version > TARGET_ENTRY_VERSION:
+                # A newer upstream layout. Home Assistant refuses to load an
+                # entry whose version is above the integration's, and silently
+                # relabelling it would corrupt the installation.
+                self.block(
+                    f"entry '{entry.get('title')}' is version {version}, but this "
+                    f"fork understands up to {TARGET_ENTRY_VERSION}. Upgrade the "
+                    "fork first, or re-add these devices through the UI."
+                )
+                continue
+
+            self.entry_ids.add(entry.get("entry_id"))
             self.note(
                 f"config entry '{entry.get('title')}' "
                 f"(version {version}, {len(devices)} device(s)) -> domain {self.dst}"
@@ -107,6 +136,10 @@ class Migration:
                     "device through the UI after the migration."
                 )
             entry["domain"] = self.dst
+            self._apply_optimistic(entry, devices)
+
+        if self.blockers:
+            return False
 
         if not found:
             self.warn(f"no config entries with domain '{self.src}' found - nothing to do")
@@ -114,6 +147,30 @@ class Migration:
 
         self._save(CONFIG_ENTRIES, data)
         return True
+
+    def _apply_optimistic(self, entry: dict, devices: dict) -> None:
+        """Pin the optimistic option so behaviour does not change silently.
+
+        Upstream entries have no ``optimistic`` key, so this fork's default
+        (on) would apply retroactively to every light and switch: commands
+        would appear to take effect immediately and would raise instead of
+        being dropped while a device is offline. ``--optimistic off`` writes
+        the option out explicitly to keep the previous behaviour.
+        """
+        if self.optimistic == "keep":
+            return
+        wanted = self.optimistic == "on"
+        touched = 0
+        for device in devices.values():
+            for ent in device.get("entities") or []:
+                if ent.get("optimistic") != wanted:
+                    ent["optimistic"] = wanted
+                    touched += 1
+        if touched:
+            self.note(
+                f"entry '{entry.get('title')}': optimistic set to {wanted} "
+                f"on {touched} entity config(s)"
+            )
 
     # ---------------------------------------------------------- device registry
     def migrate_device_registry(self) -> None:
@@ -200,6 +257,46 @@ class Migration:
                     handle.write("\n")
                 os.remove(src_path)
 
+    # ------------------------------------------------------------- templates
+    def migrate_templates(self) -> None:
+        """Carry over user device templates saved by the old integration."""
+        src_dir = os.path.join(
+            self.config_dir, "custom_components", self.src, "templates"
+        )
+        dst_dir = os.path.join(
+            self.config_dir, "custom_components", self.dst, "templates"
+        )
+        if not os.path.isdir(src_dir):
+            return
+
+        candidates = [
+            name
+            for name in sorted(os.listdir(src_dir))
+            # The samples ship with the integration; only user files matter.
+            if name.endswith((".yaml", ".yml")) and not name.startswith("sample_")
+        ]
+        if not candidates:
+            return
+
+        if not os.path.isdir(dst_dir):
+            self.warn(
+                f"{dst_dir} does not exist yet - install the integration first, "
+                f"then copy {len(candidates)} template(s) from {src_dir}"
+            )
+            return
+
+        copied = []
+        for name in candidates:
+            target = os.path.join(dst_dir, name)
+            if os.path.exists(target):
+                self.warn(f"template {name} already exists in the new folder - kept")
+                continue
+            copied.append(name)
+            if self.apply:
+                shutil.copy2(os.path.join(src_dir, name), target)
+        if copied:
+            self.note(f"templates copied: {', '.join(copied)}")
+
     # -------------------------------------------------------------------- run
     def run(self) -> int:
         if not os.path.isdir(self.storage):
@@ -210,9 +307,26 @@ class Migration:
             self.migrate_device_registry()
             self.migrate_entity_registry()
             self.migrate_storage_files()
+            self.migrate_templates()
 
         mode = "APPLIED" if self.apply else "DRY RUN (nothing written)"
         print(f"=== Migration {self.src} -> {self.dst}: {mode} ===\n")
+
+        if self.blockers:
+            print("BLOCKED - nothing was changed:")
+            for line in self.blockers:
+                print(f"  x {line}")
+            return 1
+
+        if self.optimistic == "keep" and self.changes:
+            self.warn(
+                "entities keep no explicit 'optimistic' option, so this fork's "
+                "default (on) now applies to lights and switches: commands show "
+                "immediately and raise an error when the device is offline "
+                "instead of being dropped. Use --optimistic off to keep the "
+                "previous behaviour."
+            )
+
         if self.changes:
             print("Changes:")
             for line in self.changes:
@@ -245,10 +359,25 @@ def main() -> int:
     parser.add_argument("--to", dest="dst", default=DEFAULT_TO, help="target domain")
     parser.add_argument("--apply", action="store_true", help="write the changes")
     parser.add_argument("--no-backup", action="store_true", help="skip .bak copies")
+    parser.add_argument(
+        "--optimistic",
+        choices=("keep", "off", "on"),
+        default="keep",
+        help=(
+            "optimistic command state for migrated entities: 'keep' leaves the "
+            "option unset so this fork's default (on) applies, 'off' pins the "
+            "previous LocalTuya behaviour, 'on' pins it explicitly"
+        ),
+    )
     args = parser.parse_args()
 
     return Migration(
-        args.config_dir, args.src, args.dst, args.apply, not args.no_backup
+        args.config_dir,
+        args.src,
+        args.dst,
+        args.apply,
+        not args.no_backup,
+        args.optimistic,
     ).run()
 
 
