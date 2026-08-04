@@ -123,6 +123,7 @@ CONF_GATE_OPEN_STATE = "gate_open_state"
 CONF_GATE_CLOSED_STATE = "gate_closed_state"
 CONF_GATE_OPENING_STATE = "gate_opening_state"
 CONF_GATE_CLOSING_STATE = "gate_closing_state"
+CONF_GATE_INVERTED = "gate_inverted"
 
 # fan
 CONF_FAN_SPEED_CONTROL = "fan_speed_control"

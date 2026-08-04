@@ -232,11 +232,57 @@ def test_rollback_semantics():
     check("откат: отсутствовавший DP удалён (не остался None)", "5" not in f2._status)
 
 
+
+def test_gate_inverted():
+    """Инверсия датчика ворот: датчик установлен наоборот."""
+    print("\n== cover: инверсия датчика ворот ==")
+    source = src("cover.py")
+
+    check("cover: опция gate_inverted есть в схеме настройки",
+          "CONF_GATE_INVERTED, default=False" in source)
+    check("cover: значение опции читается в __init__",
+          "self._gate_inverted = bool(self._config.get(CONF_GATE_INVERTED" in source)
+    check("cover: инверсия применяется в _gate_sensor_state",
+          "if self._gate_inverted:" in source
+          and 'state = "closed" if state == "opened" else "opened"' in source)
+
+    # Логика свопа, воспроизведённая один-в-один с cover.py
+    def sensor_state(raw_open: bool, inverted: bool):
+        state = "opened" if raw_open else "closed"
+        if inverted:
+            state = "closed" if state == "opened" else "opened"
+        return state
+
+    # Без инверсии — как раньше
+    check("без инверсии: датчик 'открыто' -> открыто",
+          sensor_state(True, False) == "opened")
+    check("без инверсии: датчик 'закрыто' -> закрыто",
+          sensor_state(False, False) == "closed")
+    # С инверсией — наоборот (случай заказчика)
+    check("с инверсией: датчик 'закрыто' -> ворота ОТКРЫТЫ",
+          sensor_state(False, True) == "opened")
+    check("с инверсией: датчик 'открыто' -> ворота ЗАКРЫТЫ",
+          sensor_state(True, True) == "closed")
+
+    # Производные свойства строятся из _gate_sensor_state
+    check("позиция берётся из состояния датчика (100/0)",
+          'return 100 if sensor_state == "opened" else 0' in source)
+    check("is_closed берётся из состояния датчика",
+          'return sensor_state == "closed"' in source)
+
+    # Строка UI во всех переводах
+    for lang in ("en", "ru"):
+        data = json.loads(src(f"translations/{lang}.json"))
+        keys = data["options"]["step"]["configure_entity"]["data"]
+        check(f"{lang}.json: подпись gate_inverted присутствует", "gate_inverted" in keys)
+
+
 test_cloud_api()
 test_get_dp_values()
 test_platform_sources()
 test_translations()
 test_rollback_semantics()
+test_gate_inverted()
 
 print(f"\n===== ИТОГ: PASS {len(PASS)} / FAIL {len(FAIL)} =====")
 if FAIL:

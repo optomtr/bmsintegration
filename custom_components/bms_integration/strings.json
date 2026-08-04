@@ -166,6 +166,7 @@
           "gate_closed_state": "Gate sensor/action value for closed",
           "gate_opening_state": "Gate action value for opening",
           "gate_closing_state": "Gate action value for closing",
+          "gate_inverted": "Invert gate sensor (sensor reports closed when the gate is open)",
           "position_inverted": "Invert 0-100 position (for *position* mode only)",
           "span_time": "Full opening time, in secs. (for *timed* mode only)",
           "unit_of_measurement": "(Optional) Unit of Measurement",

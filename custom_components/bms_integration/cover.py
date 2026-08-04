@@ -21,6 +21,7 @@ from .const import (
     CONF_CURRENT_POSITION_DP,
     CONF_GATE_ACTION_DP,
     CONF_GATE_CLOSED_STATE,
+    CONF_GATE_INVERTED,
     CONF_GATE_CLOSING_STATE,
     CONF_GATE_OPEN_STATE,
     CONF_GATE_OPENING_STATE,
@@ -91,6 +92,7 @@ def flow_schema(dps):
         vol.Optional(CONF_GATE_CLOSED_STATE, default=DEFAULT_GATE_CLOSED_STATE): str,
         vol.Optional(CONF_GATE_OPENING_STATE, default=DEFAULT_GATE_OPENING_STATE): str,
         vol.Optional(CONF_GATE_CLOSING_STATE, default=DEFAULT_GATE_CLOSING_STATE): str,
+        vol.Optional(CONF_GATE_INVERTED, default=False): bool,
         vol.Optional(CONF_POSITION_INVERTED, default=False): bool,
         vol.Optional(CONF_SPAN_TIME, default=DEFAULT_SPAN_TIME): vol.All(
             vol.Coerce(float), vol.Range(min=1.0, max=300.0)
@@ -122,6 +124,7 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
         self._position_inverted = self._config.get(CONF_POSITION_INVERTED)
         self._gate_state_dp = self._config.get(CONF_GATE_STATE_DP)
         self._gate_action_dp = self._config.get(CONF_GATE_ACTION_DP)
+        self._gate_inverted = bool(self._config.get(CONF_GATE_INVERTED, False))
         self._current_task = None
 
     @property
@@ -157,10 +160,18 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
             return None
         value = self.dp_value(CONF_GATE_STATE_DP)
         if self._matches_config_value(value, CONF_GATE_OPEN_STATE):
-            return "opened"
-        if self._matches_config_value(value, CONF_GATE_CLOSED_STATE):
-            return "closed"
-        return None
+            state = "opened"
+        elif self._matches_config_value(value, CONF_GATE_CLOSED_STATE):
+            state = "closed"
+        else:
+            return None
+
+        if self._gate_inverted:
+            # The reed switch is mounted the other way round, so the DP reads
+            # "closed" while the gate is actually open. Everything else
+            # (position, is_closed, the reported state) derives from here.
+            state = "closed" if state == "opened" else "opened"
+        return state
 
     @property
     def _gate_action_state(self):

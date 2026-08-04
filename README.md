@@ -72,6 +72,8 @@ For gate relays that have a separate open/closed sensor DP, configure the entity
 
 If the device also exposes a movement/action DP, set `Gate movement/action DP`. The default movement values are `opening` and `closing`.
 
+If the reed switch is mounted the other way round - it reports `closed` while the gate is actually open - tick **`Invert gate sensor`** instead of swapping the open/closed values. The inversion applies to the sensor DP only: the reported state, the position (0/100) and `is_closed` all follow it. The movement/action DP is not affected.
+
 ## Availability Diagnostics
 
 When a device disconnects, reconnects, or is finally marked unavailable after the grace period, BMS Integration appends a JSON line to:
