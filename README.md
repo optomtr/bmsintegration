@@ -130,6 +130,21 @@ system:
 
 To roll back, stop Home Assistant and restore the `.bak` files.
 
+## Icon and logo (HACS shows a placeholder)
+
+Home Assistant and HACS do not take icons from this repository: they are
+served from `brands.home-assistant.io`, which is built from the
+[home-assistant/brands](https://github.com/home-assistant/brands) repository.
+While the domain is missing there, HACS shows "Icon not available" and the
+integration page shows a generic icon - regardless of what is stored under
+`custom_components/bms_integration/brand/`.
+
+The ready-to-submit payload is in `brands-submission/`, already sized to the
+specification (icon 256x256 and 512x512, logo 512x198 and 1024x396). See
+`brands-submission/README.md` for the pull request steps. This is also why the
+HACS validation job in CI runs with `ignore: brands`; that flag can be dropped
+once the pull request is merged.
+
 ## Availability Diagnostics
 
 When a device disconnects, reconnects, or is finally marked unavailable after the grace period, BMS Integration appends a JSON line to:
