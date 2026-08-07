@@ -492,6 +492,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 f"{DOMAIN}-startup-recovery-{dev.id}",
             )
 
+    @callback
     def _schedule_startup_recovery(_now):
         entry.async_create_task(
             hass,
@@ -554,8 +555,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             return_exceptions=True,
         )
 
+    @callback
     def _schedule_gateway_watchdog(_now):
-        """Do not overlap slow probes from consecutive watchdog intervals."""
+        """Do not overlap slow probes from consecutive watchdog intervals.
+
+        The @callback decorator is load-bearing: Home Assistant runs a plain
+        sync listener in an executor thread, and creating an eager task from
+        there raises "loop is not the running loop". The watchdog then never
+        ran once, so a device left without a recovery task stayed unavailable
+        until the integration was reloaded by hand.
+        """
         nonlocal watchdog_task
         if watchdog_task and not watchdog_task.done():
             return

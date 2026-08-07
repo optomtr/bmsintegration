@@ -239,12 +239,17 @@ class ContextualLogger:
         return self._logger.log(logging.INFO, msg, *args)
 
     def warning(self, msg, *args):
-        """Warning method log."""
+        """Warning method log. A repeated warning is demoted, never dropped.
+
+        Dropping repeats hides a failure that keeps repeating: a device stuck
+        in a reconnect loop logged its reason once and then went silent, which
+        made the loop invisible in the log for as long as it lasted.
+        """
         if msg != self._last_warning:
             self._last_warning = msg
             return self._logger.log(logging.WARNING, msg, *args)
-        # else:
-        #     self.info(msg)
+
+        return self._logger.log(logging.DEBUG, msg, *args)
 
     def error(self, msg, *args):
         """Error level log."""

@@ -920,16 +920,25 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 fire_event(event_status_update, data)
 
     def _get_gateway(self):
-        """Return the gateway device of this sub device."""
-        if not self._node_id or (gateway := self.gateway) is None:
-            return None  # Should never happen
+        """Return the gateway device of this sub device.
+
+        Every rejection is logged: this returning None aborts the connect
+        attempt silently, which left a sub-device retrying forever with
+        nothing in the log but "Trying to update local-key...".
+        """
+        if not self._node_id:
+            self.warning("Sub-device has no node id")
+            return None
+
+        if (gateway := self.gateway) is None:
+            self.warning("Sub-device has no gateway device")
+            return None
 
         # Ensure that sub-device still on the same gateway device.
         if gateway.local_key != self.local_key:
-            if self.subdevice_state != SubdeviceState.ABSENT:
-                self.warning("Sub-device localkey doesn't match the gateway localkey")
-                # This will become ONLINE after successful connect
-                self.subdevice_state = SubdeviceState.ABSENT
+            self.warning("Sub-device localkey doesn't match the gateway localkey")
+            # This will become ONLINE after successful connect
+            self.subdevice_state = SubdeviceState.ABSENT
             return None
         else:
             return gateway

@@ -42,6 +42,13 @@ the license text.
   shows immediately and is corrected by the device's own status update); the
   state is rolled back if the command fails.
 - Cover entities can use a dedicated gate sensor DP.
+- The gateway watchdog and the startup recovery passes now actually run. Both
+  were scheduled as plain sync listeners, which Home Assistant runs in an
+  executor thread, so every firing failed with "loop is not the running loop"
+  and a device left without a recovery task stayed unavailable until the
+  integration was reloaded by hand.
+- A repeated warning is logged at debug level instead of being dropped, and a
+  sub-device that cannot reach its gateway now says why.
 - Dispatcher signals and remote storage/service domain use the BMS Integration domain.
 
 ## Install

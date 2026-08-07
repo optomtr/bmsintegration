@@ -4,6 +4,7 @@ Home Assistant is replaced by lightweight sys.modules stubs (see ha_stubs.py).
 The pytuya interface is replaced by FakeInterface.
 """
 
+import ast
 import asyncio
 import contextlib
 import os
@@ -844,6 +845,80 @@ class TestGatewayHealthCheck(Base):
         self.assertEqual(iface.close_calls, 1,
                          "the lock must serialize probes; only one reset")
         self.assertFalse(any(results))
+
+
+class TimerListenerDecoratorTest(unittest.TestCase):
+    """Every sync timer listener must be a @callback.
+
+    Home Assistant runs an undecorated sync listener in an executor thread.
+    Creating an eager task from there raises "loop is not the running loop",
+    so the listener fails every time it fires - silently, apart from a
+    traceback nobody reads. That is how the gateway watchdog and the startup
+    recovery passes were dead in production while looking wired up.
+    """
+
+    SCHEDULERS = {
+        # helper name -> index of the listener argument
+        "async_track_time_interval": 1,
+        "async_call_later": 2,
+        "async_track_point_in_time": 1,
+        "async_track_point_in_utc_time": 1,
+    }
+
+    def _module_source(self, *relative):
+        path = os.path.join(
+            os.path.dirname(SCRATCH), "custom_components", "bms_integration", *relative
+        )
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read(), path
+
+    @staticmethod
+    def _decorator_names(node):
+        for dec in node.decorator_list:
+            if isinstance(dec, ast.Name):
+                yield dec.id
+            elif isinstance(dec, ast.Attribute):
+                yield dec.attr
+
+    def _assert_listeners_are_callbacks(self, *relative):
+        source, path = self._module_source(*relative)
+        tree = ast.parse(source)
+
+        sync_defs = {}
+        async_defs = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef):
+                async_defs.add(node.name)
+            elif isinstance(node, ast.FunctionDef):
+                sync_defs[node.name] = node
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            index = self.SCHEDULERS.get(name)
+            if index is None or len(node.args) <= index:
+                continue
+
+            listener = node.args[index]
+            if not isinstance(listener, ast.Name):
+                continue  # a lambda or an expression: nothing to check statically
+            if listener.id in async_defs or listener.id not in sync_defs:
+                continue
+
+            self.assertIn(
+                "callback",
+                set(self._decorator_names(sync_defs[listener.id])),
+                f"{os.path.basename(path)}:{node.lineno}: {name}() gets the plain "
+                f"sync function {listener.id}(); it needs @callback or Home "
+                f"Assistant will run it in an executor thread",
+            )
+
+    def test_entry_setup_listeners(self):
+        self._assert_listeners_are_callbacks("__init__.py")
+
+    def test_coordinator_listeners(self):
+        self._assert_listeners_are_callbacks("coordinator.py")
 
 
 if __name__ == "__main__":
