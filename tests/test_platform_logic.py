@@ -168,7 +168,8 @@ def test_platform_sources():
     check("diagnostics: закомментированный 'NOT censoring' убран", "NOT censoring" not in diag)
 
     ent = src("entity.py")
-    check("entity: оптимистичный откат при ошибке", "rollback" in ent and "_MISSING" in ent)
+    check("entity: оптимистичный откат при ошибке (через устройство)",
+          "restore_optimistic_status" in ent and "apply_optimistic_status" in ent)
     check("entity: спящие устройства идут в очередь", "self._device.is_sleep" in ent)
     check("entity: восстановление берёт сырое значение DP", "raw_value = stored_data.attributes.get(ATTR_STATE)" in ent)
 

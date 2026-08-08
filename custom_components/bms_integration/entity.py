@@ -51,9 +51,6 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Sentinel marking "this DP had no cached value" for an optimistic rollback.
-_MISSING = object()
-
 
 async def async_setup_entry(
     domain: str,
@@ -443,13 +440,7 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
         """Return whether commands should assume success immediately."""
         return bool(self._config.get(CONF_OPTIMISTIC, DEFAULT_OPTIMISTIC))
 
-    def _apply_optimistic_status(self, status: dict) -> None:
-        """Apply an expected status locally until the real device status arrives."""
-        self._status.update({str(dp): value for dp, value in status.items()})
-        self.status_updated()
-        self.async_write_ha_state()
-
-    async def _send_dps_background(self, status: dict, rollback: dict) -> None:
+    async def _send_dps_background(self, status: dict, applied: dict, previous: dict) -> None:
         """Send DPS in the background, restoring the state if it fails."""
         try:
             await self._device.set_dps(status)
@@ -457,13 +448,7 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
             self.warning(f"Optimistic command failed: {ex}")
             # The device never changed, so it will not send a status update
             # to correct us: roll the optimistic values back ourselves.
-            for dp, value in rollback.items():
-                if value is _MISSING:
-                    self._status.pop(dp, None)
-                else:
-                    self._status[dp] = value
-            self.status_updated()
-            self.async_write_ha_state()
+            self._device.restore_optimistic_status(applied, previous)
 
     async def async_set_dps(self, status: dict, optimistic_status: dict | None = None):
         """Set DPS, optionally returning to Home Assistant optimistically."""
@@ -478,21 +463,24 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
             raise HomeAssistantError(f"Device {self._device_config.name} is not connected")
 
         optimistic_status = optimistic_status or status
-        rollback = {
-            str(dp): self._status.get(str(dp), _MISSING) for dp in optimistic_status
-        }
-        self._apply_optimistic_status(optimistic_status)
+        # The device records the expectation in its own and the protocol's
+        # caches and dispatches it to every entity of the device, so a partial
+        # confirmation from the device cannot bounce sibling datapoints back
+        # to their stale cached values.
+        applied, previous = self._device.apply_optimistic_status(optimistic_status)
         # Tie the task to the config entry so it is cancelled on unload
         # instead of outliving the integration.
         entry = getattr(self, "platform", None) and self.platform.config_entry
         if entry is not None:
             entry.async_create_background_task(
                 self.hass,
-                self._send_dps_background(status, rollback),
+                self._send_dps_background(status, applied, previous),
                 f"{DOMAIN}-optimistic-{self.unique_id}",
             )
         else:
-            self.hass.async_create_task(self._send_dps_background(status, rollback))
+            self.hass.async_create_task(
+                self._send_dps_background(status, applied, previous)
+            )
 
     async def async_set_dp(self, value, dp_id):
         """Set a single DP, optionally returning to Home Assistant optimistically."""

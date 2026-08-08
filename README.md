@@ -49,6 +49,10 @@ the license text.
   integration was reloaded by hand.
 - A repeated warning is logged at debug level instead of being dropped, and a
   sub-device that cannot reach its gateway now says why.
+- Turning several lights of one device on or off together no longer bounces
+  some of them back for a second: optimistic values are recorded in the device
+  and protocol caches, so the first partial confirmation from the device cannot
+  resurrect the stale cached state of its sibling channels.
 - A gateway that reports its sub-devices in several reply frames no longer
   gets a fixed subset of them flap-disconnected: absence is now judged over
   the union of all frames of a poll cycle, across two consecutive cycles,

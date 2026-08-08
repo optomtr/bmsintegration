@@ -627,6 +627,63 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 f"Device {self._device_config.name} is not connected"
             )
 
+    def _protocol_dps_cache(self) -> dict | None:
+        """Return the protocol-level cache this device's reports are built from."""
+        if self._interface is None:
+            return None
+        return self._interface.dps_cache.setdefault(self._node_id or "parent", {})
+
+    @callback
+    def apply_optimistic_status(self, status: dict) -> tuple[dict, dict]:
+        """Record the values a command is expected to produce.
+
+        The expected values must land in the device and protocol caches, not
+        only in the entity that sent the command: the device confirms one
+        datapoint at a time, but every report it triggers carries the WHOLE
+        cached payload, so an entity-only optimistic state was overwritten by
+        the stale cached values of the sibling datapoints changed by the same
+        user action - turning several lights on at once made the first
+        confirmation bounce the other tiles back to their old state.
+
+        Returns (applied, previous) for a later rollback.
+        """
+        applied = {str(dp): value for dp, value in status.items()}
+        if not applied:
+            return {}, {}
+
+        previous = {dp: self._status[dp] for dp in applied if dp in self._status}
+
+        if (cache := self._protocol_dps_cache()) is not None:
+            cache.update(applied)
+        self._status.update(applied)
+        self._dispatch_status()
+
+        return applied, previous
+
+    @callback
+    def restore_optimistic_status(self, applied: dict, previous: dict) -> None:
+        """Roll back expected values of a command that never reached the device."""
+        cache = self._protocol_dps_cache()
+        reverted = False
+
+        for dp, expected in applied.items():
+            if self._status.get(dp) != expected:
+                # A newer command already replaced this value - keep the newer one.
+                continue
+
+            reverted = True
+            if dp in previous:
+                self._status[dp] = previous[dp]
+                if cache is not None:
+                    cache[dp] = previous[dp]
+            else:
+                self._status.pop(dp, None)
+                if cache is not None:
+                    cache.pop(dp, None)
+
+        if reverted:
+            self._dispatch_status()
+
     async def async_update_dps(self, dps: list[int] | None = None) -> None:
         """Request a device to publish the current values of its DPS."""
         await self.check_connection()

@@ -81,6 +81,7 @@ class FakeInterface:
         self.is_connected = connected
         self.close_calls = 0
         self.status_calls = []
+        self.dps_cache = {}
         self.status_exc = None
         self.dispatched_dps = {}
 
@@ -918,6 +919,91 @@ class TestHubWithoutOwnStatus(Base):
             "a reachable sub-device the gateway aged out of its LAN status table "
             "must keep the shared session, not fail the handshake",
         )
+
+
+class TestOptimisticCache(Base):
+    """Optimistic values must survive a partial confirmation from the device.
+
+    A device confirms one datapoint at a time, but pytuya hands the listener
+    the WHOLE cached payload for that cid. With the expectation stored only in
+    the commanding entity, the first confirmation resurrected the stale cached
+    values of the sibling datapoints changed by the same user action: turning
+    a multi-gang switch on bounced the other channels' tiles back to off.
+    """
+
+    def make_connected_device(self, cache):
+        dev = self.make_device()
+        iface = FakeInterface()
+        iface.dps_cache = {"parent": dict(cache)}
+        dev._interface = iface
+        dev._status = dict(cache)
+        return dev, iface
+
+    def device_push(self, dev, iface, dp, value):
+        """Reproduce pytuya: merge the confirmed dp, hand up the WHOLE cache."""
+        iface.dps_cache["parent"][dp] = value
+        dev.status_updated(dict(iface.dps_cache["parent"]))
+
+    async def test_partial_confirmation_keeps_optimistic_siblings(self):
+        dev, iface = self.make_connected_device({"1": True, "2": True, "3": True, "4": True})
+        for dp in ("1", "2", "3", "4"):
+            dev.apply_optimistic_status({dp: False})
+
+        # The device confirms only channel 1; channels 2-4 must stay optimistic.
+        self.device_push(dev, iface, "1", False)
+
+        self.assertEqual(
+            dev._status, {"1": False, "2": False, "3": False, "4": False},
+            "a partial confirmation must not resurrect stale sibling values",
+        )
+
+    async def test_without_device_level_apply_status_is_resurrected(self):
+        # Control experiment documenting the failure mode this guards against:
+        # an entity-only expectation (device caches untouched) IS overwritten.
+        dev, iface = self.make_connected_device({"1": True, "2": True})
+        self.device_push(dev, iface, "1", False)
+        self.assertEqual(dev._status["2"], True)
+
+    async def test_rollback_restores_both_caches(self):
+        dev, iface = self.make_connected_device({"1": True, "2": True})
+        applied, previous = dev.apply_optimistic_status({"1": False})
+        self.assertEqual(dev._status["1"], False)
+
+        dev.restore_optimistic_status(applied, previous)
+
+        self.assertEqual(dev._status, {"1": True, "2": True})
+        self.assertEqual(iface.dps_cache["parent"], {"1": True, "2": True})
+
+    async def test_newer_command_survives_older_rollback(self):
+        dev, iface = self.make_connected_device({"1": True})
+        applied_off, prev_off = dev.apply_optimistic_status({"1": False})
+        dev.apply_optimistic_status({"1": True})  # user pressed ON again
+
+        dev.restore_optimistic_status(applied_off, prev_off)  # OFF command failed
+
+        self.assertEqual(dev._status["1"], True, "the newer command must win")
+
+    async def test_subdevice_writes_its_own_cid_cache(self):
+        gw = self.make_device(name="gw", dev_id="gw1")
+        iface = FakeInterface()
+        iface.dps_cache = {"parent": {"1": True}, "n1": {"1": True, "2": True}}
+        sub = self.make_device(node_id="n1", name="sub", dev_id="sub1")
+        sub.gateway = gw
+        sub._interface = iface
+        sub._status = {"1": True, "2": True}
+
+        sub.apply_optimistic_status({"2": False})
+
+        self.assertEqual(iface.dps_cache["n1"], {"1": True, "2": False})
+        self.assertEqual(iface.dps_cache["parent"], {"1": True},
+                         "the gateway's own cache must stay untouched")
+
+    async def test_apply_dispatches_to_entities(self):
+        dev, _ = self.make_connected_device({"1": True})
+        ha_stubs.DISPATCH_LOG.clear()
+        dev.apply_optimistic_status({"1": False})
+        self.assertTrue(ha_stubs.DISPATCH_LOG,
+                        "optimistic apply must notify the device's entities")
 
 
 class TimerListenerDecoratorTest(unittest.TestCase):
