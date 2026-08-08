@@ -53,6 +53,12 @@ the license text.
   some of them back for a second: optimistic values are recorded in the device
   and protocol caches, so the first partial confirmation from the device cannot
   resurrect the stale cached state of its sibling channels.
+- New sidebar panel **BMS Control Center** (admin only): overview with health
+  tiles, the full connection map from config entry down to each datapoint, a device
+  card with status/entities/DPS/diagnostics/configuration, discovered devices,
+  an event timeline over the availability report, and integration settings.
+  Backed by admin-only WebSocket commands that never serialize local keys or
+  cloud credentials.
 - A gateway that reports its sub-devices in several reply frames no longer
   gets a fixed subset of them flap-disconnected: absence is now judged over
   the union of all frames of a poll cycle, across two consecutive cycles,

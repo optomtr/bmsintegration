@@ -1,465 +1,1267 @@
 /**
- * BMS Устройства — панель обслуживания установки.
+ * BMS Control Center — панель обслуживания установки в сайдбаре Home Assistant.
  *
  * Обычный веб-компонент без сборщика и без Lit: панель не должна зависеть от
  * внутреннего устройства фронтенда Home Assistant, иначе его обновление молча
- * гасит панель (так и случилось с попыткой одолжить у него LitElement).
- * Штатные элементы HA (ha-form и прочие) при этом доступны — они
- * зарегистрированы глобально и работают внутри нашего shadow DOM.
+ * гасит панель. Данные приходят только из bms_integration/* WebSocket-команд —
+ * фронтенд не читает ни runtime-объекты, ни файлы напрямую.
  */
 
-const TABS = [
-  { id: "devices", label: "Устройства", icon: "🔌" },
-  { id: "log", label: "Журнал", icon: "📄" },
-  { id: "report", label: "Отчёты", icon: "📊" },
-  { id: "rooms", label: "Комнаты", icon: "🏠" },
-  { id: "settings", label: "Настройки", icon: "⚙️" },
+// ---------------------------------------------------------------- палитра --
+const C = {
+  bg: "#F0F3F6", card: "#FFFFFF", line: "#E4E9EE", div: "#EDF0F3",
+  ink: "#1B2733", ink2: "#3E4B58", ink3: "#55616D", mut: "#75808B",
+  mut2: "#64707C", mut3: "#7A8590", faint: "#A6AFB8",
+  accent: "#006FFF", accentHi: "#2F87FF",
+  ok: "#149A54", warn: "#B97D00", bad: "#DE2F44",
+  stale: "#D96511", grace: "#6E4FD9", cfg: "#C93A8C", blue: "#1E7FE0",
+};
+const MONO = "ui-monospace,'SF Mono',Menlo,monospace";
+
+// Состояния из брифа: явный текст + цвет + иконка, никогда только цвет.
+const ST = {
+  online:       { label: "Онлайн",          color: C.ok,    icon: "i-check" },
+  connecting:   { label: "Подключение",     color: C.blue,  icon: "i-dots" },
+  reconnecting: { label: "Переподключение", color: C.warn,  icon: "i-refresh" },
+  grace:        { label: "Grace-период",    color: C.grace, icon: "i-clock" },
+  unavailable:  { label: "Недоступно",      color: C.bad,   icon: "i-octagon" },
+  stale:        { label: "Шлюз залип",      color: C.stale, icon: "i-alert" },
+  config:       { label: "Ошибка конфиг.",  color: C.cfg,   icon: "i-gear" },
+};
+const KIND = {
+  entry:   { icon: "i-shield", label: "Запись конфигурации",   color: C.mut2, size: "13.5px", weight: "600", font: "inherit" },
+  gateway: { icon: "i-zigbee", label: "Шлюз Zigbee",           color: "#3E76A8", size: "13px", weight: "600", font: "inherit" },
+  direct:  { icon: "i-wifi",   label: "Прямое Wi-Fi устройство", color: "#3E76A8", size: "13px", weight: "600", font: "inherit" },
+  device:  { icon: "i-chip",   label: "Подустройство",         color: C.mut2, size: "12.5px", weight: "500", font: "inherit" },
+  entity:  { icon: "i-link",   label: "Сущность Home Assistant", color: "#98A2AC", size: "12px", weight: "400", font: MONO },
+};
+
+const NAV = [
+  { id: "overview", label: "Обзор", icon: "i-grid" },
+  { id: "map", label: "Карта связей", icon: "i-network" },
+  { id: "device", label: "Устройство", icon: "i-chip" },
+  { id: "add", label: "Добавить устройство", icon: "i-plus" },
+  { id: "events", label: "События", icon: "i-list" },
+  { id: "settings", label: "Настройки", icon: "i-sliders" },
 ];
 
-const REFRESH_MS = 5000;
+const DEVICE_TABS = [
+  { id: "status", label: "Статус" },
+  { id: "entities", label: "Сущности" },
+  { id: "dps", label: "DPS" },
+  { id: "diag", label: "Диагностика" },
+  { id: "config", label: "Конфигурация" },
+];
 
-const esc = (value) =>
-  String(value ?? "").replace(/[&<>"']/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
-  );
+const EVENT_META = {
+  disconnect_detected: { label: "Разрыв связи", color: C.bad, icon: "i-octagon" },
+  reconnect_succeeded: { label: "Связь восстановлена", color: C.ok, icon: "i-check" },
+  command_failed: { label: "Команда не прошла", color: C.bad, icon: "i-alert" },
+  startup_recovery: { label: "Восстановление при старте", color: C.warn, icon: "i-refresh" },
+  gateway_probe_failed: { label: "Шлюз не ответил", color: C.stale, icon: "i-alert" },
+  dps_refresh_failed: { label: "Опрос DPS не удался", color: C.warn, icon: "i-refresh" },
+};
 
-function humanAge(seconds) {
+// ------------------------------------------------------------- утилиты ----
+const esc = (v) =>
+  String(v ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+const soft = (hex, a) => {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+};
+
+const plural = (n, one, few, many) => {
+  const m10 = n % 10, m100 = n % 100;
+  const w = m10 === 1 && m100 !== 11 ? one
+    : m10 >= 2 && m10 <= 4 && (m100 < 10 || m100 >= 20) ? few : many;
+  return `${n} ${w}`;
+};
+
+function age(seconds) {
   if (seconds === null || seconds === undefined) return "—";
-  if (seconds < 60) return `${Math.round(seconds)} с назад`;
-  if (seconds < 3600) return `${Math.round(seconds / 60)} мин назад`;
-  return `${Math.round(seconds / 3600)} ч назад`;
+  if (seconds < 60) return `${Math.round(seconds)} с`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)} мин`;
+  return `${Math.round(seconds / 3600)} ч`;
 }
+const hhmmss = (d) => d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+const icon = (id, size = 14, color = "currentColor") =>
+  `<svg width="${size}" height="${size}" style="color:${color};flex:0 0 auto"><use href="#${id}"></use></svg>`;
 
-function humanTime(epochSeconds) {
-  return new Date(epochSeconds * 1000).toLocaleTimeString("ru-RU", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-}
+// Для записи конфигурации «Шлюз залип» бессмысленно: у неё нет соединения,
+// у неё есть только итог по всем узлам под ней.
+const stateLabel = (state, kind) =>
+  kind === "entry"
+    ? state === "online" ? "Все узлы в норме" : "Есть проблемы"
+    : (ST[state] || ST.config).label;
 
-class BmsDevicesPanel extends HTMLElement {
+const pill = (state, kind) => {
+  const s = ST[state] || ST.config;
+  return `<span style="display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 8px;border-radius:5px;
+    background:${soft(s.color, 0.12)};color:${s.color};font-size:11.5px;font-weight:600;white-space:nowrap;width:fit-content">
+    ${icon(s.icon, 12)}${stateLabel(state, kind)}</span>`;
+};
+
+const cardOpen = (title, right = "") => `
+  <div style="background:${C.card};border:1px solid ${C.line};border-radius:10px;box-shadow:0 1px 2px rgba(24,39,58,.05)">
+    <div style="padding:13px 16px;border-bottom:1px solid ${C.line};display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+      <span style="font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:${C.mut2}">${title}</span>
+      ${right}
+    </div>`;
+const cardClose = `</div>`;
+
+const btn = (label, opts = {}) => {
+  const { act = "", data = "", primary = false, danger = false, small = false, ico = "" } = opts;
+  const bg = primary ? C.accent : danger ? soft(C.bad, 0.09) : "#F4F6F8";
+  const fg = primary ? "#FFFFFF" : danger ? C.bad : C.ink2;
+  const bd = primary ? C.accent : danger ? soft(C.bad, 0.4) : "#D0D8DF";
+  const h = small ? 26 : 32;
+  return `<button data-act="${act}" ${data} style="display:inline-flex;align-items:center;gap:7px;height:${h}px;
+    padding:0 ${small ? 10 : 12}px;border-radius:7px;border:1px solid ${bd};background:${bg};color:${fg};
+    font-size:${small ? 11.5 : 12.5}px;font-weight:${primary ? 600 : 500};cursor:pointer;white-space:nowrap">
+    ${ico ? icon(ico, small ? 12 : 14) : ""}${label}</button>`;
+};
+
+const kv = (rows) => `
+  <div style="display:flex;flex-direction:column;border:1px solid ${C.line};border-radius:8px;overflow:hidden">
+    ${rows.map(([k, v]) => `
+      <div style="display:flex;align-items:center;gap:10px;padding:8px 11px;border-bottom:1px solid ${C.div};background:#F7F9FB">
+        <span style="font-size:11px;color:${C.mut3};flex:0 0 130px">${esc(k)}</span>
+        <span style="font-size:11.5px;color:${C.ink2};font-family:${MONO};flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${v}</span>
+      </div>`).join("")}
+  </div>`;
+
+const empty = (text, ico = "i-check", color = C.ok) => `
+  <div style="padding:30px 16px;display:flex;align-items:center;justify-content:center;gap:10px">
+    ${icon(ico, 15, color)}<span style="font-size:12.5px;color:${C.mut2}">${esc(text)}</span></div>`;
+
+// ============================================================== компонент ==
+class BmsControlCenter extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
     this._hass = null;
-    this._tab = "devices";
-    this._search = "";
-    this._overview = null;
-    this._log = null;
-    this._report = null;
-    this._error = null;
-    this._busy = new Set();
     this._built = false;
+    this.s = {
+      screen: "overview",
+      deviceTab: "status",
+      deviceId: null,
+      selected: null,
+      expert: false,
+      incidentsOnly: false,
+      mapMode: "tree",
+      search: "",
+      eventSearch: "",
+      entryFilter: "all",
+      collapsed: new Set(),
+      updatedAt: null,
+      busy: false,
+    };
+    this.d = { overview: null, topology: null, device: null, logs: null, report: null, discovered: null };
+    this._err = null;
   }
 
   set hass(hass) {
     const first = !this._hass;
     this._hass = hass;
-    if (first) this._refresh();
+    if (first) this.refresh();
   }
-  get hass() {
-    return this._hass;
-  }
+  get hass() { return this._hass; }
 
   connectedCallback() {
-    this._build();
-    this._timer = setInterval(() => this._refresh(), REFRESH_MS);
+    this.build();
+    this._timer = setInterval(() => this.refresh(true), 6000);
   }
+  disconnectedCallback() { clearInterval(this._timer); }
 
-  disconnectedCallback() {
-    clearInterval(this._timer);
-  }
-
-  // ---------------------------------------------------------------- данные --
-  async _call(type, payload = {}) {
+  // ------------------------------------------------------------- данные --
+  ws(type, payload = {}) {
     return this._hass.callWS({ type: `bms_integration/${type}`, ...payload });
   }
 
-  async _refresh() {
+  async refresh(silent = false) {
     if (!this._hass) return;
+    if (!silent) this.s.busy = true, this.paintHeader();
     try {
-      if (this._tab === "devices" || this._tab === "rooms") {
-        this._overview = await this._call("overview");
-      } else if (this._tab === "log") {
-        this._log = await this._call("logs", { limit: 200 });
-      } else if (this._tab === "report") {
-        this._report = await this._call("report", { limit: 100 });
-      } else if (this._tab === "settings") {
-        this._overview = await this._call("overview");
+      const jobs = [this.ws("overview").then((r) => (this.d.overview = r))];
+      const sc = this.s.screen;
+      if (sc === "map") jobs.push(this.ws("topology").then((r) => (this.d.topology = r)));
+      if (sc === "device" && this.s.deviceId)
+        jobs.push(this.ws("device", { device_id: this.s.deviceId }).then((r) => (this.d.device = r)).catch(() => (this.d.device = null)));
+      if (sc === "add") jobs.push(this.ws("discovered").then((r) => (this.d.discovered = r)));
+      if (sc === "events") {
+        jobs.push(this.ws("report", { limit: 300 }).then((r) => (this.d.report = r)));
+        jobs.push(this.ws("logs", { limit: 300 }).then((r) => (this.d.logs = r)));
       }
-      this._error = null;
-    } catch (err) {
-      this._error = err?.message || String(err);
+      await Promise.all(jobs);
+      this.s.updatedAt = new Date();
+      this._err = null;
+    } catch (e) {
+      this._err = e?.message || String(e);
     }
-    this._renderBody();
+    this.s.busy = false;
+    this.paint();
   }
 
-  // ---------------------------------------------------------------- каркас --
-  _build() {
+  go(screen, extra = {}) {
+    Object.assign(this.s, { screen }, extra);
+    this.paint();
+    this.refresh(true);
+  }
+
+  toast(text, bad = false) {
+    const el = document.createElement("div");
+    el.textContent = text;
+    el.style.cssText = `position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:20;
+      background:${bad ? C.bad : C.ink};color:#fff;padding:10px 18px;border-radius:8px;font-size:13px;
+      box-shadow:0 6px 20px rgba(24,39,58,.28)`;
+    this.shadowRoot.appendChild(el);
+    setTimeout(() => el.remove(), 3000);
+  }
+
+  // ------------------------------------------------------------- каркас --
+  build() {
     if (this._built) return;
     this._built = true;
     this.shadowRoot.innerHTML = `
-      <style>${STYLES}</style>
-      <div class="wrap">
+      ${SPRITE}
+      <style>${CSS}</style>
+      <div class="app">
         <header>
           <div class="brand">
-            <span class="logo">⚡</span>
+            <img src="/bms_integration_panel/assets/bms-logo.png" alt="BMS" class="logo">
+            <span class="vr"></span>
             <div>
-              <div class="h1">BMS Устройства</div>
-              <div class="sub" id="subtitle">Обслуживание установки</div>
+              <div class="t1">Control Center</div>
+              <div class="t2">BMS CONNECTION SYSTEM</div>
             </div>
           </div>
-          <div class="actions">
-            <input id="search" class="search" type="search" placeholder="Поиск…" />
-            <button class="btn" data-act="refresh">Обновить</button>
-          </div>
+          <div class="hactions" id="hactions"></div>
         </header>
-        <nav id="tabs"></nav>
-        <main id="body"><div class="muted">Загрузка…</div></main>
-      </div>
-    `;
-
-    const tabs = this.shadowRoot.getElementById("tabs");
-    tabs.innerHTML = TABS.map(
-      (t) =>
-        `<button class="tab" data-tab="${t.id}"><span>${t.icon}</span>${t.label}</button>`
-    ).join("");
-    this._syncTabs();
-
-    this.shadowRoot.addEventListener("click", (ev) => this._onClick(ev));
-    this.shadowRoot.getElementById("search").addEventListener("input", (ev) => {
-      this._search = ev.target.value.toLowerCase();
-      this._renderBody();
-    });
-  }
-
-  _syncTabs() {
-    this.shadowRoot.querySelectorAll(".tab").forEach((el) => {
-      el.classList.toggle("active", el.dataset.tab === this._tab);
-    });
-    const search = this.shadowRoot.getElementById("search");
-    search.style.display = ["devices", "log", "rooms"].includes(this._tab) ? "" : "none";
-  }
-
-  async _onClick(ev) {
-    const target = ev.composedPath().find((el) => el.dataset && (el.dataset.tab || el.dataset.act));
-    if (!target) return;
-
-    if (target.dataset.tab) {
-      this._tab = target.dataset.tab;
-      this._syncTabs();
-      this.shadowRoot.getElementById("body").innerHTML = `<div class="muted">Загрузка…</div>`;
-      await this._refresh();
-      return;
-    }
-
-    const act = target.dataset.act;
-    if (act === "refresh") {
-      await this._refresh();
-    } else if (act === "reconnect" || act === "refresh-dps") {
-      await this._deviceAction(target, act);
-    } else if (act === "expand") {
-      const row = target.closest(".device");
-      row.classList.toggle("open");
-    }
-  }
-
-  async _deviceAction(button, act) {
-    const { deviceId, nodeId } = button.dataset;
-    const key = `${deviceId}:${act}`;
-    if (this._busy.has(key)) return;
-    this._busy.add(key);
-    button.disabled = true;
-    button.textContent = "…";
-    try {
-      await this._call("action", {
-        device_id: deviceId,
-        node_id: nodeId || null,
-        action: act === "reconnect" ? "reconnect" : "refresh",
-      });
-      this._toast("Команда отправлена");
-    } catch (err) {
-      this._toast(err?.message || "Не получилось", true);
-    } finally {
-      this._busy.delete(key);
-      await this._refresh();
-    }
-  }
-
-  _toast(text, isError = false) {
-    const el = document.createElement("div");
-    el.className = `toast${isError ? " error" : ""}`;
-    el.textContent = text;
-    this.shadowRoot.querySelector(".wrap").appendChild(el);
-    setTimeout(() => el.remove(), 2600);
-  }
-
-  // ------------------------------------------------------------- рендеринг --
-  _renderBody() {
-    const body = this.shadowRoot.getElementById("body");
-    if (this._error) {
-      body.innerHTML = `<div class="card error">Ошибка: ${esc(this._error)}</div>`;
-      return;
-    }
-    const render = {
-      devices: () => this._renderDevices(),
-      log: () => this._renderLog(),
-      report: () => this._renderReport(),
-      rooms: () => this._renderRooms(),
-      settings: () => this._renderSettings(),
-    }[this._tab];
-    body.innerHTML = render ? render() : "";
-    this._renderSubtitle();
-  }
-
-  _renderSubtitle() {
-    const el = this.shadowRoot.getElementById("subtitle");
-    const s = this._overview?.summary;
-    el.textContent = s
-      ? `${s.connected} из ${s.total} на связи · ${s.entities} сущностей`
-      : "Обслуживание установки";
-  }
-
-  _matches(device) {
-    if (!this._search) return true;
-    return [device.name, device.host, device.device_id, device.area_name]
-      .filter(Boolean)
-      .some((v) => String(v).toLowerCase().includes(this._search));
-  }
-
-  _renderDevices() {
-    const data = this._overview;
-    if (!data) return `<div class="muted">Загрузка…</div>`;
-    const s = data.summary;
-
-    const cards = `
-      <div class="stats">
-        ${this._stat(s.connected, "на связи", "ok")}
-        ${this._stat(s.offline, "не отвечают", s.offline ? "bad" : "")}
-        ${this._stat(s.quiet, "молчат > 2 мин", s.quiet ? "warn" : "")}
-        ${this._stat(s.gateways, "шлюзов")}
-        ${this._stat(s.subdevices, "за шлюзом")}
-        ${this._stat(s.entities, "сущностей")}
+        <nav id="nav"></nav>
+        <main id="main"></main>
       </div>`;
+    this.shadowRoot.addEventListener("click", (e) => this.onClick(e));
+    this.shadowRoot.addEventListener("input", (e) => this.onInput(e));
+    this.shadowRoot.addEventListener("change", (e) => this.onInput(e));
+    this.paint();
+  }
 
-    // Шлюз и его дети идут вместе — это главное отношение в такой установке.
-    const shown = data.devices.filter((d) => this._matches(d));
-    const gateways = shown.filter((d) => !d.is_subdevice);
-    const children = shown.filter((d) => d.is_subdevice);
-    const byGateway = {};
-    children.forEach((c) => {
-      (byGateway[c.gateway_id] = byGateway[c.gateway_id] || []).push(c);
-    });
+  paintHeader() {
+    const s = this.s;
+    const upd = s.updatedAt ? hhmmss(s.updatedAt) : "—";
+    const ex = s.expert;
+    this.shadowRoot.getElementById("hactions").innerHTML = `
+      <div class="chip-sel">
+        ${icon("i-home", 14, C.mut)}
+        <select data-act="entry">
+          <option value="all">Все записи</option>
+          ${(this.d.overview?.entries || []).map((e) =>
+            `<option value="${esc(e.entry_id)}" ${s.entryFilter === e.entry_id ? "selected" : ""}>${esc(e.title)}</option>`).join("")}
+        </select>
+      </div>
+      <div class="upd"><span class="dot-live"></span><span>Обновлено ${upd}</span></div>
+      ${btn("Обновить", { act: "refresh", ico: "i-refresh" })}
+      <button data-act="expert" title="Экспертный режим: raw-DPS и широкие операции"
+        style="display:inline-flex;align-items:center;gap:8px;height:32px;padding:0 11px;border-radius:7px;
+        border:1px solid ${ex ? C.stale : "#D0D8DF"};background:${ex ? soft(C.stale, 0.1) : "#F4F6F8"};
+        color:${ex ? C.stale : C.ink3};font-size:12px;font-weight:600;letter-spacing:.02em;cursor:pointer">
+        <span style="width:26px;height:14px;border-radius:8px;background:${ex ? C.stale : "#C6CFD8"};position:relative;flex:0 0 auto">
+          <span style="position:absolute;top:2px;left:${ex ? "14px" : "2px"};width:10px;height:10px;border-radius:50%;background:#fff;transition:left .18s"></span>
+        </span>EXPERT</button>`;
+  }
 
-    let out = cards;
-    for (const gw of gateways) {
-      out += this._deviceRow(gw);
-      for (const child of byGateway[gw.device_id] || []) out += this._deviceRow(child, true);
-      delete byGateway[gw.device_id];
+  paintNav() {
+    const problems = this.d.overview ? this.d.overview.summary.total - this.d.overview.summary.online : 0;
+    this.shadowRoot.getElementById("nav").innerHTML = NAV.map((n) => {
+      const on = this.s.screen === n.id;
+      const badge = n.id === "events" && problems > 0
+        ? `<span class="badge-n">${problems}</span>` : "";
+      return `<button data-act="nav" data-nav="${n.id}" class="tab ${on ? "on" : ""}">
+        ${icon(n.icon, 15)}${n.label}${badge}</button>`;
+    }).join("");
+  }
+
+  paint() {
+    if (!this._built) return;
+    this.paintHeader();
+    this.paintNav();
+    const main = this.shadowRoot.getElementById("main");
+    if (this._err) {
+      main.innerHTML = `<div class="pad"><div class="card err">${icon("i-alert", 15, C.bad)} ${esc(this._err)}</div></div>`;
+      return;
     }
-    // Дети, чей шлюз отфильтрован поиском, не должны исчезнуть.
-    Object.values(byGateway).forEach((list) => list.forEach((c) => (out += this._deviceRow(c, true))));
-
-    if (!shown.length) out += `<div class="muted">Ничего не найдено</div>`;
-    return out;
+    const view = {
+      overview: () => this.vOverview(), map: () => this.vMap(), device: () => this.vDevice(),
+      add: () => this.vAdd(), events: () => this.vEvents(), settings: () => this.vSettings(),
+    }[this.s.screen];
+    main.innerHTML = view ? view() : "";
   }
 
-  _stat(value, label, tone = "") {
-    return `<div class="stat ${tone}"><div class="v">${value}</div><div class="l">${label}</div></div>`;
+  // ----------------------------------------------------- фильтр по записи --
+  rows() {
+    const all = this.d.overview?.devices || [];
+    return this.s.entryFilter === "all" ? all : all.filter((r) => r.entry_id === this.s.entryFilter);
   }
 
-  _deviceRow(d, child = false) {
-    const state = d.connected ? "ok" : d.available ? "warn" : "bad";
-    const stateText = d.connected
-      ? "на связи"
-      : d.available
-      ? "переподключается"
-      : "нет связи";
-    const badges = [
-      d.is_gateway ? `<span class="badge gw">шлюз · ${d.sub_device_count}</span>` : "",
-      d.area_name ? `<span class="badge">${esc(d.area_name)}</span>` : "",
-      d.quiet ? `<span class="badge warn">молчит ${humanAge(d.last_update_age)}</span>` : "",
-      d.enable_debug ? `<span class="badge">отладка</span>` : "",
-    ].join("");
+  sum() {
+    const rows = this.rows();
+    if (this.s.entryFilter === "all" && this.d.overview) return this.d.overview.summary;
+    const by = {};
+    rows.forEach((r) => (by[r.state] = (by[r.state] || 0) + 1));
+    const badGw = rows.filter((r) => r.is_gateway && r.state !== "online");
+    return {
+      total: rows.length, online: by.online || 0, connecting: by.connecting || 0,
+      reconnecting: by.reconnecting || 0, grace: by.grace || 0,
+      unavailable: by.unavailable || 0, config: by.config || 0,
+      bad_gateways: badGw.length, bad_gateway_children: badGw.reduce((a, g) => a + g.sub_device_count, 0),
+      gateways: rows.filter((r) => r.is_gateway).length,
+      subdevices: rows.filter((r) => r.is_subdevice).length,
+      quiet: rows.filter((r) => r.quiet).length,
+      entities: rows.reduce((a, r) => a + r.entity_count, 0),
+    };
+  }
 
-    const entities = d.entities
-      .map(
-        (e) =>
-          `<div class="ent"><span class="ename">${esc(e.name)}</span>
-             <code>${esc(e.entity_id)}</code>
-             <span class="estate ${e.state === "unavailable" || e.state === "unknown" ? "bad" : ""}">${esc(
-            e.state ?? "—"
-          )}</span></div>`
-      )
-      .join("");
+  // ================================================== 01 Обзор ============
+  vOverview() {
+    const s = this.sum(), rows = this.rows();
+    if (!this.d.overview) return `<div class="pad muted">Загрузка…</div>`;
 
-    return `
-      <div class="device ${child ? "child" : ""}">
-        <div class="drow" data-act="expand">
-          <span class="dot ${state}" title="${stateText}"></span>
-          <div class="dmain">
-            <div class="dname">${esc(d.name)} ${badges}</div>
-            <div class="dmeta">${esc(d.host)} · ${esc(d.protocol)} · ${d.entity_count} сущн. ·
-              последний ответ ${humanAge(d.last_update_age)}</div>
+    const tiles = [
+      { label: "Всего устройств", value: s.total, icon: "i-chip", color: "#98A2AC", vColor: C.ink },
+      { label: "Онлайн", value: s.online, icon: "i-check", color: C.ok, vColor: C.ok },
+      { label: "Переподключение", value: s.reconnecting, icon: "i-refresh", color: C.warn, note: "ретраи", vColor: s.reconnecting ? C.warn : C.ink },
+      { label: "Grace-период", value: s.grace, icon: "i-clock", color: C.grace, note: "ожидание", vColor: s.grace ? C.grace : C.ink },
+      { label: "Недоступно", value: s.unavailable, icon: "i-octagon", color: C.bad, note: "подтв. сбой", vColor: s.unavailable ? C.bad : C.ink },
+      { label: "Шлюзы с проблемой", value: s.bad_gateways, icon: "i-alert", color: C.stale, note: s.bad_gateway_children ? `${s.bad_gateway_children} детей` : "", vColor: s.bad_gateways ? C.stale : C.ink },
+    ].map((t) => `
+      <div class="tile" style="--tc:${t.color}">
+        <div class="tl">${icon(t.icon, 14, t.color)}<span>${t.label}</span></div>
+        <div class="tv"><span style="color:${t.vColor}">${t.value}</span><span class="tn">${t.note || ""}</span></div>
+      </div>`).join("");
+
+    const order = ["online", "reconnecting", "grace", "unavailable", "config"];
+    const health = order.map((k) => ({ k, n: s[k] || 0, c: ST[k].color, l: ST[k].label }));
+    const bar = health.filter((h) => h.n).map((h) =>
+      `<span style="width:${(h.n / Math.max(1, s.total)) * 100}%;background:${h.c}"></span>`).join("");
+    const legend = health.map((h) => `
+      <button data-act="filter-state" data-state="${h.k}" class="hrow">
+        <span class="hd" style="background:${h.c}"></span>
+        <span class="hl">${h.l}</span><span class="hn">${h.n}</span></button>`).join("");
+
+    const gateways = rows.filter((r) => r.is_gateway);
+    const gwList = gateways.length ? gateways.map((g) => {
+      const st = ST[g.state] || ST.config;
+      const kids = rows.filter((r) => r.gateway_id === g.device_id);
+      const affected = kids.filter((k) => k.state !== "online").length;
+      return `<button class="gwrow" data-act="open-device" data-id="${esc(g.device_id)}">
+        <span class="gwico" style="background:${soft(st.color, 0.12)};color:${st.color}">${icon("i-zigbee", 17)}</span>
+        <span class="gwmain">
+          <span class="gwtop"><span class="gwname">${esc(g.name)}</span>${pill(g.state)}</span>
+          <span class="gwmeta">${esc(g.host)} · ${plural(kids.length, "саб-устройство", "саб-устройства", "саб-устройств")}</span>
+        </span>
+        <span class="gwaff"><span style="color:${affected ? C.bad : C.ok}">${affected}</span><span>затронуто</span></span>
+      </button>`;
+    }).join("") : empty("Шлюзов нет — все устройства подключаются напрямую", "i-wifi", C.mut);
+
+    const incidents = (this.d.report?.entries || this.d.overview.recent || []).slice(-8).reverse();
+    const feed = incidents.length ? incidents.map((e) => {
+      const m = EVENT_META[e.event] || { label: e.event, color: C.mut, icon: "i-dots" };
+      return `<div class="inc">
+        <span class="inct">${esc(new Date(e.ts).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }))}</span>
+        <span class="incico" style="background:${soft(m.color, 0.12)};color:${m.color}">${icon(m.icon, 12)}</span>
+        <span class="incb"><span class="inct1">${esc(m.label)}</span>
+        <span class="inct2">${esc(e.name || e.device_id)}${e.reason ? " · " + esc(e.reason) : ""}</span></span>
+      </div>`;
+    }).join("") : empty("Инцидентов не зафиксировано");
+
+    const attention = rows.filter((r) => r.state !== "online");
+    const attRows = attention.length ? attention.map((r) => `
+      <div class="arow">
+        <span class="acell">${icon(r.is_subdevice ? "i-zigbee" : "i-wifi", 14, C.mut)}
+          <span class="aname">${esc(r.name)}</span></span>
+        <span class="amono">${esc(r.area_name || (r.gateway_id ? "через шлюз" : "напрямую"))}</span>
+        <span>${pill(r.state)}</span>
+        <span class="areason">${esc(r.last_error || "—")}</span>
+        <span class="amono">${age(r.last_update_age)}</span>
+        ${btn("Открыть", { act: "open-device", data: `data-id="${esc(r.device_id)}"`, small: true })}
+      </div>`).join("") : empty(`Все ${s.total} устройств на связи`);
+
+    return `<div class="pad col16" style="max-width:1560px">
+      <div class="tiles">${tiles}</div>
+      <div class="row16">
+        <div class="col16" style="flex:1 1 480px;min-width:320px">
+          ${cardOpen("Здоровье соединений", `<span class="mono small">${esc(this.scopeName())}</span>`)}
+            <div style="padding:16px">
+              <div class="hbar">${bar}</div>
+              <div class="hgrid">${legend}</div>
+            </div>
+          ${cardClose}
+          ${cardOpen(`Шлюзы · ${esc(this.scopeName())}`, btn("На карте", { act: "nav", data: 'data-nav="map"', small: true, ico: "i-chev-r" }))}
+            <div>${gwList}</div>
+          ${cardClose}
+        </div>
+        <div style="flex:1 1 380px;min-width:300px;display:flex;flex-direction:column;background:${C.card};border:1px solid ${C.line};border-radius:10px;box-shadow:0 1px 2px rgba(24,39,58,.05)">
+          <div style="padding:13px 16px;border-bottom:1px solid ${C.line};display:flex;align-items:center;justify-content:space-between;gap:12px">
+            <span class="cap">Лента инцидентов</span>
+            ${btn("Все события", { act: "nav", data: 'data-nav="events"', small: true, ico: "i-chev-r" })}
           </div>
-          <div class="dactions">
-            <button class="btn small" data-act="refresh-dps"
-              data-device-id="${esc(d.device_id)}" data-node-id="${esc(d.node_id || "")}">Опросить</button>
-            <button class="btn small" data-act="reconnect"
-              data-device-id="${esc(d.device_id)}" data-node-id="${esc(d.node_id || "")}">Переподключить</button>
+          <div style="flex:1;padding:4px 0">${feed}</div>
+          <div style="padding:11px 16px;border-top:1px solid ${C.line};display:flex;gap:8px;flex-wrap:wrap">
+            ${btn("Обновить данные", { act: "refresh", primary: true, ico: "i-refresh" })}
+            ${btn("Перезагрузить интеграцию", { act: "reload-all", danger: true, ico: "i-alert" })}
           </div>
         </div>
-        <div class="dbody">${entities || `<div class="muted">Нет сущностей</div>`}</div>
+      </div>
+      ${cardOpen("Требуют внимания",
+        `${attention.length ? `<span class="badge-w">${attention.length}</span>` : ""}
+         <span class="small mut">${esc(attention.length ? "нажмите «Открыть» для карточки устройства" : "все узлы в норме")}</span>`)}
+        <div style="overflow-x:auto"><div style="min-width:880px">
+          <div class="ahead"><span>Устройство</span><span>Зона / связь</span><span>Состояние</span><span>Причина</span><span>Ответ</span><span></span></div>
+          ${attRows}
+        </div></div>
+      ${cardClose}
+    </div>`;
+  }
+
+  scopeName() {
+    if (this.s.entryFilter === "all") return "все записи";
+    const e = (this.d.overview?.entries || []).find((x) => x.entry_id === this.s.entryFilter);
+    return e ? e.title : "запись";
+  }
+
+  // ================================================== 02 Карта связей =====
+  vMap() {
+    if (!this.d.topology) return `<div class="pad muted">Загрузка карты…</div>`;
+    const s = this.sum();
+    const chips = ["online", "reconnecting", "grace", "unavailable", "config"].map((k) => {
+      const on = this.s.mapState === k;
+      return `<button data-act="chip" data-state="${k}" class="chip" style="border-color:${on ? ST[k].color : "#DDE3E9"};
+        background:${on ? soft(ST[k].color, 0.1) : C.card};color:${on ? ST[k].color : C.ink3};font-weight:${on ? 600 : 500}">
+        <span style="width:7px;height:7px;border-radius:50%;background:${ST[k].color}"></span>${ST[k].label}
+        <span style="font-family:${MONO};opacity:.7">${s[k] || 0}</span></button>`;
+    }).join("");
+
+    const rowsHtml = [];
+    const walk = (node, depth) => {
+      const match = !this.s.search ||
+        (node.name + " " + (node.meta || "") + " " + (node.node || "")).toLowerCase().includes(this.s.search);
+      const stateOk = !this.s.mapState || node.state === this.s.mapState;
+      const incOk = !this.s.incidentsOnly || node.state !== "online";
+      const kids = node.children || [];
+      const collapsed = this.s.collapsed.has(node.id);
+      const childHtml = collapsed ? [] : kids.map((k) => walk(k, depth + 1)).filter(Boolean);
+      const showSelf = match && stateOk && incOk;
+      if (!showSelf && !childHtml.length) return null;
+
+      const k = KIND[node.kind] || KIND.device;
+      const st = ST[node.state] || ST.config;
+      const sel = this.s.selected === node.id;
+      const html = `
+        <div class="trow ${sel ? "sel" : ""}" data-act="select" data-node="${esc(node.id)}" data-device="${esc(node.device_id || "")}">
+          <span class="tmark" style="background:${sel ? C.accent : "transparent"}"></span>
+          <span class="tname">
+            <span style="width:${depth * 18}px;flex:0 0 auto"></span>
+            ${kids.length
+              ? `<button class="tchev" data-act="toggle" data-node="${esc(node.id)}">${icon(collapsed ? "i-chev-r" : "i-chev-d", 13)}</button>`
+              : `<span class="tdot"></span>`}
+            ${icon(k.icon, 15, k.color)}
+            <span class="tlabel">
+              <span style="font-size:${k.size};font-weight:${k.weight};color:${C.ink};font-family:${k.font}">${esc(node.name)}</span>
+              <span class="tmeta">${esc(node.meta || "")}</span>
+            </span>
+          </span>
+          <span style="width:172px;flex:0 0 auto">${pill(node.state, node.kind)}</span>
+          <span class="tval">${esc(node.value || "")}</span>
+          <span class="tnode">${esc(node.node || "")}</span>
+        </div>`;
+      rowsHtml.push(showSelf ? html : "");
+      childHtml.forEach(() => {});
+      return html;
+    };
+    const flat = [];
+    const walk2 = (node, depth) => {
+      const kids = node.children || [];
+      const collapsed = this.s.collapsed.has(node.id);
+      flat.push({ node, depth });
+      if (!collapsed) kids.forEach((k) => walk2(k, depth + 1));
+    };
+    this.d.topology.tree.forEach((t) => walk2(t, 0));
+
+    const visible = flat.filter(({ node }) => {
+      const q = this.s.search;
+      const match = !q || (node.name + " " + (node.meta || "") + " " + (node.node || "")).toLowerCase().includes(q);
+      const stateOk = !this.s.mapState || node.state === this.s.mapState;
+      const incOk = !this.s.incidentsOnly || node.state !== "online";
+      return match && stateOk && incOk;
+    });
+
+    const tree = visible.map(({ node, depth }) => {
+      const k = KIND[node.kind] || KIND.device;
+      const kids = node.children || [];
+      const collapsed = this.s.collapsed.has(node.id);
+      const sel = this.s.selected === node.id;
+      return `<div class="trow ${sel ? "sel" : ""}" data-act="select" data-node="${esc(node.id)}" data-device="${esc(node.device_id || "")}">
+        <span class="tmark" style="background:${sel ? C.accent : "transparent"}"></span>
+        <span class="tname">
+          <span style="width:${depth * 18}px;flex:0 0 auto"></span>
+          ${kids.length
+            ? `<button class="tchev" data-act="toggle" data-node="${esc(node.id)}">${icon(collapsed ? "i-chev-r" : "i-chev-d", 13)}</button>`
+            : `<span class="tdot"></span>`}
+          ${icon(k.icon, 15, k.color)}
+          <span class="tlabel">
+            <span style="font-size:${k.size};font-weight:${k.weight};color:${C.ink};font-family:${k.font};overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(node.name)}</span>
+            <span class="tmeta">${esc(node.meta || "")}</span>
+          </span>
+        </span>
+        <span style="width:172px;flex:0 0 auto">${pill(node.state, node.kind)}</span>
+        <span class="tval">${esc(node.value || "")}</span>
+        <span class="tnode">${esc(node.node || "")}</span>
       </div>`;
+    }).join("");
+
+    return `<div class="pad col14" style="max-width:1720px">
+      <div class="mtools">
+        <div class="search"><span>${icon("i-search", 14, C.mut)}</span>
+          <input data-act="search" value="${esc(this.s.search)}" placeholder="Поиск устройства, сущности или node ID">
+        </div>
+        <div class="chips">${icon("i-filter", 14, C.mut)}${chips}</div>
+        <span style="flex:1"></span>
+        <button data-act="incidents" class="chip" style="border-color:${this.s.incidentsOnly ? C.stale : "#DDE3E9"};
+          background:${this.s.incidentsOnly ? soft(C.stale, 0.1) : C.card};color:${this.s.incidentsOnly ? C.stale : C.ink3}">
+          ${icon("i-alert", 13)}Только инциденты</button>
+        ${btn("Развернуть всё", { act: "expand-all", small: true })}
+        ${btn("Свернуть всё", { act: "collapse-all", small: true })}
+      </div>
+      <div class="row14">
+        <div style="flex:1 1 620px;min-width:320px;background:${C.card};border:1px solid ${C.line};border-radius:10px;box-shadow:0 1px 2px rgba(24,39,58,.05);overflow:hidden">
+          <div style="overflow-x:auto"><div style="min-width:760px">
+            <div class="thead"><span style="flex:1">Узел цепочки</span><span style="width:172px">Состояние</span>
+              <span style="width:126px">Значение</span><span style="width:104px">Node ID</span></div>
+            ${tree || empty("Ничего не найдено", "i-search", C.mut)}
+          </div></div>
+          <div class="tfoot"><span class="small mut">Показано ${visible.length} узлов${this.s.search ? " по фильтру" : ""}</span></div>
+        </div>
+        ${this.selectedAside()}
+      </div>
+    </div>`;
   }
 
-  _renderLog() {
-    const data = this._log;
-    if (!data) return `<div class="muted">Загрузка…</div>`;
-    if (!data.records.length) {
-      return `<div class="card">
-        <p>Записей пока нет.</p>
-        <p class="muted">Журнал собирается в памяти с момента запуска. Если тут пусто —
-        скорее всего интеграция пишет только предупреждения; включите подробный
-        уровень в «Настройках» этой панели.</p>
+  selectedAside() {
+    const flat = [];
+    const walk = (n) => { flat.push(n); (n.children || []).forEach(walk); };
+    (this.d.topology?.tree || []).forEach(walk);
+    const node = flat.find((n) => n.id === this.s.selected) || flat[0];
+    if (!node) return "";
+    const k = KIND[node.kind] || KIND.device;
+    const st = ST[node.state] || ST.config;
+    const row = (this.rows() || []).find((r) => r.device_id === node.device_id);
+
+    const fields = [["Тип", k.label], ["Идентификатор", node.id]];
+    if (node.node) fields.push(["Node ID", node.node]);
+    if (row) {
+      fields.push(["Адрес", row.host], ["Протокол", row.protocol]);
+      fields.push(["Последний ответ", age(row.last_update_age)]);
+      if (row.retries) fields.push(["Попыток подряд", row.retries]);
+      if (row.last_error) fields.push(["Последняя ошибка", esc(row.last_error)]);
+      fields.push(["Сущностей", row.entity_count]);
+    }
+
+    const warn = row && row.state !== "online" && row.is_gateway
+      ? `Шлюз недоступен — это объясняет состояние ${plural(row.sub_device_count, "дочернего устройства", "дочерних устройств", "дочерних устройств")}.`
+      : row && row.quiet ? `Устройство не отвечало ${age(row.last_update_age)} — возможно, шлюз перестал его перечислять.` : "";
+
+    return `<aside style="flex:0 1 330px;min-width:280px;background:${C.card};border:1px solid ${C.line};border-radius:10px;box-shadow:0 1px 2px rgba(24,39,58,.05)">
+      <div style="padding:13px 15px;border-bottom:1px solid ${C.line};display:flex;align-items:center;justify-content:space-between">
+        <span class="cap">Выбранный узел</span>${icon("i-eye", 14, C.faint)}
+      </div>
+      <div style="padding:15px;display:flex;flex-direction:column;gap:13px">
+        <div style="display:flex;gap:11px;align-items:flex-start">
+          <span style="width:34px;height:34px;border-radius:9px;background:${soft(st.color, 0.12)};color:${st.color};display:flex;align-items:center;justify-content:center;flex:0 0 auto">${icon(k.icon, 18)}</span>
+          <span style="min-width:0"><span style="display:block;font-size:14.5px;font-weight:600">${esc(node.name)}</span>
+            <span style="display:block;font-size:11.5px;color:${C.mut3};margin-top:2px">${k.label}</span></span>
+        </div>
+        ${pill(node.state, node.kind)}
+        ${kv(fields)}
+        ${warn ? `<div class="warnbox">${icon("i-alert", 14, C.stale)}<span>${esc(warn)}</span></div>` : ""}
+        ${node.device_id ? `<div style="display:flex;flex-direction:column;gap:7px">
+          ${btn("Открыть карточку устройства", { act: "open-device", data: `data-id="${esc(node.device_id)}"`, primary: true, ico: "i-chip" })}
+          <div style="display:flex;gap:7px">
+            ${btn("Обновить DPS", { act: "dev-refresh", data: `data-id="${esc(node.device_id)}"`, ico: "i-refresh" })}
+            ${btn("Переподключить", { act: "dev-reconnect", data: `data-id="${esc(node.device_id)}"`, ico: "i-link" })}
+          </div></div>` : ""}
+      </div></aside>`;
+  }
+
+  // ================================================== 03 Карточка =========
+  vDevice() {
+    if (!this.s.deviceId) {
+      const rows = this.rows();
+      return `<div class="pad col14" style="max-width:1100px">
+        ${cardOpen("Выберите устройство")}
+        <div>${rows.map((r) => `<button class="gwrow" data-act="open-device" data-id="${esc(r.device_id)}">
+          <span class="gwico" style="background:${soft((ST[r.state] || ST.config).color, .12)};color:${(ST[r.state] || ST.config).color}">
+            ${icon(r.is_subdevice ? "i-zigbee" : "i-wifi", 17)}</span>
+          <span class="gwmain"><span class="gwtop"><span class="gwname">${esc(r.name)}</span>${pill(r.state)}</span>
+          <span class="gwmeta">${esc(r.host)} · ${r.entity_count} сущн.</span></span></button>`).join("")}</div>
+        ${cardClose}</div>`;
+    }
+    const d = this.d.device;
+    if (!d) return `<div class="pad muted">Загрузка устройства…</div>`;
+    const r = d.device, st = ST[r.state] || ST.config;
+
+    const tabs = DEVICE_TABS.map((t) => {
+      const n = t.id === "entities" ? r.entity_count : t.id === "dps" ? d.dps.length : null;
+      const on = this.s.deviceTab === t.id;
+      return `<button data-act="dtab" data-tab="${t.id}" class="tab ${on ? "on" : ""}">${t.label}
+        ${n !== null ? `<span class="cnt">${n}</span>` : ""}</button>`;
+    }).join("");
+
+    const body = {
+      status: () => this.dvStatus(d), entities: () => this.dvEntities(d),
+      dps: () => this.dvDps(d), diag: () => this.dvDiag(d), config: () => this.dvConfig(d),
+    }[this.s.deviceTab]();
+
+    return `<div style="display:flex;flex-direction:column">
+      <div style="padding:16px 20px 0;max-width:1560px">
+        <div class="crumbs">${icon("i-network", 12, C.mut3)}
+          <button data-act="nav" data-nav="map" class="lnk">Карта связей</button>${icon("i-chev-r", 11, C.faint)}
+          <span>${esc(r.name)}</span></div>
+        <div class="dhead">
+          <span class="dico" style="background:${soft(st.color, .12)};color:${st.color}">${icon(r.is_subdevice ? "i-zigbee" : "i-wifi", 22)}</span>
+          <div style="min-width:0;flex:1">
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+              <span style="font-size:19px;font-weight:600;letter-spacing:-.01em">${esc(r.name)}</span>${pill(r.state)}
+            </div>
+            <div class="mono small mut" style="margin-top:3px">${esc(r.host)} · ${esc(r.protocol)}${r.node_id ? " · node " + esc(r.node_id) : ""} · ${esc(r.model || "Tuya")}</div>
+          </div>
+          <div style="display:flex;gap:7px;flex-wrap:wrap">
+            ${btn("Обновить DPS", { act: "dev-refresh", data: `data-id="${esc(r.device_id)}"`, ico: "i-refresh" })}
+            ${btn("Тест статуса", { act: "dev-test", data: `data-id="${esc(r.device_id)}"`, ico: "i-play" })}
+            ${btn("Переподключить", { act: "dev-reconnect", data: `data-id="${esc(r.device_id)}"`, ico: "i-link" })}
+            ${btn("Перезагрузить запись", { act: "reload-entry", data: `data-entry="${esc(r.entry_id)}"`, danger: true })}
+          </div>
+        </div>
+        <nav class="subnav">${tabs}</nav>
+      </div>
+      <div class="pad col14" style="max-width:1560px;padding-top:16px">${body}</div>
+    </div>`;
+  }
+
+  dvStatus(d) {
+    const r = d.device;
+    const conn = [
+      ["Состояние", ST[r.state]?.label || r.state],
+      ["Подключено", r.connected ? "да" : "нет"],
+      ["Доступно для HA", r.available ? "да" : "нет"],
+      ["Последний ответ", age(r.last_update_age) + (r.last_update_age !== null ? " назад" : "")],
+      ["Попыток подряд", r.retries || 0],
+      ["Последняя ошибка", esc(r.last_error || "—")],
+      ["Отладка устройства", r.enable_debug ? "включена" : "выключена"],
+    ];
+    const chain = [
+      ["Запись конфигурации", esc(r.entry_id.slice(-10))],
+      ["Транспорт", r.is_subdevice ? "через шлюз Zigbee" : "прямое Wi-Fi подключение"],
+      ["Шлюз", d.gateway ? esc(d.gateway.name) : "—"],
+      ["Node ID", esc(r.node_id || "—")],
+      ["Дочерних устройств", d.children.length],
+      ["Комната", esc(r.area_name || "не назначена")],
+    ];
+    const kids = d.children.length ? `
+      ${cardOpen(`Дочерние устройства · ${d.children.length}`)}
+      <div>${d.children.map((k) => `<button class="gwrow" data-act="open-device" data-id="${esc(k.device_id)}">
+        <span class="gwico" style="background:${soft((ST[k.state] || ST.config).color, .12)};color:${(ST[k.state] || ST.config).color}">${icon("i-chip", 16)}</span>
+        <span class="gwmain"><span class="gwtop"><span class="gwname">${esc(k.name)}</span>${pill(k.state)}</span>
+        <span class="gwmeta">node ${esc(k.node_id || "")} · ${k.entity_count} сущн.</span></span></button>`).join("")}</div>
+      ${cardClose}` : "";
+
+    return `<div class="row14">
+      <div style="flex:1 1 420px;min-width:300px" class="col14">
+        ${cardOpen("Соединение")}<div style="padding:14px">${kv(conn)}</div>${cardClose}
+        ${kids}
+      </div>
+      <div style="flex:1 1 420px;min-width:300px" class="col14">
+        ${cardOpen("Цепочка и связи")}<div style="padding:14px">${kv(chain)}</div>${cardClose}
+        ${cardOpen("Результаты действий")}
+        <div id="actionlog" style="padding:14px;display:flex;flex-direction:column;gap:8px">
+          ${(this._actionLog || []).length ? (this._actionLog || []).map((a) => `
+            <div style="display:flex;gap:9px;align-items:flex-start">
+              ${icon(a.ok ? "i-check" : "i-alert", 13, a.ok ? C.ok : C.bad)}
+              <span style="flex:1;font-size:12px;color:${C.ink2}">${esc(a.text)}
+                <span class="mono small mut" style="display:block">${esc(a.time)}</span></span></div>`).join("")
+            : `<span class="small mut">Действий пока не было. Кнопки сверху пишут сюда результат.</span>`}
+        </div>${cardClose}
+      </div></div>`;
+  }
+
+  dvEntities(d) {
+    const map = {};
+    (d.entity_configs || []).forEach((c) => (map[c.id] = c));
+    const rows = d.device.entities.map((e) => {
+      const cfg = Object.values(map).find((c) => e.entity_id.startsWith(c.platform + "."));
+      const mapping = cfg ? Object.entries(cfg.mapping).filter(([k]) => k !== "platform")
+        .map(([k, v]) => `${k.replace(/_dp$/, "")}=${v}`).join(" · ") : "";
+      const bad = e.state === "unavailable" || e.state === "unknown";
+      return `<div class="erow">
+        <span class="ename2">${esc(e.name)}<span class="mono small mut" style="display:block">${esc(e.entity_id)}</span></span>
+        <span class="mono small">${esc(e.domain)}</span>
+        <span class="mono small mut">${esc(mapping || "—")}</span>
+        <span style="font-weight:600;color:${bad ? C.bad : C.ink}">${esc(e.state ?? "—")}</span>
+        ${btn("Изменить", { act: "edit-entity", data: `data-eid="${esc(e.entity_id)}"`, small: true, ico: "i-pencil" })}
       </div>`;
+    }).join("");
+    return `${cardOpen(`Сущности устройства · ${d.device.entity_count}`)}
+      <div style="overflow-x:auto"><div style="min-width:760px">
+        <div class="ehead"><span>Сущность</span><span>Платформа</span><span>Сопоставление DP</span><span>Состояние HA</span><span></span></div>
+        ${rows || empty("У устройства нет сущностей", "i-alert", C.mut)}
+      </div></div>${cardClose}`;
+  }
+
+  dvDps(d) {
+    const rows = d.dps.map((p) => `
+      <div class="drow">
+        <span class="mono" style="font-weight:600">${esc(p.dp)}</span>
+        <span class="mono small mut">${esc(p.code || "—")}</span>
+        <span class="mono" style="color:${C.ink}">${esc(JSON.stringify(p.value))}</span>
+        <span class="small mut">${esc(p.used_by.join(", ") || "не используется")}</span>
+        ${this.s.expert ? btn("Записать", { act: "write-dp", data: `data-dp="${esc(p.dp)}"`, small: true, ico: "i-terminal" }) : ""}
+      </div>`).join("");
+
+    const expert = this.s.expert ? `
+      ${cardOpen("Экспертная запись raw DP · set_dp", `<span class="badge-w">только эксперт</span>`)}
+      <div style="padding:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input id="dpid" placeholder="DP, напр. 1" style="width:120px" class="inp">
+        <input id="dpval" placeholder="значение: true / 42 / open" style="flex:1;min-width:180px" class="inp">
+        ${btn("Записать DP", { act: "write-dp-form", danger: true, ico: "i-terminal" })}
+        <span class="small mut" style="flex-basis:100%">Запись идёт прямо в устройство и записывается в журнал интеграции.</span>
+      </div>${cardClose}`
+      : `<div class="card" style="padding:14px;display:flex;align-items:center;gap:10px">
+          ${icon("i-shield", 15, C.mut)}<span class="small mut" style="flex:1">Запись сырых DP скрыта. Включите EXPERT в шапке, чтобы получить доступ.</span>
+          ${btn("Включить EXPERT", { act: "expert", small: true })}</div>`;
+
+    return `${cardOpen(`Живые значения DPS · ${d.dps.length}`)}
+      <div style="overflow-x:auto"><div style="min-width:700px">
+        <div class="dhead2"><span>DP</span><span>Код</span><span>Значение</span><span>Привязка</span>${this.s.expert ? "<span></span>" : ""}</div>
+        ${rows || empty("Устройство ещё не сообщило ни одного значения", "i-clock", C.mut)}
+      </div></div>${cardClose}
+      ${expert}`;
+  }
+
+  dvDiag(d) {
+    const evs = (d.events || []).slice().reverse();
+    const rows = evs.length ? evs.map((e) => {
+      const m = EVENT_META[e.event] || { label: e.event, color: C.mut, icon: "i-dots" };
+      return `<div class="inc" style="padding:10px 16px;border-bottom:1px solid ${C.div}">
+        <span class="inct">${esc(new Date(e.ts).toLocaleString("ru-RU"))}</span>
+        <span class="incico" style="background:${soft(m.color, .12)};color:${m.color}">${icon(m.icon, 12)}</span>
+        <span class="incb"><span class="inct1">${esc(m.label)}</span>
+          <span class="inct2">${esc(e.reason || "")}${e.disconnect_age_sec != null ? ` · ${Math.round(e.disconnect_age_sec)} с` : ""}</span></span>
+      </div>`;
+    }).join("") : empty("Событий доступности по этому устройству нет");
+
+    return `${cardOpen("События доступности устройства",
+      btn("Вся хронология", { act: "nav", data: 'data-nav="events"', small: true, ico: "i-chev-r" }))}
+      <div>${rows}</div>${cardClose}
+      ${cardOpen("Диагностические данные", btn("Копировать (redacted)", { act: "copy-diag", small: true, ico: "i-copy" }))}
+      <div style="padding:14px"><pre class="pre">${esc(JSON.stringify(d.config, null, 2))}</pre></div>${cardClose}`;
+  }
+
+  dvConfig(d) {
+    const c = d.config;
+    const fields = Object.entries(c)
+      .filter(([k]) => !["entities", "dps_strings"].includes(k))
+      .map(([k, v]) => [k, esc(typeof v === "object" ? JSON.stringify(v) : String(v))]);
+    return `${cardOpen("Транспорт и устройство",
+      `<span class="small mut">ключи и секреты не передаются в панель</span>`)}
+      <div style="padding:14px">${kv(fields)}</div>${cardClose}
+      ${cardOpen("Датапоинты устройства")}
+      <div style="padding:14px"><pre class="pre">${esc((c.dps_strings || []).join("\n") || "—")}</pre></div>${cardClose}`;
+  }
+
+  // ================================================== 04 Добавление =======
+  vAdd() {
+    const d = this.d.discovered;
+    if (!d) return `<div class="pad muted">Поиск устройств…</div>`;
+    const found = d.devices || [];
+    const fresh = found.filter((f) => !f.configured);
+    const known = found.filter((f) => f.configured);
+
+    const rows = fresh.length ? fresh.map((f) => `
+      <div class="frow">
+        <span class="acell">${icon("i-wifi", 14, C.mut)}<span class="aname mono">${esc(f.device_id)}</span></span>
+        <span class="mono small">${esc(f.host)}</span>
+        <span class="mono small mut">протокол ${esc(f.protocol || "?")}</span>
+        ${btn("Добавить", { act: "add-device", data: `data-id="${esc(f.device_id)}"`, primary: true, small: true, ico: "i-plus" })}
+      </div>`).join("") : empty("Новых устройств в сети не обнаружено", "i-search", C.mut);
+
+    return `<div class="pad col16" style="max-width:1440px">
+      <div class="row16">
+        <div style="flex:2 1 520px;min-width:320px" class="col16">
+          ${cardOpen(`Найденные устройства · ${fresh.length}`,
+            btn("Сканировать снова", { act: "refresh", small: true, ico: "i-refresh" }))}
+            <div>${rows}</div>
+          ${cardClose}
+          ${cardOpen(`Уже в системе · ${known.length}`)}
+            <div>${known.length ? known.map((f) => `
+              <div class="frow"><span class="acell">${icon("i-check", 14, C.ok)}
+                <span class="aname mono">${esc(f.device_id)}</span></span>
+                <span class="mono small">${esc(f.host)}</span><span class="small mut">настроено</span><span></span></div>`).join("")
+              : empty("Ни одно из найденных устройств пока не настроено", "i-alert", C.mut)}</div>
+          ${cardClose}
+        </div>
+        <aside style="flex:1 1 300px;min-width:280px" class="col16">
+          ${cardOpen("Как это работает")}
+          <div style="padding:14px;display:flex;flex-direction:column;gap:10px">
+            ${[["Устройства сами объявляют себя", "Tuya-устройства раз в несколько секунд шлют широковещательный пакет в локальную сеть. Панель показывает всё, что услышала."],
+               ["Широковещание не проходит между подсетями", "Устройство в другом VLAN придётся добавить вручную и задать статический адрес."],
+               ["Ключ берётся из облака", "Локальный ключ подставляется из привязанного облачного аккаунта Tuya и никогда не показывается в панели."]]
+              .map(([t, b]) => `<div><div style="font-size:12.5px;font-weight:600;margin-bottom:3px">${t}</div>
+                <div class="small mut" style="line-height:1.5">${b}</div></div>`).join("")}
+          </div>${cardClose}
+          ${cardOpen("Ручное добавление")}
+          <div style="padding:14px;display:flex;flex-direction:column;gap:9px">
+            <span class="small mut">Полный мастер с выбором платформы и датапоинтов открывается в стандартном интерфейсе интеграции.</span>
+            ${btn("Открыть мастер добавления", { act: "open-flow", primary: true, ico: "i-plus" })}
+          </div>${cardClose}
+        </aside>
+      </div></div>`;
+  }
+
+  // ================================================== 05 События ==========
+  vEvents() {
+    const rep = this.d.report?.entries || [];
+    const logs = this.d.logs?.records || [];
+    const q = this.s.eventSearch;
+
+    const evs = rep.slice().reverse().filter((e) =>
+      !q || JSON.stringify(e).toLowerCase().includes(q));
+
+    const byDay = {};
+    evs.forEach((e) => {
+      const d = new Date(e.ts);
+      const key = d.toLocaleDateString("ru-RU", { day: "numeric", month: "long" });
+      (byDay[key] = byDay[key] || []).push(e);
+    });
+
+    const timeline = Object.keys(byDay).length ? Object.entries(byDay).map(([day, items]) => `
+      <div class="dayhdr">${esc(day)}</div>
+      ${items.map((e) => {
+        const m = EVENT_META[e.event] || { label: e.event, color: C.mut, icon: "i-dots" };
+        return `<div class="tlrow">
+          <span class="mono small mut" style="width:64px;flex:0 0 auto">${esc(new Date(e.ts).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" }))}</span>
+          <span class="incico" style="background:${soft(m.color, .12)};color:${m.color}">${icon(m.icon, 12)}</span>
+          <span style="flex:1;min-width:0">
+            <span style="display:block;font-size:12.5px;color:${C.ink2}">${esc(m.label)}${e.reason ? " — " + esc(e.reason) : ""}</span>
+            <span class="mono small mut" style="display:block;margin-top:2px">${esc(e.name || e.device_id)}${e.node_id ? " · node " + esc(e.node_id) : ""}</span>
+          </span>
+          ${e.device_id ? btn("Открыть", { act: "open-device", data: `data-id="${esc(e.device_id)}"`, small: true }) : ""}
+        </div>`;
+      }).join("")}`).join("") : empty("Событий за выбранный период нет");
+
+    const logRows = logs.slice().reverse()
+      .filter((r) => !q || r.message.toLowerCase().includes(q))
+      .slice(0, 200)
+      .map((r) => `<div class="logrow ${r.level.toLowerCase()}">
+        <span class="mono small mut" style="width:64px;flex:0 0 auto">${hhmmss(new Date(r.time * 1000))}</span>
+        <span class="lvl">${r.level}</span><span class="lmsg">${esc(r.message)}</span></div>`).join("");
+
+    return `<div class="pad col14" style="max-width:1560px">
+      <div class="mtools">
+        <div class="search"><span>${icon("i-search", 14, C.mut)}</span>
+          <input data-act="esearch" value="${esc(q)}" placeholder="Устройство, сущность, node ID, причина"></div>
+        <span style="flex:1"></span>
+        ${btn("Экспорт (redacted)", { act: "export", small: true, ico: "i-download" })}
+        ${btn("Обновить", { act: "refresh", small: true, ico: "i-refresh" })}
+      </div>
+      <div class="row14">
+        <div style="flex:1 1 620px;min-width:320px">
+          ${cardOpen(`Хронология · ${evs.length}`, `<span class="small mut">источник: журнал доступности</span>`)}
+          <div>${timeline}</div>${cardClose}
+        </div>
+        <div style="flex:1 1 420px;min-width:300px">
+          ${cardOpen(`Журнал интеграции · ${logs.length}`, `<span class="small mut">в памяти с запуска</span>`)}
+          <div style="padding:8px 6px">${logRows || empty("Записей нет — интеграция пишет только предупреждения", "i-list", C.mut)}</div>
+          ${cardClose}
+        </div>
+      </div></div>`;
+  }
+
+  // ================================================== 06 Настройки ========
+  vSettings() {
+    const entries = this.d.overview?.entries || [];
+    const s = this.sum();
+    const cards = entries.map((e) => `
+      ${cardOpen(esc(e.title), pill(e.problems ? "stale" : "online", "entry"))}
+      <div style="padding:14px;display:flex;flex-direction:column;gap:12px">
+        <div class="mini3">
+          <div><b>${e.devices}</b><span>${plural(e.devices, "устройство", "устройства", "устройств")
+            .replace(/^\d+\s/, "")}</span></div>
+          <div><b>${e.entities}</b><span>${plural(e.entities, "сущность", "сущности", "сущностей")
+            .replace(/^\d+\s/, "")}</span></div>
+          <div><b style="color:${e.problems ? C.bad : C.ok}">${e.problems}</b><span>${
+            plural(e.problems, "проблема", "проблемы", "проблем").replace(/^\d+\s/, "")}</span></div>
+        </div>
+        ${kv([["Идентификатор", esc(e.entry_id)], ["Облачный аккаунт", e.no_cloud ? "не привязан" : "привязан"]])}
+        <div style="display:flex;gap:7px;flex-wrap:wrap">
+          ${btn("Показать на карте", { act: "nav", data: 'data-nav="map"', ico: "i-network" })}
+          ${btn("Перезагрузить запись", { act: "reload-entry", data: `data-entry="${esc(e.entry_id)}"`, danger: true, ico: "i-refresh" })}
+        </div>
+      </div>${cardClose}`).join("");
+
+    return `<div class="pad col16" style="max-width:1440px">
+      <div class="row16">
+        <div style="flex:2 1 520px;min-width:320px" class="col16">${cards}</div>
+        <aside style="flex:1 1 320px;min-width:290px" class="col16">
+          ${cardOpen("Параметры восстановления")}
+          <div style="padding:14px">${kv([
+            ["Grace-период", "120 с"],
+            ["Окно при старте", "300 с"],
+            ["Отсчёт повторов", "1, 2, 5, 10, 20, 30, 60 с"],
+            ["Watchdog шлюза", "каждые 30 с"],
+            ["Порог «молчит»", "120 с"],
+          ])}</div>${cardClose}
+          ${cardOpen("Экспертный режим")}
+          <div style="padding:14px;display:flex;flex-direction:column;gap:9px">
+            <span class="small mut">Открывает запись сырых DP в карточке устройства. Каждая запись попадает в журнал интеграции с именем пользователя.</span>
+            ${btn(this.s.expert ? "Выключить EXPERT" : "Включить EXPERT", { act: "expert", danger: this.s.expert })}
+          </div>${cardClose}
+          ${cardOpen("Опасные операции")}
+          <div style="padding:14px;display:flex;flex-direction:column;gap:9px">
+            <span class="small mut">Перезагрузка интеграции разрывает соединения со всеми ${s.total} устройствами и собирает их заново. Свет и техника продолжат работать от выключателей.</span>
+            ${btn("Перезагрузить интеграцию BMS", { act: "reload-all", danger: true, ico: "i-alert" })}
+          </div>${cardClose}
+        </aside>
+      </div></div>`;
+  }
+
+  // ------------------------------------------------------------ события --
+  onInput(e) {
+    const t = e.composedPath()[0];
+    if (!t?.dataset) return;
+    if (t.dataset.act === "search") { this.s.search = t.value.toLowerCase(); this.paint(); this.focus("search"); }
+    if (t.dataset.act === "esearch") { this.s.eventSearch = t.value.toLowerCase(); this.paint(); this.focus("esearch"); }
+    if (t.dataset.act === "entry") { this.s.entryFilter = t.value; this.paint(); }
+  }
+
+  focus(act) {
+    const el = this.shadowRoot.querySelector(`[data-act="${act}"]`);
+    if (el) { el.focus(); const v = el.value; el.value = ""; el.value = v; }
+  }
+
+  async onClick(e) {
+    const el = e.composedPath().find((n) => n?.dataset?.act);
+    if (!el) return;
+    const a = el.dataset.act;
+    const id = el.dataset.id;
+
+    if (a === "nav") return this.go(el.dataset.nav);
+    if (a === "dtab") { this.s.deviceTab = el.dataset.tab; return this.paint(); }
+    if (a === "refresh") return this.refresh();
+    if (a === "expert") { this.s.expert = !this.s.expert; return this.paint(); }
+    if (a === "incidents") { this.s.incidentsOnly = !this.s.incidentsOnly; return this.paint(); }
+    if (a === "chip") {
+      this.s.mapState = this.s.mapState === el.dataset.state ? null : el.dataset.state;
+      return this.paint();
     }
-    const rows = data.records
-      .filter((r) => !this._search || r.message.toLowerCase().includes(this._search))
-      .slice()
-      .reverse()
-      .map(
-        (r) => `<div class="logrow ${r.level.toLowerCase()}">
-          <span class="lt">${humanTime(r.time)}</span>
-          <span class="ll">${r.level}</span>
-          <span class="lm">${esc(r.message)}</span>
-        </div>`
-      )
-      .join("");
-    return `<div class="loghead muted">${data.captured} записей в памяти</div><div class="log">${rows}</div>`;
-  }
-
-  _renderReport() {
-    const data = this._report;
-    if (!data) return `<div class="muted">Загрузка…</div>`;
-    if (!data.entries.length) {
-      return `<div class="card"><p>Разрывов связи не зафиксировано.</p>
-        <p class="muted">Здесь появляются отключения и восстановления устройств
-        с причиной и длительностью — файл bms_integration_availability.jsonl.</p></div>`;
+    if (a === "filter-state") { this.s.mapState = el.dataset.state; return this.go("map"); }
+    if (a === "toggle") {
+      const n = el.dataset.node;
+      this.s.collapsed.has(n) ? this.s.collapsed.delete(n) : this.s.collapsed.add(n);
+      return this.paint();
     }
-    const rows = data.entries
-      .slice()
-      .reverse()
-      .map(
-        (e) => `<tr>
-          <td class="nowrap">${esc(new Date(e.ts).toLocaleString("ru-RU"))}</td>
-          <td>${esc(e.name || e.device_id)}</td>
-          <td><span class="ev ${esc(e.event)}">${esc(e.event)}</span></td>
-          <td>${esc(e.reason || "")}</td>
-          <td class="nowrap">${e.disconnect_age_sec != null ? Math.round(e.disconnect_age_sec) + " с" : ""}</td>
-        </tr>`
-      )
-      .join("");
-    return `<table class="tbl">
-      <thead><tr><th>Время</th><th>Устройство</th><th>Событие</th><th>Причина</th><th>Длительность</th></tr></thead>
-      <tbody>${rows}</tbody></table>`;
+    if (a === "expand-all") { this.s.collapsed.clear(); return this.paint(); }
+    if (a === "collapse-all") {
+      const all = [];
+      const walk = (n) => { if ((n.children || []).length) all.push(n.id); (n.children || []).forEach(walk); };
+      (this.d.topology?.tree || []).forEach(walk);
+      this.s.collapsed = new Set(all);
+      return this.paint();
+    }
+    if (a === "select") {
+      this.s.selected = el.dataset.node;
+      return this.paint();
+    }
+    if (a === "open-device") {
+      this.s.deviceId = id; this.s.deviceTab = "status"; this.d.device = null;
+      return this.go("device");
+    }
+    if (a === "open-flow") {
+      const entry = this.d.overview?.entries?.[0];
+      window.history.pushState(null, "", "/config/integrations/integration/bms_integration");
+      window.dispatchEvent(new CustomEvent("location-changed"));
+      return;
+    }
+    if (a === "add-device") {
+      this.toast("Устройство добавляется через мастер интеграции — открываю");
+      return this.onClick({ composedPath: () => [{ dataset: { act: "open-flow" } }] });
+    }
+    if (a === "edit-entity") {
+      window.history.pushState(null, "", "/config/integrations/integration/bms_integration");
+      window.dispatchEvent(new CustomEvent("location-changed"));
+      return;
+    }
+    if (a === "copy-diag") {
+      try {
+        await navigator.clipboard.writeText(JSON.stringify(this.d.device?.config || {}, null, 2));
+        this.toast("Скопировано без секретов");
+      } catch { this.toast("Буфер обмена недоступен", true); }
+      return;
+    }
+    if (a === "export") {
+      const blob = new Blob([JSON.stringify(this.d.report?.entries || [], null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url; link.download = "bms-events.json"; link.click();
+      URL.revokeObjectURL(url);
+      return this.toast("Файл событий сохранён");
+    }
+
+    // ---- действия, меняющие состояние --------------------------------
+    if (a === "dev-refresh" || a === "dev-reconnect" || a === "dev-test") {
+      const row = this.rows().find((r) => r.device_id === id);
+      const action = a === "dev-refresh" ? "refresh" : a === "dev-test" ? "status_test" : "reconnect";
+      el.disabled = true;
+      try {
+        const res = await this.ws("action", { device_id: id, node_id: row?.node_id || null, action });
+        this.logAction(true, `${el.textContent.trim()}: ${res.detail} (${res.took_ms} мс)`);
+        this.toast(res.detail);
+      } catch (err) {
+        this.logAction(false, `${el.textContent.trim()}: ${err?.message || err}`);
+        this.toast(err?.message || "Не получилось", true);
+      }
+      el.disabled = false;
+      return this.refresh(true);
+    }
+    if (a === "reload-entry" || a === "reload-all") {
+      const all = a === "reload-all";
+      const what = all ? "всю интеграцию" : "эту запись";
+      if (!confirm(`Перезагрузить ${what}? Соединения со всеми устройствами будут пересобраны — это занимает до минуты.`)) return;
+      this.toast("Перезагрузка запущена…");
+      try {
+        await this.ws("reload", all ? {} : { entry_id: el.dataset.entry });
+        this.toast("Перезагрузка выполнена");
+      } catch (err) { this.toast(err?.message || "Не удалось", true); }
+      return this.refresh();
+    }
+    if (a === "write-dp" || a === "write-dp-form") {
+      const dp = a === "write-dp" ? el.dataset.dp : this.shadowRoot.getElementById("dpid")?.value;
+      const value = a === "write-dp"
+        ? prompt(`Новое значение DP ${dp}:`)
+        : this.shadowRoot.getElementById("dpval")?.value;
+      if (dp == null || value == null || value === "") return;
+      const row = this.d.device?.device;
+      if (!confirm(`Записать DP ${dp} = ${value} в «${row?.name}»? Команда уйдёт прямо в устройство.`)) return;
+      try {
+        await this.ws("set_dp", { device_id: row.device_id, node_id: row.node_id || null, dp: String(dp), value });
+        this.logAction(true, `Запись DP ${dp} = ${value}`);
+        this.toast("Записано");
+      } catch (err) {
+        this.logAction(false, `Запись DP ${dp}: ${err?.message || err}`);
+        this.toast(err?.message || "Запись не прошла", true);
+      }
+      return this.refresh(true);
+    }
   }
 
-  _renderRooms() {
-    return `<div class="card"><p>Раздел в работе — комнаты и привязка устройств.</p></div>`;
-  }
-
-  _renderSettings() {
-    return `<div class="card"><p>Раздел в работе — настройки интеграции и объекта.</p></div>`;
+  logAction(ok, text) {
+    this._actionLog = [{ ok, text, time: hhmmss(new Date()) }, ...(this._actionLog || [])].slice(0, 8);
   }
 }
 
-const STYLES = `
-  :host { display: block; background: var(--primary-background-color); min-height: 100vh; }
-  .wrap { font-family: var(--paper-font-body1_-_font-family, Roboto, sans-serif);
-          color: var(--primary-text-color); position: relative; }
-  header { display: flex; align-items: center; justify-content: space-between; gap: 16px;
-           padding: 14px 20px; background: var(--app-header-background-color, var(--primary-color));
-           color: var(--app-header-text-color, #fff); flex-wrap: wrap; }
-  .brand { display: flex; align-items: center; gap: 12px; }
-  .logo { font-size: 26px; }
-  .h1 { font-size: 20px; font-weight: 500; line-height: 1.1; }
-  .sub { font-size: 13px; opacity: .85; }
-  .actions { display: flex; gap: 8px; align-items: center; }
-  .search { padding: 8px 12px; border-radius: 8px; border: none; min-width: 200px;
-            background: rgba(255,255,255,.15); color: inherit; }
-  .search::placeholder { color: rgba(255,255,255,.7); }
-  .btn { padding: 8px 14px; border-radius: 8px; border: none; cursor: pointer;
-         background: rgba(255,255,255,.18); color: inherit; font-size: 14px; }
-  .btn:hover { background: rgba(255,255,255,.28); }
-  .btn.small { padding: 6px 10px; font-size: 13px; background: var(--secondary-background-color);
-               color: var(--primary-text-color); }
-  .btn:disabled { opacity: .5; cursor: default; }
-  nav { display: flex; gap: 4px; padding: 0 16px; background: var(--card-background-color);
-        border-bottom: 1px solid var(--divider-color); overflow-x: auto; }
-  .tab { background: none; border: none; padding: 14px 16px; cursor: pointer; font-size: 14px;
-         color: var(--secondary-text-color); border-bottom: 3px solid transparent; white-space: nowrap; }
-  .tab span { margin-right: 6px; }
-  .tab.active { color: var(--primary-color); border-bottom-color: var(--primary-color); font-weight: 500; }
-  main { padding: 16px; max-width: 1200px; }
-  .muted { color: var(--secondary-text-color); }
-  .card { background: var(--card-background-color); border-radius: 12px; padding: 16px; }
-  .card.error { border-left: 4px solid var(--error-color); }
-  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-           gap: 10px; margin-bottom: 16px; }
-  .stat { background: var(--card-background-color); border-radius: 12px; padding: 12px 14px; }
-  .stat .v { font-size: 24px; font-weight: 600; }
-  .stat .l { font-size: 12px; color: var(--secondary-text-color); }
-  .stat.ok .v { color: var(--success-color, #4caf50); }
-  .stat.bad .v { color: var(--error-color, #f44336); }
-  .stat.warn .v { color: var(--warning-color, #ff9800); }
-  .device { background: var(--card-background-color); border-radius: 12px; margin-bottom: 8px; overflow: hidden; }
-  .device.child { margin-left: 24px; border-left: 3px solid var(--divider-color); }
-  .drow { display: flex; align-items: center; gap: 12px; padding: 12px 14px; cursor: pointer; }
-  .drow:hover { background: var(--secondary-background-color); }
-  .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
-  .dot.ok { background: var(--success-color, #4caf50); }
-  .dot.warn { background: var(--warning-color, #ff9800); }
-  .dot.bad { background: var(--error-color, #f44336); }
-  .dmain { flex: 1; min-width: 0; }
-  .dname { font-weight: 500; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-  .dmeta { font-size: 12px; color: var(--secondary-text-color); margin-top: 2px; }
-  .dactions { display: flex; gap: 6px; flex: none; }
-  .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 400;
-           background: var(--secondary-background-color); color: var(--secondary-text-color); }
-  .badge.gw { background: var(--primary-color); color: #fff; }
-  .badge.warn { background: var(--warning-color, #ff9800); color: #000; }
-  .dbody { display: none; padding: 0 14px 12px 36px; }
-  .device.open .dbody { display: block; }
-  .ent { display: flex; gap: 10px; align-items: center; padding: 4px 0; font-size: 13px; flex-wrap: wrap; }
-  .ename { min-width: 140px; }
-  .ent code { color: var(--secondary-text-color); font-size: 12px; }
-  .estate { margin-left: auto; font-weight: 500; }
-  .estate.bad { color: var(--error-color); }
-  .log { font-family: ui-monospace, monospace; font-size: 12.5px; }
-  .loghead { margin-bottom: 8px; }
-  .logrow { display: flex; gap: 10px; padding: 5px 8px; border-radius: 6px; align-items: baseline; }
-  .logrow:nth-child(odd) { background: var(--card-background-color); }
-  .lt { color: var(--secondary-text-color); flex: none; }
-  .ll { flex: none; width: 62px; font-weight: 600; }
-  .logrow.warning .ll { color: var(--warning-color, #ff9800); }
-  .logrow.error .ll { color: var(--error-color, #f44336); }
-  .logrow.info .ll { color: var(--info-color, #2196f3); }
-  .lm { white-space: pre-wrap; word-break: break-word; }
-  .tbl { width: 100%; border-collapse: collapse; background: var(--card-background-color);
-         border-radius: 12px; overflow: hidden; font-size: 13px; }
-  .tbl th { text-align: left; padding: 10px 12px; background: var(--secondary-background-color);
-            font-weight: 500; }
-  .tbl td { padding: 9px 12px; border-top: 1px solid var(--divider-color); vertical-align: top; }
-  .nowrap { white-space: nowrap; }
-  .ev { padding: 2px 8px; border-radius: 999px; background: var(--secondary-background-color); font-size: 12px; }
-  .ev.disconnect_detected, .ev.command_failed { background: var(--error-color); color: #fff; }
-  .ev.reconnect_succeeded { background: var(--success-color, #4caf50); color: #fff; }
-  .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
-           background: var(--primary-color); color: #fff; padding: 10px 18px; border-radius: 8px;
-           box-shadow: 0 4px 14px rgba(0,0,0,.3); z-index: 10; }
-  .toast.error { background: var(--error-color); }
+// ------------------------------------------------------------- спрайт ----
+const SPRITE = `<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-grid" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 9.5V6a2.5 2.5 0 0 1 2.5-2.5h3.5M14.5 3.5H18A2.5 2.5 0 0 1 20.5 6v3.5M20.5 14.5V18a2.5 2.5 0 0 1-2.5 2.5h-3.5M9.5 20.5H6A2.5 2.5 0 0 1 3.5 18v-3.5"/><rect x="8.4" y="8.4" width="7.2" height="7.2" rx="1.6"/></symbol>
+<symbol id="i-network" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="8.6" y="3.4" width="6.8" height="5" rx="1.4"/><rect x="3" y="15.6" width="6.8" height="5" rx="1.4"/><rect x="14.2" y="15.6" width="6.8" height="5" rx="1.4"/><path d="M12 8.4v3.4M6.4 15.6v-1.9a1.9 1.9 0 0 1 1.9-1.9h7.4a1.9 1.9 0 0 1 1.9 1.9v1.9"/></symbol>
+<symbol id="i-chip" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="4.4" y="4.4" width="15.2" height="15.2" rx="4.2"/><rect x="9.1" y="9.1" width="5.8" height="5.8" rx="1.7"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5.2v13.6M5.2 12h13.6"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8.8 6.4h11.2M8.8 12h11.2M8.8 17.6h7.4"/><circle cx="4.7" cy="6.4" r="1.15" fill="currentColor" stroke="none"/><circle cx="4.7" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="4.7" cy="17.6" r="1.15" fill="currentColor" stroke="none"/></symbol>
+<symbol id="i-sliders" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3.7 7.4h6.1M14.2 7.4h6.1M3.7 12h10.1M18.2 12h2.1M3.7 16.6h3.5M11.6 16.6h8.7"/><circle cx="12" cy="7.4" r="2.2"/><circle cx="16" cy="12" r="2.2"/><circle cx="9.4" cy="16.6" r="2.2"/></symbol>
+<symbol id="i-pencil" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4.2 19.8l1.1-4.1L16.1 4.9a2.3 2.3 0 0 1 3.2 3.2L8.3 18.7l-4.1 1.1z"/><path d="M14.6 6.4l3.2 3.2"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M19.7 12a7.7 7.7 0 1 1-2.3-5.5"/><path d="M19.7 4.3v4.3h-4.3"/></symbol>
+<symbol id="i-chev-r" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9.4 5.6l6.4 6.4-6.4 6.4"/></symbol>
+<symbol id="i-chev-d" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M5.6 9.4l6.4 6.4 6.4-6.4"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="10.8" cy="10.8" r="6.4"/><path d="M15.5 15.5l4.3 4.3"/></symbol>
+<symbol id="i-wifi" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3.6 9.2a12 12 0 0 1 16.8 0"/><path d="M6.9 12.7a7.4 7.4 0 0 1 10.2 0"/><path d="M10.2 16.2a3 3 0 0 1 3.6 0"/><circle cx="12" cy="19.2" r="1.2" fill="currentColor" stroke="none"/></symbol>
+<symbol id="i-zigbee" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6.6 6.6h10.8L6.6 17.4h10.8"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.2l7.8 2.7v6.2c0 4.3-3.1 7.4-7.8 8.7-4.7-1.3-7.8-4.4-7.8-8.7V5.9z"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.8v10.4M8.2 10.6L12 14.4l3.8-3.8"/><path d="M4.8 18.4h14.4"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="8.8" y="8.8" width="11.4" height="11.4" rx="2.8"/><path d="M15.4 8.8V6.6a2.8 2.8 0 0 0-2.8-2.8H6.6a2.8 2.8 0 0 0-2.8 2.8v6a2.8 2.8 0 0 0 2.8 2.8h2.2"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.8 12.6l4.6 4.6L19.2 7.4"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.4"/><path d="M12 7.2V12l3.4 2.1"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 4.3a2 2 0 0 1 3.4 0l7.4 13.3a2 2 0 0 1-1.7 3H4.6a2 2 0 0 1-1.7-3z"/><path d="M12 9.4v4.3"/><circle cx="12" cy="17.2" r="1" fill="currentColor" stroke="none"/></symbol>
+<symbol id="i-octagon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.6"/><path d="M5.9 5.9l12.2 12.2"/></symbol>
+<symbol id="i-terminal" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3.2" y="4.2" width="17.6" height="15.6" rx="3.4"/><path d="M7.6 9.6l2.8 2.4-2.8 2.4M13.2 14.4h3.6"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9.6 14.4l4.8-4.8"/><path d="M10.9 6.9l2.1-2.1a4.3 4.3 0 0 1 6.1 6.1l-2.1 2.1M13.1 17.1l-2.1 2.1a4.3 4.3 0 0 1-6.1-6.1l2.1-2.1"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3.8 5.6h16.4l-6.4 7.4v6.6l-3.6-2.1v-4.5z"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8.2 5.4a1 1 0 0 1 1.5-.9l9.1 5.6a1 1 0 0 1 0 1.8l-9.1 5.6a1 1 0 0 1-1.5-.9z"/></symbol>
+<symbol id="i-gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4.9"/><circle cx="12" cy="12" r="2.1"/><path d="M16.9 12h2M14.45 16.24l1 1.74M9.55 16.24l-1 1.74M7.1 12h-2M9.55 7.76l-1-1.74M14.45 7.76l1-1.74"/></symbol>
+<symbol id="i-dots" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"><path d="M4.4 12h.01M8.2 12h.01" stroke-width="2.6"/><path d="M12 12h.01M15.8 12h.01M19.6 12h.01" stroke-width="2.6" opacity=".35"/></symbol>
+<symbol id="i-home" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3.6 10.9L12 4.2l8.4 6.7v8a1.8 1.8 0 0 1-1.8 1.8H5.4a1.8 1.8 0 0 1-1.8-1.8z"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.6 12.6S6 6.8 12 6.8s9.4 5.8 9.4 5.8"/><circle cx="12" cy="13.4" r="3.1"/></symbol>
+</defs></svg>`;
+
+// ---------------------------------------------------------------- стили --
+const CSS = `
+:host{display:block;background:${C.bg};min-height:100vh;
+  font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Helvetica Neue','Segoe UI',sans-serif;
+  color:${C.ink};-webkit-font-smoothing:antialiased}
+*{box-sizing:border-box}
+button{font-family:inherit;transition:background .15s,border-color .15s,color .15s}
+input,select{font-family:inherit}
+.app{display:flex;flex-direction:column;min-height:100vh}
+header{background:${C.card};border-bottom:1px solid ${C.div};display:flex;align-items:center;gap:16px;
+  padding:9px 20px;flex-wrap:wrap;min-height:56px}
+.brand{display:flex;align-items:center;gap:11px;min-width:0}
+.logo{height:26px;width:auto;display:block}
+.vr{width:1px;height:22px;background:#DDE3E9}
+.t1{font-size:14px;font-weight:600;letter-spacing:-.01em;white-space:nowrap}
+.t2{font-size:10.5px;color:${C.mut};letter-spacing:.04em;white-space:nowrap}
+.hactions{display:flex;align-items:center;gap:8px;margin-left:auto;flex-wrap:wrap}
+.chip-sel{display:flex;align-items:center;gap:8px;height:32px;padding:0 10px 0 11px;background:${C.card};
+  border:1px solid #DDE3E9;border-radius:7px}
+.chip-sel select{background:transparent;border:0;color:${C.ink};font-size:12.5px;font-weight:500;outline:none;cursor:pointer;max-width:180px}
+.upd{display:flex;align-items:center;gap:7px;font-size:11.5px;color:${C.mut};white-space:nowrap}
+.dot-live{width:6px;height:6px;border-radius:50%;background:${C.ok};box-shadow:0 0 0 3px ${soft(C.ok, .14)}}
+nav{background:${C.card};border-bottom:1px solid ${C.div};display:flex;gap:2px;padding:0 14px;overflow-x:auto}
+nav::-webkit-scrollbar{display:none}
+.tab{display:inline-flex;align-items:center;gap:8px;height:42px;padding:0 12px;border:0;background:transparent;
+  color:#5F6B77;font-size:12.5px;font-weight:500;cursor:pointer;white-space:nowrap;border-bottom:2px solid transparent}
+.tab.on{color:${C.accent};font-weight:600;border-bottom-color:${C.accent}}
+.badge-n{min-width:17px;height:17px;padding:0 5px;border-radius:9px;background:${soft(C.bad, .16)};color:${C.bad};
+  font-size:10.5px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;font-family:${MONO}}
+.badge-w{height:18px;padding:0 7px;border-radius:4px;background:${soft(C.warn, .14)};color:${C.warn};
+  font-size:10.5px;font-weight:700;display:inline-flex;align-items:center;font-family:${MONO}}
+.cnt{font-family:${MONO};font-size:11px;opacity:.65}
+main{flex:1;min-height:0}
+.pad{padding:20px 20px 40px}
+.col14{display:flex;flex-direction:column;gap:14px}
+.col16{display:flex;flex-direction:column;gap:16px}
+.row14{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start}
+.row16{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start}
+.card{background:${C.card};border:1px solid ${C.line};border-radius:10px;box-shadow:0 1px 2px rgba(24,39,58,.05)}
+.card.err{border-left:3px solid ${C.bad};padding:14px;display:flex;gap:10px;align-items:center;color:${C.bad}}
+.cap{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:${C.mut2}}
+.muted,.mut{color:${C.mut}}
+.small{font-size:11.5px}
+.mono{font-family:${MONO}}
+.pre{margin:0;font-family:${MONO};font-size:11.5px;color:${C.ink2};white-space:pre-wrap;word-break:break-word;
+  background:#F7F9FB;border:1px solid ${C.div};border-radius:8px;padding:11px;max-height:340px;overflow:auto}
+.inp{height:32px;padding:0 10px;border:1px solid #DDE3E9;border-radius:7px;background:${C.card};
+  color:${C.ink};font-size:12.5px;outline:none}
+.inp:focus{border-color:${C.accent}}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:10px}
+.tile{background:${C.card};border:1px solid ${C.line};border-radius:10px;box-shadow:0 1px 2px rgba(24,39,58,.05);
+  padding:13px 14px;display:flex;flex-direction:column;gap:9px;position:relative;overflow:hidden}
+.tile:before{content:'';position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--tc)}
+.tl{display:flex;align-items:center;gap:7px}
+.tl span{font-size:10.5px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:${C.mut2}}
+.tv{display:flex;align-items:baseline;gap:8px}
+.tv>span:first-child{font-family:${MONO};font-size:27px;font-weight:600;line-height:1;letter-spacing:-.02em}
+.tn{font-size:11px;color:${C.mut}}
+.hbar{display:flex;height:9px;border-radius:5px;overflow:hidden;gap:1.5px;background:#F2F5F8}
+.hgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:2px;margin-top:14px}
+.hrow{display:flex;align-items:center;gap:10px;padding:7px 8px;border:0;background:transparent;border-radius:6px;
+  cursor:pointer;text-align:left;width:100%}
+.hrow:hover{background:#F4F6F8}
+.hd{width:9px;height:9px;border-radius:50%;flex:0 0 auto}
+.hl{font-size:12.5px;color:${C.ink2};flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hn{font-family:${MONO};font-size:13px;font-weight:600;color:${C.ink}}
+.gwrow{display:flex;align-items:center;gap:13px;padding:13px 16px;border:0;border-top:1px solid ${C.div};
+  background:transparent;cursor:pointer;text-align:left;width:100%}
+.gwrow:hover{background:#F4F6F8}
+.gwico{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+.gwmain{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
+.gwtop{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.gwname{font-size:13px;font-weight:600;color:${C.ink};overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.gwmeta{font-size:11.5px;color:${C.mut};font-family:${MONO}}
+.gwaff{text-align:right;flex:0 0 auto}
+.gwaff>span:first-child{display:block;font-family:${MONO};font-size:14px;font-weight:600}
+.gwaff>span:last-child{display:block;font-size:10px;color:${C.mut};letter-spacing:.04em}
+.inc{display:flex;gap:11px;padding:9px 16px;align-items:flex-start}
+.inct{font-family:${MONO};font-size:11px;color:${C.mut};padding-top:2px;flex:0 0 auto;width:44px}
+.incico{width:22px;height:22px;border-radius:6px;display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+.incb{flex:1;min-width:0}
+.inct1{display:block;font-size:12.5px;color:#303D4A;line-height:1.35}
+.inct2{display:block;font-size:11px;color:${C.mut};font-family:${MONO};margin-top:2px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ahead,.arow{display:grid;grid-template-columns:minmax(190px,1.5fr) minmax(130px,1fr) 190px minmax(170px,1.2fr) 90px 96px;gap:12px}
+.ahead{padding:9px 16px;background:#F7F9FB;border-bottom:1px solid ${C.line};font-size:10.5px;font-weight:600;
+  letter-spacing:.07em;text-transform:uppercase;color:${C.mut}}
+.arow{padding:0 16px;border-bottom:1px solid ${C.div};align-items:center;min-height:46px}
+.arow:hover{background:#F4F6F8}
+.acell{display:flex;align-items:center;gap:9px;min-width:0}
+.aname{font-size:12.5px;font-weight:500;color:${C.ink};overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.amono{font-size:11.5px;color:${C.mut2};font-family:${MONO};overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.areason{font-size:11.5px;color:${C.mut2};overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mtools{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.search{display:flex;align-items:center;gap:8px;height:34px;padding:0 11px;background:${C.card};
+  border:1px solid #DDE3E9;border-radius:7px;flex:1 1 220px;max-width:340px}
+.search input{flex:1;min-width:0;background:transparent;border:0;outline:none;color:${C.ink};font-size:12.5px}
+.chips{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 10px;border-radius:14px;
+  border:1px solid #DDE3E9;background:${C.card};font-size:11.5px;cursor:pointer;white-space:nowrap}
+.thead{display:flex;align-items:center;padding:9px 14px;background:#F7F9FB;border-bottom:1px solid ${C.line};
+  font-size:10.5px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:${C.mut}}
+.trow{display:flex;align-items:center;min-height:44px;padding:0 14px;border-bottom:1px solid ${C.bg};
+  cursor:pointer;position:relative}
+.trow:hover{background:#F4F7FA}
+.trow.sel{background:${soft(C.accent, .05)}}
+.tmark{position:absolute;left:0;top:0;bottom:0;width:2px}
+.tname{flex:1;min-width:0;display:flex;align-items:center;gap:8px}
+.tchev{width:18px;height:18px;flex:0 0 auto;border:0;background:transparent;padding:0;color:#6E7985;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;border-radius:4px}
+.tchev:hover{background:${C.line};color:${C.ink}}
+.tdot{width:18px;flex:0 0 auto;display:flex;justify-content:center}
+.tdot:after{content:'';width:5px;height:5px;border-radius:50%;background:#D0D8DF}
+.tlabel{min-width:0;display:flex;flex-direction:column;gap:1px;padding:6px 0}
+.tmeta{font-size:11px;color:${C.mut3};overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tval{width:126px;flex:0 0 auto;font-family:${MONO};font-size:11.5px;color:${C.ink3};
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tnode{width:104px;flex:0 0 auto;font-family:${MONO};font-size:11.5px;color:${C.mut3};
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tfoot{padding:10px 14px;background:#F7F9FB;border-top:1px solid ${C.line}}
+.warnbox{display:flex;gap:9px;padding:10px 11px;border-radius:8px;background:${soft(C.stale, .09)};
+  border:1px solid ${soft(C.stale, .3)};font-size:11.5px;color:#7A5D00;line-height:1.5}
+.crumbs{display:flex;align-items:center;gap:7px;font-size:11.5px;color:${C.mut3};margin-bottom:11px;flex-wrap:wrap}
+.lnk{border:0;background:transparent;color:${C.accent};font-size:11.5px;cursor:pointer;padding:0}
+.dhead{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding-bottom:14px}
+.dico{width:44px;height:44px;border-radius:11px;display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+.subnav{display:flex;gap:2px;border-bottom:1px solid ${C.line};overflow-x:auto}
+.subnav .tab{height:38px}
+.ehead,.erow{display:grid;grid-template-columns:minmax(200px,2fr) 110px minmax(150px,1.4fr) 120px 110px;gap:12px}
+.ehead{padding:9px 16px;background:#F7F9FB;border-bottom:1px solid ${C.line};font-size:10.5px;font-weight:600;
+  letter-spacing:.07em;text-transform:uppercase;color:${C.mut}}
+.erow{padding:9px 16px;border-bottom:1px solid ${C.div};align-items:center;font-size:12.5px}
+.erow:hover{background:#F4F6F8}
+.ename2{min-width:0;overflow:hidden}
+.dhead2,.drow{display:grid;grid-template-columns:70px 150px minmax(120px,1fr) minmax(160px,1.2fr) auto;gap:12px}
+.dhead2{padding:9px 16px;background:#F7F9FB;border-bottom:1px solid ${C.line};font-size:10.5px;font-weight:600;
+  letter-spacing:.07em;text-transform:uppercase;color:${C.mut}}
+.drow{padding:9px 16px;border-bottom:1px solid ${C.div};align-items:center;font-size:12px}
+.drow:hover{background:#F4F6F8}
+.frow{display:grid;grid-template-columns:minmax(200px,2fr) 140px minmax(120px,1fr) auto;gap:12px;
+  padding:11px 16px;border-bottom:1px solid ${C.div};align-items:center}
+.frow:hover{background:#F4F6F8}
+.dayhdr{padding:9px 16px;background:#F7F9FB;border-bottom:1px solid ${C.line};font-size:11px;font-weight:600;
+  letter-spacing:.06em;text-transform:uppercase;color:${C.mut}}
+.tlrow{display:flex;gap:11px;padding:10px 16px;border-bottom:1px solid ${C.div};align-items:center}
+.tlrow:hover{background:#F4F6F8}
+.logrow{display:flex;gap:10px;padding:5px 10px;border-radius:6px;align-items:baseline;font-family:${MONO};font-size:11.5px}
+.logrow:nth-child(odd){background:#F7F9FB}
+.lvl{flex:0 0 auto;width:58px;font-weight:700;color:${C.mut}}
+.logrow.warning .lvl{color:${C.warn}}
+.logrow.error .lvl{color:${C.bad}}
+.logrow.info .lvl{color:${C.blue}}
+.lmsg{white-space:pre-wrap;word-break:break-word;color:${C.ink2}}
+.mini3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;text-align:center}
+.mini3 div{background:#F7F9FB;border:1px solid ${C.div};border-radius:8px;padding:10px 6px}
+.mini3 b{display:block;font-family:${MONO};font-size:19px;font-weight:600}
+.mini3 span{font-size:10.5px;color:${C.mut}}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:${C.bg}}
+::-webkit-scrollbar-thumb{background:#DDE3E9;border-radius:6px;border:2px solid ${C.bg}}
+::-webkit-scrollbar-thumb:hover{background:#ABB5BF}
 `;
 
-customElements.define("bms-devices-panel", BmsDevicesPanel);
+customElements.define("bms-devices-panel", BmsControlCenter);

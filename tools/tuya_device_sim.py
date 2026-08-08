@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import struct
 import sys
 
@@ -343,10 +344,67 @@ class Simulator:
         await writer.drain()
 
 
+async def broadcast_presence(devices: dict, advertise_ip: str, stop: asyncio.Event,
+                             extra_targets: list[str] | None = None,
+                             only_ids: set[str] | None = None):
+    """Announce the devices on UDP 6666, the way a real one does every few seconds.
+
+    Home Assistant's discovery listener decrypts these with the well-known Tuya
+    UDP key, so the panel's "add device" screen sees the simulated house too.
+    """
+    # Port 6666 carries the plaintext announcement: the listener recognises a
+    # zero command as "not encrypted" and reads the payload straight out of the
+    # frame, so this is the simplest thing that a real device also does.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+    announcements = []
+    for dev_id, dev in devices.items():
+        if dev["kind"] == "gateway":
+            continue  # a hub announces itself, its children do not
+        if only_ids and dev_id not in only_ids:
+            continue  # this simulator instance does not host that device
+        announcements.append(
+            {"ip": advertise_ip, "gwId": dev_id, "active": 2, "ability": 0,
+             "encrypt": True, "productKey": "sim", "version": PROTOCOL}
+        )
+
+    # A global broadcast does not always leave a container bridge, so aim at the
+    # local subnet's broadcast address as well.
+    octets = advertise_ip.split(".")
+    targets = ["255.255.255.255", f"{octets[0]}.{octets[1]}.255.255", f"{octets[0]}.{octets[1]}.{octets[2]}.255"]
+    # A container bridge often swallows broadcast entirely; when the listener's
+    # address is known, hand it the same packet directly.
+    targets.extend(extra_targets or [])
+
+    while not stop.is_set():
+        for body in announcements:
+            # The listener slices the payload out at a fixed offset that assumes
+            # a return code is present, so the frame must carry one.
+            payload = struct.pack(">I", 0) + json.dumps(body).encode()
+            msg = TuyaMessage(0, 0, 0, payload, 0, True, Affix.prefix_55aa.value, False)
+            packed = parser.pack_message(msg)
+            for target in targets:
+                try:
+                    sock.sendto(packed, (target, 6666))
+                except OSError as ex:  # noqa: PERF203 - a closed network is not fatal
+                    _LOGGER.debug("announce to %s failed: %s", target, ex)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            pass
+    sock.close()
+
+
 async def main_async(args):
     devices = build_scenario()
     sim = Simulator(devices, offline=set(args.offline or []))
     server = await asyncio.start_server(sim.handle, args.host, args.port)
+    stop = asyncio.Event()
+    if args.advertise:
+        asyncio.create_task(broadcast_presence(devices, args.advertise, stop, args.announce_to,
+                                              set(args.only or []) or None))
+        _LOGGER.info("announcing presence on UDP 6666 as %s", args.advertise)
     total = sum(1 + len(d.get("sub_devices", {})) for d in devices.values())
     _LOGGER.info("listening on %s:%s - %d simulated devices", args.host, args.port, total)
     if args.offline:
@@ -360,6 +418,12 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=6668)
     ap.add_argument("--offline", nargs="*", help="device ids that must not answer")
+    ap.add_argument("--advertise", metavar="IP",
+                    help="announce the devices on UDP 6667 from this address")
+    ap.add_argument("--announce-to", nargs="*", metavar="IP",
+                    help="also send the announcement straight to these listeners")
+    ap.add_argument("--only", nargs="*", metavar="DEVICE_ID",
+                    help="announce only these device ids (one simulator per address)")
     ap.add_argument("--scenario", metavar="HOST", nargs="?", const="127.0.0.1",
                     help="print the HA config entry devices block and exit")
     args = ap.parse_args()
