@@ -900,6 +900,25 @@ class TestHubWithoutOwnStatus(Base):
             "a device with no sub-devices and no status is still a failed handshake",
         )
 
+    async def test_subdevice_stays_connected_when_gateway_aged_it_out(self):
+        # Same local_key on both, so _get_gateway() accepts the pairing.
+        gw = self.make_device(name="gw", dev_id="gw1", local_key="0123456789abcdef")
+        gw._interface = self.empty_status_interface()  # gateway already connected
+        sub = self.make_device(node_id="n1", name="sub", dev_id="sub1",
+                               local_key="0123456789abcdef")
+        sub.gateway = gw
+        gw.sub_devices["n1"] = sub
+        sub.dps_to_request = {"1": None}
+
+        # The sub-device adopts the gateway's interface, whose status(cid) is {}.
+        await sub._make_connection()
+
+        self.assertTrue(
+            sub.connected,
+            "a reachable sub-device the gateway aged out of its LAN status table "
+            "must keep the shared session, not fail the handshake",
+        )
+
 
 class TimerListenerDecoratorTest(unittest.TestCase):
     """Every sync timer listener must be a @callback.

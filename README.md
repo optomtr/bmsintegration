@@ -53,6 +53,13 @@ the license text.
   gets a fixed subset of them flap-disconnected: absence is now judged over
   the union of all frames of a poll cycle, across two consecutive cycles,
   and "nearby" devices count as present.
+- A reachable sub-device that the gateway drops from its LAN status table is no
+  longer failed on its initial handshake and left permanently disconnected
+  (previously it only revived for a few seconds after a press in the cloud app).
+  A sub-device shares the gateway's validated key, so an empty initial status is
+  treated as a cold gateway table, not a bad key: the shared session is kept and
+  commands go through, while a genuinely departed child is still caught by the
+  offline/absent path.
 - Adding a Zigbee gateway itself as a device no longer takes every sub-device
   behind it offline. A hub's own datapoints are often cloud-pull only, so its
   LAN status query returns nothing; that is no longer treated as a failed

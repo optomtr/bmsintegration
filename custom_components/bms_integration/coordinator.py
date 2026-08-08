@@ -402,6 +402,22 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                             "Gateway reported no status of its own; keeping the "
                             "session for its sub-devices"
                         )
+                    elif self.is_subdevice:
+                        # A sub-device shares the gateway's already-validated
+                        # session key, so an empty reply here is not a rotated
+                        # key: the gateway simply aged this cid out of its LAN
+                        # status table (the Zigbee child is still reachable, as
+                        # the cloud app shows). Failing the handshake left it
+                        # permanently disconnected until a cloud press refreshed
+                        # the gateway table. Keep the session: commands travel
+                        # over the shared socket and real state arrives via the
+                        # gateway's sub-device poll or the next device push. A
+                        # genuinely departed child is still caught by the
+                        # off_devs/ABSENT disconnect path.
+                        self.debug(
+                            "Sub-device gave no initial status; keeping the "
+                            "shared gateway session"
+                        )
                     else:
                         raise Exception("Failed to retrieve status")
 
