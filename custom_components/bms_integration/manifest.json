@@ -5,11 +5,16 @@
     "@optomtr"
   ],
   "config_flow": true,
-  "dependencies": [],
+  "dependencies": [
+    "http",
+    "frontend",
+    "panel_custom",
+    "websocket_api"
+  ],
   "documentation": "https://github.com/optomtr/bmsintegration/",
   "integration_type": "hub",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/optomtr/bmsintegration/issues",
   "requirements": [],
-  "version": "2026.8.3.16"
+  "version": "2026.8.3.17"
 }

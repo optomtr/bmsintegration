@@ -34,6 +34,8 @@ from .coordinator import (
     TuyaDevice,
 )
 from .config_flow import ENTRIES_VERSION
+from .panel import async_remove_panel, async_setup_panel
+from .websocket import async_register_websocket_api
 from .const import (
     ATTR_UPDATED_AT,
     CONF_GATEWAY_ID,
@@ -390,6 +392,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     hass_localtuya = HassLocalTuyaData(tuya_api, {})
     hass.data[DOMAIN][entry.entry_id] = hass_localtuya
 
+    # The device panel and its API belong to the integration, not to one entry.
+    async_register_websocket_api(hass)
+    await async_setup_panel(hass)
+
     def _setup_devices(entry_devices: dict):
         """Setup Localtuya devices object."""
         devices = hass_localtuya.devices
@@ -604,6 +610,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Unload the platforms.
     await hass.config_entries.async_unload_platforms(entry, PLATFORMS.values())
     hass.data[DOMAIN].pop(entry.entry_id)
+
+    # The panel is global: drop it only when the last entry goes away, or a
+    # reload of one entry would leave the sidebar empty.
+    if not any(
+        isinstance(value, HassLocalTuyaData) for value in hass.data[DOMAIN].values()
+    ):
+        async_remove_panel(hass)
 
     _LOGGER.info("Unload completed")
     return True
