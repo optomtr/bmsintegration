@@ -847,6 +847,60 @@ class TestGatewayHealthCheck(Base):
         self.assertFalse(any(results))
 
 
+class TestHubWithoutOwnStatus(Base):
+    """A hub answering nothing must not drag its sub-devices down.
+
+    A Zigbee gateway's own datapoints are usually cloud-pull, so a LAN status
+    query returns {}. Treating that as a failed handshake kept the gateway
+    disconnected, and every sub-device behind it then had no data at all -
+    lights rendered as "off" and no command reached the house.
+    """
+
+    def patch_pytuya_connect(self, iface):
+        original = coordinator.pytuya_connect
+
+        async def fake_connect(*args, **kwargs):
+            return iface
+
+        coordinator.pytuya_connect = fake_connect
+        self.addCleanup(setattr, coordinator, "pytuya_connect", original)
+
+    def empty_status_interface(self):
+        iface = FakeInterface()
+
+        async def status(cid=None):
+            iface.status_calls.append(cid)
+            return {}
+
+        iface.status = status
+        return iface
+
+    async def test_gateway_stays_connected_without_own_datapoints(self):
+        gw = self.make_device(name="gw", dev_id="gw1")
+        sub = self.make_device(node_id="n1", name="sub", dev_id="sub1")
+        sub.gateway = gw
+        gw.sub_devices["n1"] = sub
+        self.patch_connect(sub, ["park"])
+        gw.dps_to_request = {"32": None}
+        self.patch_pytuya_connect(self.empty_status_interface())
+
+        await gw._make_connection()
+
+        self.assertTrue(gw.connected, "hub must keep the session for its sub-devices")
+
+    async def test_plain_device_without_status_still_fails(self):
+        dev = self.make_device(name="plug", dev_id="plug1")
+        dev.dps_to_request = {"1": None}
+        self.patch_pytuya_connect(self.empty_status_interface())
+
+        await dev._make_connection()
+
+        self.assertFalse(
+            dev.connected,
+            "a device with no sub-devices and no status is still a failed handshake",
+        )
+
+
 class TimerListenerDecoratorTest(unittest.TestCase):
     """Every sync timer listener must be a @callback.
 

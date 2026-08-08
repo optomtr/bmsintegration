@@ -49,6 +49,10 @@ the license text.
   integration was reloaded by hand.
 - A repeated warning is logged at debug level instead of being dropped, and a
   sub-device that cannot reach its gateway now says why.
+- Adding a Zigbee gateway itself as a device no longer takes every sub-device
+  behind it offline. A hub's own datapoints are often cloud-pull only, so its
+  LAN status query returns nothing; that is no longer treated as a failed
+  handshake when the device has sub-devices.
 - Dispatcher signals and remote storage/service domain use the BMS Integration domain.
 
 ## Install

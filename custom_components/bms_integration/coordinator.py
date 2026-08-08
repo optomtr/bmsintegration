@@ -392,7 +392,18 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                     # frame - typically a rotated local key. Treating that as
                     # a successful connect left a permanent "zombie" session
                     # with an empty status and no key refresh.
-                    raise Exception("Failed to retrieve status")
+                    if self.sub_devices:
+                        # ...but a Zigbee hub commonly answers nothing at all:
+                        # its own datapoints are cloud-pull only. Failing its
+                        # handshake takes every sub-device behind it offline,
+                        # so keep the session - the sub-devices carry the real
+                        # state, and a bad key surfaces on them instead.
+                        self.warning(
+                            "Gateway reported no status of its own; keeping the "
+                            "session for its sub-devices"
+                        )
+                    else:
+                        raise Exception("Failed to retrieve status")
 
                 self.status_updated(status)
             except (UnicodeDecodeError, DecodeError) as e:
