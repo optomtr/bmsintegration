@@ -233,6 +233,75 @@ async def test_gcm_nonce_unique():
     check("200 шифрований -> 200 уникальных nonce", len(ivs) == 200, f"уникальных={len(ivs)}")
 
 
+async def test_subdev_chunked_query():
+    print("\n== Опрос саб-устройств: ответ шлюза кусками ==")
+
+    class FakeSub:
+        def __init__(self):
+            self.states = []
+
+        def subdevice_state_updated(self, state):
+            self.states.append(state)
+
+    class GwListener(pytuya.EmptyListener):
+        def __init__(self, cids):
+            self.sub_devices = {cid: FakeSub() for cid in cids}
+
+    listener = GwListener(["cidA", "cidB", "cidC", "cidD"])
+    proto = pytuya.TuyaProtocol("deviceid123456789012", KEY.decode(), 3.5, False, listener)
+    ABSENT = pytuya.SubdeviceState.ABSENT
+    ONLINE = pytuya.SubdeviceState.ONLINE
+    OFFLINE = pytuya.SubdeviceState.OFFLINE
+    subs = listener.sub_devices
+
+    async def cycle(frames):
+        """Один цикл опроса: кадры ответа, затем оценка на границе цикла."""
+        for f in frames:
+            proto._msg_subdevs_query({"data": f})
+            if proto._sub_devs_query_task:
+                await proto._sub_devs_query_task
+        proto._evaluate_subdevices_cycle()
+
+    # Цикл 1: A в кадре 1, B в кадре 2, D — только nearby, C не упомянут.
+    await cycle([{"online": ["cidA"]}, {"online": ["cidB"], "nearby": ["cidD"]}])
+    check("кусок без устройства не даёт ABSENT (старый баг)",
+          ABSENT not in subs["cidB"].states, f'B={subs["cidB"].states}')
+    check("nearby не считается пропавшим", ABSENT not in subs["cidD"].states)
+    check("nearby не диспатчит ONLINE/OFFLINE", subs["cidD"].states == [])
+    check("после 1 полного пропуска ABSENT ещё нет", ABSENT not in subs["cidC"].states)
+
+    # Цикл 2: то же самое — C пропал второй цикл подряд.
+    await cycle([{"online": ["cidA"]}, {"online": ["cidB"], "nearby": ["cidD"]}])
+    check("2 полных цикла пропуска -> ABSENT", subs["cidC"].states.count(ABSENT) == 1)
+
+    # Цикл 3: C всё ещё нет — ABSENT повторяется (контракт координатора).
+    await cycle([{"online": ["cidA", "cidB"], "nearby": ["cidD"]}])
+    check("ABSENT повторяется каждый следующий цикл", subs["cidC"].states.count(ABSENT) == 2)
+
+    # Цикл 4: C вернулся в online — счётчик сброшен, ABSENT прекращается.
+    await cycle([{"online": ["cidA", "cidB", "cidC"], "nearby": ["cidD"]}])
+    check("возврат в список сбрасывает счётчик", subs["cidC"].states[-1] == ONLINE)
+    await cycle([{"online": ["cidA", "cidB"], "nearby": ["cidD"]}])
+    check("после возврата один пропуск снова не карается",
+          subs["cidC"].states.count(ABSENT) == 2)
+
+    # Тихий цикл: ответа не было вовсе — счётчики заморожены.
+    frozen = dict(proto._subdev_absent_cycles)
+    proto._evaluate_subdevices_cycle()
+    check("цикл без ответа шлюза не увеличивает счётчики",
+          proto._subdev_absent_cycles == frozen)
+
+    # offline из кадра доставляется немедленно.
+    await cycle([{"online": ["cidA"], "offline": ["cidB"], "nearby": ["cidD", "cidC"]}])
+    check("offline из кадра доставляется сразу", subs["cidB"].states[-1] == OFFLINE)
+
+    # clean_up_session сбрасывает аккумулятор.
+    proto._subdev_absent_cycles["cidC"] = 5
+    proto.clean_up_session()
+    check("clean_up_session сбрасывает счётчики пропусков",
+          proto._subdev_absent_cycles == {} and proto._subdev_seen_cids == set())
+
+
 async def main():
     await test_dispatcher()
     await test_dispatcher_6699()
@@ -240,6 +309,7 @@ async def main():
     await test_generate_payload_t()
     await test_negotiation_hmac_reject()
     await test_gcm_nonce_unique()
+    await test_subdev_chunked_query()
     print(f"\n===== ИТОГ: PASS {len(PASS)} / FAIL {len(FAIL)} =====")
     if FAIL:
         print("Провалено:", *FAIL, sep="\n  - ")

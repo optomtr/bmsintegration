@@ -132,6 +132,12 @@ NO_PROTOCOL_HEADER_CMDS = [
 HEARTBEAT_INTERVAL = 8.3
 TIMEOUT_CONNECT = 5
 TIMEOUT_REPLY = 5
+# A gateway with many sub-devices splits one subdev_online_stat_query reply
+# into several frames, and some firmwares do not list every sub-device in
+# every frame. A sub-device is judged ABSENT only after it was missing from
+# EVERY frame of this many consecutive query cycles; judging per frame made a
+# fixed subset of devices flap-disconnect every 2 heartbeats on a busy gateway.
+SUBDEVICE_ABSENT_CYCLES = 2
 
 # DPS that are known to be safe to use with update_dps (0x12) command
 UPDATE_DPS_WHITELIST = [18, 19, 20]  # Socket (Wi-Fi)
@@ -524,6 +530,13 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         self.dispatcher = self._setup_dispatcher()
         self.heartbeater: asyncio.Task | None = None
         self._sub_devs_query_task: asyncio.Task | None = None
+        # Sub-device online poll is aggregated across all frames of one cycle.
+        # _subdev_seen_cids collects every cid named in any frame of the current
+        # cycle; _subdev_absent_cycles counts consecutive full-cycle misses per
+        # cid; _subdev_cycle_had_reply guards against punishing a silent cycle.
+        self._subdev_seen_cids: set = set()
+        self._subdev_absent_cycles: dict = {}
+        self._subdev_cycle_had_reply: bool = False
         self.dps_cache = {}
         self.local_nonce = b"0123456789abcdef"  # not-so-random random key
         self.remote_nonce = b""
@@ -562,9 +575,31 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
 
     def _msg_subdevs_query(self, decoded_message):
         """
-        Handle the sub-devices query message.
+        Handle one frame of a sub-devices query reply.
         Message: {"online": [cids, ...], "offline": [cids, ...], "nearby": [cids, ...]}
+
+        A busy gateway answers in several frames and does not repeat every
+        sub-device in every frame. Each frame is therefore treated as PARTIAL:
+        it can only turn a named device ONLINE or OFFLINE, never mark a device
+        ABSENT for being unnamed. Absence is decided once per cycle, over the
+        union of every frame, in _evaluate_subdevices_cycle().
         """
+        data = decoded_message.get("data")
+        if not isinstance(data, dict):
+            return
+
+        on_devs = data.get("online", []) or []
+        off_devs = data.get("offline", []) or []
+        # "nearby" means the gateway still knows the device exists; it must not
+        # count as absent even though it carries no online/offline verdict.
+        nearby = data.get("nearby", []) or []
+
+        # Record what this frame proves, synchronously, before the async task -
+        # so a straggler frame later in the cycle cannot be missed.
+        self._subdev_cycle_had_reply = True
+        self._subdev_seen_cids.update(on_devs)
+        self._subdev_seen_cids.update(off_devs)
+        self._subdev_seen_cids.update(nearby)
 
         async def _action(on_devs, off_devs):
             try:
@@ -572,26 +607,60 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
                 listener = self.listener and self.listener()
                 if listener is None:
                     return
-                for cid, device in listener.sub_devices.items():
-                    if cid in on_devs:
+                for cid in on_devs:
+                    if device := listener.sub_devices.get(cid):
                         device.subdevice_state_updated(SubdeviceState.ONLINE)
-                    elif cid in off_devs:
+                for cid in off_devs:
+                    if device := listener.sub_devices.get(cid):
                         device.subdevice_state_updated(SubdeviceState.OFFLINE)
-                    else:
-                        # ABSENT detection is weak, because, with many sub-devices,
-                        # the gateway provides them all in more than 1 reply. This
-                        # should be taken into account in device.subdevice_state_updated()
-                        device.subdevice_state_updated(SubdeviceState.ABSENT)
             except asyncio.CancelledError:
                 pass
             finally:
                 self._sub_devs_query_task = None
 
-        if (data := decoded_message.get("data")) and isinstance(data, dict):
-            on_devs, off_devs = data.get("online", []), data.get("offline", [])
-            self._sub_devs_query_task = self.loop.create_task(
-                _action(on_devs, off_devs)
-            )
+        self._sub_devs_query_task = self.loop.create_task(_action(on_devs, off_devs))
+
+    def _evaluate_subdevices_cycle(self):
+        """Decide ABSENT for the cycle that just ended, then start a new one.
+
+        Called at the top of subdevices_query(), one heartbeat after the
+        previous query was sent - long enough for every frame of that reply to
+        have arrived. A sub-device missing from the whole cycle is only pushed
+        ABSENT once it has been missing for SUBDEVICE_ABSENT_CYCLES cycles in a
+        row; a genuinely departed device still reaches the coordinator's
+        "Device is absent" disconnect, just a couple of heartbeats later.
+        """
+        listener = self.listener and self.listener()
+
+        if not self._subdev_cycle_had_reply:
+            # The gateway did not answer at all this cycle (busy/slow). Freeze
+            # the counters rather than blaming every sub-device for the silence.
+            return
+
+        if listener is not None:
+            for cid, device in listener.sub_devices.items():
+                if cid in self._subdev_seen_cids:
+                    if self._subdev_absent_cycles.get(cid, 0) >= SUBDEVICE_ABSENT_CYCLES:
+                        self.info(f"Sub-device {cid} is listed again by the gateway")
+                    self._subdev_absent_cycles.pop(cid, None)
+                    continue
+
+                misses = self._subdev_absent_cycles.get(cid, 0) + 1
+                self._subdev_absent_cycles[cid] = misses
+                if misses == SUBDEVICE_ABSENT_CYCLES:
+                    self.info(
+                        f"Sub-device {cid} missing from {misses} poll cycles; "
+                        "marking absent"
+                    )
+                if misses >= SUBDEVICE_ABSENT_CYCLES:
+                    # Keep signalling ABSENT every cycle so the coordinator's
+                    # repeated-ABSENT disconnect contract still fires on a real
+                    # departure.
+                    device.subdevice_state_updated(SubdeviceState.ABSENT)
+
+        # Start the next cycle's accumulation.
+        self._subdev_seen_cids = set()
+        self._subdev_cycle_had_reply = False
 
     def _setup_dispatcher(self) -> MessageDispatcher:
         def _status_update(msg, ack=False):
@@ -741,6 +810,12 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         # A 3.4/3.5 session replaces local_key temporarily. Keep the device
         # key intact so the next reconnect can negotiate a fresh session.
         self.local_key = self.real_local_key
+
+        # Drop the sub-device poll accumulator so a fresh session starts a fresh
+        # cycle instead of inheriting stale misses.
+        self._subdev_seen_cids = set()
+        self._subdev_absent_cycles = {}
+        self._subdev_cycle_had_reply = False
 
         if self.heartbeater:
             self.heartbeater.cancel()
@@ -934,6 +1009,10 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
 
     async def subdevices_query(self):
         """Request a list of sub-devices and their status."""
+        # Before asking again, judge the cycle that the previous query opened:
+        # by now every frame of its reply has arrived, so the union in
+        # _subdev_seen_cids is complete.
+        self._evaluate_subdevices_cycle()
         # Return payload: {"online": [cid1, ...], "offline": [cid2, ...]}
         # "nearby": [cids, ...] can come in payload.
         payload = self._generate_payload(
