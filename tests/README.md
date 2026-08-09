@@ -45,7 +45,9 @@ was silently never executed.
   direction, alarm feature flags, water heater and vacuum crashes, base64
   sensor decoding, and others).
 - `test_end_to_end.py` — the repository's protocol client against the
-  repository's device simulator over a loopback socket. Every other suite
+  repository's device simulator over a loopback socket, run three times: 3.3,
+  3.4 (a session key negotiated over the 55AA frame) and 3.5 (6699/GCM, what
+  the pilot gateway speaks), plus a wrong-key negotiation that must fail. Every other suite
   replaces something (FakeInterface for pytuya, hand-built frames for a
   device); the two worst production outages both lived in the seam between
   them, so this one covers a hub with no datapoints of its own, a chunked

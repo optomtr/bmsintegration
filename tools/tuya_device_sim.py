@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 """Fake Tuya LAN devices, so the integration can be developed without hardware.
 
-Speaks protocol 3.3 (AES-ECB, no session negotiation) using the repository's own
-framing and cipher, so what the integration parses here is what it parses from a
-real device. Serves several devices - and one Zigbee gateway with sub-devices
-addressed by `cid` - from a single port, telling them apart by the `devId` in the
-request. That works because every simulated device shares one local key, exactly
-as the sub-devices of a real gateway do.
+Speaks protocol 3.3, 3.4 and 3.5 - AES-ECB, a negotiated session key over the
+55AA frame, and the 6699/GCM frame respectively - using the repository's own
+framing and cipher, so what the integration parses here is what it parses from
+a real device. The pilot gateway is 3.5, and pytuya only polls sub-devices as
+its heartbeat from 3.4 upwards, so a 3.3-only simulator could not exercise the
+code path that caused two production outages.
 
-    python3 tools/tuya_device_sim.py                # default scenario, port 6668
-    python3 tools/tuya_device_sim.py --scenario     # print the HA device config
+Serves several devices - and one Zigbee gateway with sub-devices addressed by
+`cid` - from a single port, telling them apart by the `devId` in the request.
+That works because every simulated device shares one local key, exactly as the
+sub-devices of a real gateway do.
+
+    python3 tools/tuya_device_sim.py                    # default, 3.3, port 6668
+    python3 tools/tuya_device_sim.py --protocol 3.5     # what the pilot speaks
+    python3 tools/tuya_device_sim.py --subdev-chunk 2   # hub answers in frames
+    python3 tools/tuya_device_sim.py --scenario         # print the HA config
 
 The scenario is printed as the `devices` block of a bms_integration config entry,
 so a dev Home Assistant can be pointed straight at it.
@@ -19,12 +26,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import json
 import logging
 import os
 import socket
 import struct
 import sys
+from hashlib import sha256
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "custom_components", "bms_integration", "core"))
@@ -39,7 +48,23 @@ _LOGGER = logging.getLogger("tuya_sim")
 # its children, and it lets one listening socket route by devId.
 LOCAL_KEY = "bmsSimKey0000001"
 PROTOCOL = "3.3"
-VERSION_HEADER = b"3.3" + b"\x00" * 12  # version_bytes + PROTOCOL_3x_HEADER
+
+# Commands that carry no version header, mirroring pytuya's own list. A device
+# and a client must agree on this exactly or the payload shifts by 15 bytes.
+NO_HEADER_CMDS = {
+    CMDType.DP_QUERY,
+    CMDType.DP_QUERY_NEW,
+    CMDType.UPDATEDPS,
+    CMDType.HEART_BEAT,
+    CMDType.SESS_KEY_NEG_START,
+    CMDType.SESS_KEY_NEG_RESP,
+    CMDType.SESS_KEY_NEG_FINISH,
+    CMDType.LAN_EXT_STREAM,
+}
+
+
+def version_header(protocol: str) -> bytes:
+    return protocol.encode() + b"\x00" * 12
 
 
 # --------------------------------------------------------------------------- #
@@ -207,29 +232,119 @@ def ha_device_config(host: str) -> dict:
 # Wire format
 # --------------------------------------------------------------------------- #
 class Codec:
-    """Encrypt/decrypt exactly the way a 3.3 device does."""
+    """Encrypt/decrypt exactly the way a device of this protocol version does.
 
-    def __init__(self, key: str):
-        self.cipher = AESCipher(key.encode("latin1"))
+    3.3 is AES-ECB inside a 55AA frame. 3.4 keeps the 55AA frame but signs it
+    with HMAC-SHA256 and encrypts with a negotiated session key; 3.5 moves to
+    the 6699 frame, where the whole payload is AES-GCM. The production gateway
+    is 3.5, so a simulator that only speaks 3.3 cannot exercise the code paths
+    that actually run on site - including the sub-device poll, which pytuya
+    only uses as a heartbeat from 3.4 upwards.
+    """
+
+    def __init__(self, key: str, protocol: str = PROTOCOL):
+        self.real_key = key.encode("latin1")
+        self.protocol = protocol
+        # A real device picks a random nonce; a fixed one keeps the stand
+        # reproducible and is exactly what pytuya's client side does too.
+        self.local_nonce = b"0123456789abcdef"
+        self.remote_nonce = b""
+        self.version = float(protocol)
+        # Until a session is negotiated, the device key is the session key.
+        self.key = self.real_key
+        self.cipher = AESCipher(self.key)
+        # Nonces belong to one connection, so they live here and not on the
+        # Simulator: two clients negotiating at once would share them.
+        self.local_nonce = b"0123456789abcdef"
+        self.remote_nonce = b""
+
+    def set_session_key(self, key: bytes) -> None:
+        self.key = key
+        self.cipher = AESCipher(key)
+
+    @property
+    def hmac_key(self) -> bytes | None:
+        return self.key if self.version >= 3.4 else None
 
     def decode(self, payload: bytes) -> dict:
-        if not payload:
+        """Decode a JSON command payload."""
+        raw = self.decode_raw(payload)
+        if not raw:
             return {}
-        if payload.startswith(b"3.3"):
-            payload = payload[len(VERSION_HEADER) :]
         try:
-            return json.loads(self.cipher.decrypt(payload, False))
+            return json.loads(raw)
         except Exception:  # noqa: BLE001 - a probe with a wrong key is not fatal
             return {}
 
+    def decode_raw(self, payload: bytes) -> bytes:
+        """Return the plaintext of a payload, without parsing it."""
+        if not payload:
+            return b""
+        header = version_header(self.protocol)
+        if self.version >= 3.5:
+            pass  # the 6699 frame was already decrypted by the parser
+        elif self.version >= 3.4:
+            # 3.4 encrypts the version header along with the payload, so it
+            # can only be stripped after decrypting. Stripping first (as a
+            # first attempt did) leaves the header in the JSON and every
+            # command silently decodes to nothing.
+            try:
+                payload = self.cipher.decrypt(payload, False, decode_text=False)
+            except Exception:  # noqa: BLE001
+                return b""
+        else:
+            # 3.3 puts the header outside the ciphertext.
+            if payload.startswith(header[:3]):
+                payload = payload[len(header) :]
+            try:
+                payload = self.cipher.decrypt(payload, False, decode_text=False)
+            except Exception:  # noqa: BLE001
+                return b""
+
+        if payload.startswith(header[:3]):
+            payload = payload[len(header) :]
+        return payload
+
     def frame(self, seqno: int, cmd: int, obj: dict | None) -> bytes:
-        body = b"" if obj is None else self.cipher.encrypt(
-            json.dumps(obj, separators=(",", ":")).encode(), False
-        )
+        body = b"" if obj is None else json.dumps(obj, separators=(",", ":")).encode()
+        return self.frame_raw(seqno, cmd, body)
+
+    def frame_raw(self, seqno: int, cmd: int, body: bytes) -> bytes:
+        """Frame an already-serialised payload, adding the version header."""
+        if body and cmd not in NO_HEADER_CMDS and self.version >= 3.4:
+            body = version_header(self.protocol) + body
+
+        if self.version >= 3.5:
+            # A device-to-client frame carries a 4-byte retcode ahead of the
+            # payload; the client's parser strips it unconditionally. Without
+            # it the first four bytes of every reply were eaten - which showed
+            # up as "session key negotiation failed on step 1".
+            msg = TuyaMessage(
+                seqno,
+                cmd,
+                None,
+                struct.pack(">I", 0) + body,
+                0,
+                True,
+                Affix.prefix_6699.value,
+                True,
+            )
+            return parser.pack_message(msg, hmac_key=self.key)
+
+        encrypted = self.cipher.encrypt(body, False) if body else b""
+        if encrypted and cmd not in NO_HEADER_CMDS and self.version == 3.3:
+            encrypted = version_header(self.protocol) + encrypted
         msg = TuyaMessage(
-            seqno, cmd, 0, struct.pack(">I", 0) + body, 0, True, Affix.prefix_55aa.value, False
+            seqno,
+            cmd,
+            0,
+            struct.pack(">I", 0) + encrypted,
+            0,
+            True,
+            Affix.prefix_55aa.value,
+            False,
         )
-        return parser.pack_message(msg)
+        return parser.pack_message(msg, hmac_key=self.hmac_key)
 
 
 # --------------------------------------------------------------------------- #
@@ -243,6 +358,7 @@ class Simulator:
         offline_cids: set[str] | None = None,
         nearby_cids: set[str] | None = None,
         subdev_chunk: int = 0,
+        protocol: str = PROTOCOL,
     ):
         self.devices = devices
         self.offline = offline
@@ -251,7 +367,7 @@ class Simulator:
         self.offline_cids = offline_cids or set()
         self.nearby_cids = nearby_cids or set()
         self.subdev_chunk = subdev_chunk
-        self.codec = Codec(LOCAL_KEY)
+        self.protocol = protocol
         self.push_seqno = 1000
 
     def _state_for(self, dev_id: str | None, cid: str | None) -> dict | None:
@@ -270,6 +386,8 @@ class Simulator:
         peer = writer.get_extra_info("peername")
         buffer = b""
         seen: str | None = None
+        # A session key belongs to one connection, so each gets its own codec.
+        codec = Codec(LOCAL_KEY, self.protocol)
         _LOGGER.info("connect from %s", peer)
         try:
             while True:
@@ -287,21 +405,40 @@ class Simulator:
                         break
                     raw, buffer = buffer[: header.total_length], buffer[header.total_length :]
                     try:
-                        msg = parser.unpack_message(raw, header=header, no_retcode=True)
+                        msg = parser.unpack_message(
+                            raw,
+                            header=header,
+                            hmac_key=codec.hmac_key,
+                            no_retcode=True,
+                        )
                     except Exception as ex:  # noqa: BLE001
                         _LOGGER.debug("undecodable frame: %s", ex)
                         continue
-                    seen = await self._respond(writer, msg) or seen
+                    seen = await self._respond(writer, msg, codec) or seen
         except (ConnectionResetError, asyncio.IncompleteReadError):
             pass
+        except Exception:  # noqa: BLE001 - a simulator bug must be visible
+            _LOGGER.exception("handler failed for %s", peer)
         finally:
             _LOGGER.info("disconnect %s (%s)", peer, seen or "unknown device")
             writer.close()
 
-    async def _respond(self, writer, msg) -> str | None:
-        body = self.codec.decode(msg.payload)
-        dev_id = body.get("devId") or body.get("gwId")
-        cid = body.get("cid")
+    async def _respond(self, writer, msg, codec: "Codec") -> str | None:
+        if msg.cmd in (
+            CMDType.SESS_KEY_NEG_START,
+            CMDType.SESS_KEY_NEG_FINISH,
+        ):
+            await self._negotiate(writer, msg, codec)
+            return None
+
+        body = codec.decode(msg.payload)
+        # 3.4/3.5 wrap a CONTROL in {"protocol":5,"t":..,"data":{...}}, so the
+        # cid and the datapoints live one level down. A simulator that only
+        # looked at the top level silently accepted the command and changed
+        # nothing - which is worse than refusing it.
+        inner = body.get("data") if isinstance(body.get("data"), dict) else {}
+        dev_id = body.get("devId") or body.get("gwId") or inner.get("devId")
+        cid = body.get("cid") or inner.get("cid")
 
         # The offline gate has to come first. Answering heartbeats while
         # ignoring everything else is not a state a real device can be in, and
@@ -312,7 +449,7 @@ class Simulator:
             return dev_id
 
         if msg.cmd == CMDType.HEART_BEAT:
-            writer.write(self.codec.frame(msg.seqno, CMDType.HEART_BEAT, None))
+            writer.write(codec.frame(msg.seqno, CMDType.HEART_BEAT, None))
             await writer.drain()
             return dev_id
 
@@ -321,41 +458,83 @@ class Simulator:
         if msg.cmd in (CMDType.DP_QUERY, CMDType.DP_QUERY_NEW):
             if state is None:
                 _LOGGER.info("status for unknown %s/%s -> empty", dev_id, cid)
-                writer.write(self.codec.frame(msg.seqno, msg.cmd, {}))
+                writer.write(codec.frame(msg.seqno, msg.cmd, {}))
             else:
                 reply = {"dps": dict(state)}
                 if cid:
                     reply["cid"] = cid
-                writer.write(self.codec.frame(msg.seqno, msg.cmd, reply))
+                writer.write(codec.frame(msg.seqno, msg.cmd, reply))
             await writer.drain()
             return dev_id
 
         if msg.cmd in (CMDType.CONTROL, CMDType.CONTROL_NEW):
-            dps = body.get("dps") or {}
+            dps = body.get("dps") or inner.get("dps") or {}
             if state is not None:
                 state.update(dps)
                 _LOGGER.info("SET %s%s %s", dev_id, f"/{cid}" if cid else "", dps)
             # ACK first, then report the new state the way a device does.
-            writer.write(self.codec.frame(msg.seqno, msg.cmd, None))
+            writer.write(codec.frame(msg.seqno, msg.cmd, None))
             await writer.drain()
             if state is not None:
                 await asyncio.sleep(0.15)
-                await self._push_status(writer, dps, cid)
+                await self._push_status(writer, dps, cid, codec)
             return dev_id
 
         if msg.cmd == CMDType.UPDATEDPS:
             if state is not None:
-                await self._push_status(writer, dict(state), cid)
+                await self._push_status(writer, dict(state), cid, codec)
             return dev_id
 
         if msg.cmd == CMDType.LAN_EXT_STREAM:
-            await self._respond_subdev_query(writer, msg, body, dev_id)
+            await self._respond_subdev_query(writer, msg, body, dev_id, codec)
             return dev_id
 
         _LOGGER.debug("unhandled cmd %s from %s", msg.cmd, dev_id)
         return dev_id
 
-    async def _respond_subdev_query(self, writer, msg, body: dict, dev_id):
+    async def _negotiate(self, writer, msg, codec: "Codec") -> None:
+        """The device half of the 3.4/3.5 session-key handshake.
+
+        Step 1: the client sends its 16-byte nonce. We answer with our own
+        nonce plus HMAC(local_key, client_nonce), proving we hold the key.
+        Step 2: the client returns HMAC(local_key, our_nonce). The session key
+        is XOR(nonces) encrypted with the device key - ECB for 3.4, the middle
+        16 bytes of a GCM encryption under an IV of the client nonce for 3.5.
+        """
+        if msg.cmd == CMDType.SESS_KEY_NEG_START:
+            # decode_raw does whatever this protocol version requires: 3.4
+            # decrypts with the device key, 3.5 was already decrypted by the
+            # 6699 parser. Encrypting again here (as a first attempt did) puts
+            # two layers on the wire and the client sees noise.
+            codec.remote_nonce = codec.decode_raw(msg.payload)[:16]
+            proof = hmac.new(codec.real_key, codec.remote_nonce, sha256).digest()
+            writer.write(
+                codec.frame_raw(
+                    msg.seqno, CMDType.SESS_KEY_NEG_RESP, codec.local_nonce + proof
+                )
+            )
+            await writer.drain()
+            return
+
+        # SESS_KEY_NEG_FINISH: verify the client's proof, then switch keys.
+        expected = hmac.new(codec.real_key, codec.local_nonce, sha256).digest()
+        got = codec.decode_raw(msg.payload)[:32]
+        if not hmac.compare_digest(expected, got):
+            _LOGGER.warning("session key negotiation: client failed the HMAC check")
+            writer.close()
+            return
+
+        session = bytes(a ^ b for a, b in zip(codec.remote_nonce, codec.local_nonce))
+        cipher = AESCipher(codec.real_key)
+        if codec.version == 3.4:
+            session = cipher.encrypt(session, False, pad=False)
+        else:
+            iv = codec.remote_nonce[:12]
+            session = cipher.encrypt(session, use_base64=False, pad=False, iv=iv)[12:28]
+        codec.set_session_key(session)
+        _LOGGER.info("session key negotiated (protocol %s)", codec.protocol)
+
+    async def _respond_subdev_query(self, writer, msg, body: dict, dev_id, codec):
         """Answer subdev_online_stat_query the way a Zigbee hub does.
 
         A real hub splits the answer over several frames and does not repeat
@@ -391,7 +570,7 @@ class Simulator:
                 data["offline"] = offline
                 data["nearby"] = nearby
             writer.write(
-                self.codec.frame(
+                codec.frame(
                     msg.seqno, CMDType.LAN_EXT_STREAM, {"data": data}
                 )
             )
@@ -403,12 +582,12 @@ class Simulator:
             len(online), len(frames), len(offline), len(nearby),
         )
 
-    async def _push_status(self, writer, dps: dict, cid: str | None):
+    async def _push_status(self, writer, dps: dict, cid: str | None, codec):
         self.push_seqno += 1
         payload: dict = {"dps": dps}
         if cid:
             payload["cid"] = cid
-        writer.write(self.codec.frame(self.push_seqno, CMDType.STATUS, payload))
+        writer.write(codec.frame(self.push_seqno, CMDType.STATUS, payload))
         await writer.drain()
 
 
@@ -474,6 +653,7 @@ async def main_async(args):
         offline_cids=set(args.offline_cid or []),
         nearby_cids=set(args.nearby_cid or []),
         subdev_chunk=args.subdev_chunk,
+        protocol=args.protocol,
     )
     server = await asyncio.start_server(sim.handle, args.host, args.port)
     stop = asyncio.Event()
@@ -482,7 +662,8 @@ async def main_async(args):
                                               set(args.only or []) or None))
         _LOGGER.info("announcing presence on UDP 6666 as %s", args.advertise)
     total = sum(1 + len(d.get("sub_devices", {})) for d in devices.values())
-    _LOGGER.info("listening on %s:%s - %d simulated devices", args.host, args.port, total)
+    _LOGGER.info("listening on %s:%s - %d simulated devices, protocol %s",
+                 args.host, args.port, total, args.protocol)
     if args.offline:
         _LOGGER.info("pretending offline: %s", ", ".join(args.offline))
     if args.offline_cid or args.nearby_cid or args.subdev_chunk:
@@ -499,6 +680,8 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=6668)
     ap.add_argument("--offline", nargs="*", help="device ids that must not answer")
+    ap.add_argument("--protocol", default=PROTOCOL, choices=["3.3", "3.4", "3.5"],
+                    help="LAN protocol to speak (the pilot gateway is 3.5)")
     ap.add_argument("--offline-cid", nargs="*", metavar="CID",
                     help="sub-devices the hub reports as offline")
     ap.add_argument("--nearby-cid", nargs="*", metavar="CID",

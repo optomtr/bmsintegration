@@ -62,10 +62,17 @@ class GatewayListener(pytuya.EmptyListener):
 
 
 class EndToEnd(unittest.IsolatedAsyncioTestCase):
+    # The pilot gateway is 3.5. 3.3 has no session key, 3.4 negotiates one over
+    # the 55AA frame, 3.5 moves to 6699/GCM - and pytuya only polls sub-devices
+    # as a heartbeat from 3.4 upwards, so a 3.3-only stand cannot see it at all.
+    PROTOCOL = "3.3"
+
     async def asyncSetUp(self):
         self.devices = sim_module.build_scenario()
         self.cids = list(self.devices[GATEWAY_ID]["sub_devices"])
-        self.sim = sim_module.Simulator(self.devices, offline=set())
+        self.sim = sim_module.Simulator(
+            self.devices, offline=set(), protocol=self.PROTOCOL
+        )
         self.server = await asyncio.start_server(self.sim.handle, "127.0.0.1", 0)
         self.port = self.server.sockets[0].getsockname()[1]
         self.proto = None
@@ -82,7 +89,13 @@ class EndToEnd(unittest.IsolatedAsyncioTestCase):
         listener = listener or GatewayListener(self.cids)
         self.listener = listener
         self.proto = await pytuya.connect(
-            "127.0.0.1", GATEWAY_ID, SIM_KEY, 3.3, False, listener, self.port
+            "127.0.0.1",
+            GATEWAY_ID,
+            SIM_KEY,
+            float(self.PROTOCOL),
+            False,
+            listener,
+            self.port,
         )
         return self.proto
 
@@ -188,6 +201,50 @@ class EndToEnd(unittest.IsolatedAsyncioTestCase):
         # And the client recovers the moment the device answers again.
         self.sim.offline = set()
         self.assertEqual(await proto.status(), {"32": "normal"})
+
+
+class EndToEnd34(EndToEnd):
+    """The same suite over a negotiated 3.4 session."""
+
+    PROTOCOL = "3.4"
+
+
+class EndToEnd35(EndToEnd):
+    """The same suite over 3.5 - the protocol the pilot gateway speaks."""
+
+    PROTOCOL = "3.5"
+
+
+class SessionNegotiation(unittest.IsolatedAsyncioTestCase):
+    """A device that cannot prove it holds the key must not get a session."""
+
+    async def asyncSetUp(self):
+        self.sim = sim_module.Simulator(
+            sim_module.build_scenario(), offline=set(), protocol="3.5"
+        )
+        self.server = await asyncio.start_server(self.sim.handle, "127.0.0.1", 0)
+        self.port = self.server.sockets[0].getsockname()[1]
+
+    async def asyncTearDown(self):
+        self.server.close()
+        await self.server.wait_closed()
+
+    async def test_wrong_key_does_not_negotiate(self):
+        proto = await pytuya.connect(
+            "127.0.0.1",
+            GATEWAY_ID,
+            "wrongKey00000001",
+            3.5,
+            False,
+            pytuya.EmptyListener(),
+            self.port,
+        )
+        try:
+            # The HMAC check fails, so no session key is derived and no status
+            # comes back - rather than a garbage key producing garbage state.
+            self.assertEqual(await proto.status(), {})
+        finally:
+            await asyncio.wait_for(proto.close(), 5)
 
 
 if __name__ == "__main__":
