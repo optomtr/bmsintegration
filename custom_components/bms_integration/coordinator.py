@@ -53,6 +53,10 @@ RECONNECT_INTERVAL = timedelta(seconds=5)
 AVAILABILITY_GRACE_PERIOD = 120
 STARTUP_AVAILABILITY_GRACE_PERIOD = 300
 RECONNECT_BACKOFF_SECONDS = (1, 2, 5, 10, 20, 30, 60)
+# How many commands in a row must fail before the shared transport is judged
+# broken. A gateway socket carries every sub-device behind it, so a single
+# child that stopped answering must not be able to reconnect the whole hub.
+COMMAND_FAILURES_BEFORE_RESET = 3
 AVAILABILITY_REPORT_FILE = "bms_integration_availability.jsonl"
 # The report is a troubleshooting aid, not an archive: rotate it so a
 # flapping device cannot fill the (often SD-card) disk over months.
@@ -107,6 +111,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._fake_gateway = fake_gateway
         self._node_id: str = self._device_config.node_id
         self._subdevice_off_count: int = 0
+        self._command_failures: int = 0
 
         # last_update_time: Sleep timer, a device that reports the status every x seconds then goes into sleep.
         self._last_update_time = time.monotonic() - 5
@@ -486,7 +491,13 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                     self.status_updated(RESTORE_STATES)
 
                 if self._pending_status:
-                    await self.set_status()
+                    try:
+                        await self.set_status()
+                    except Exception as ex:  # pylint: disable=broad-except
+                        # Flushing a queued command must not abort the
+                        # connection that just succeeded; set_status has
+                        # already logged and handled the failure.
+                        self.debug(f"Queued command failed after connect: {ex}")
 
                 if self.sub_devices:
                     # Keep a reference: a bare create_task can be garbage
@@ -584,19 +595,53 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             payload, self._pending_status = self._pending_status.copy(), {}
             try:
                 await self._interface.set_dps(payload, cid=self._node_id)
-                # bluetooth devices usually does not send updated status payload.
-                # NOTE: This will override the status if the BLE device fails to receive the signal.
-                if self.is_write_only:
-                    self.status_updated(payload)
             except asyncio.CancelledError:
                 raise
             except Exception as ex:  # pylint: disable=broad-except
                 self.warning(f"Failed to set values {payload} --> {ex}")
-                await self._async_reset_stale_connection(
-                    f"Command failed: {ex}", "command_failed"
-                )
+                await self._async_handle_command_failure(ex)
+                # The caller has to know the command was lost: the optimistic
+                # value is already showing in the interface and only an
+                # exception here triggers its rollback.
+                raise
+            self._command_failures = 0
+            # bluetooth devices usually does not send updated status payload.
+            # NOTE: This will override the status if the BLE device fails to receive the signal.
+            if self.is_write_only:
+                self.status_updated(payload)
         elif not self.connected:
             self.error(f"Device is not connected.")
+
+    async def _async_handle_command_failure(self, ex: Exception) -> None:
+        """Decide whether one failed command means the transport is broken."""
+        if isinstance(ex, (ConnectionError, OSError)) or not self.connected:
+            # The socket itself is gone: reconnect at once.
+            self._command_failures = 0
+            await self._async_reset_stale_connection(
+                f"Command failed: {ex}", "command_failed"
+            )
+            return
+
+        # A reply timeout for one datapoint is not proof that the socket is
+        # dead, and on a Zigbee hub that socket is shared by every sub-device
+        # behind it. Resetting it here turned a single unresponsive child - a
+        # flat battery, a curtain out of range - into a reconnect for the
+        # whole floor: the pilot site logged 29 lost commands and 138 gateway
+        # handshakes in one day this way. Reset only once the failures repeat.
+        self._command_failures += 1
+        if self._command_failures < COMMAND_FAILURES_BEFORE_RESET:
+            self.debug(
+                "Command failed (%d/%d) but the session still looks healthy",
+                self._command_failures,
+                COMMAND_FAILURES_BEFORE_RESET,
+            )
+            return
+
+        self._command_failures = 0
+        await self._async_reset_stale_connection(
+            f"{COMMAND_FAILURES_BEFORE_RESET} commands in a row failed: {ex}",
+            "command_failed",
+        )
 
     async def set_dp(self, state, dp_index):
         """Change value of a DP of the Tuya device."""

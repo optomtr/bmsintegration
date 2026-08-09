@@ -295,9 +295,12 @@ class MessageDispatcher(ContextualLogger):
     async def wait_for(self, seqno, cmd, timeout=TIMEOUT_REPLY):
         """Wait for response to a sequence number to be received and return it."""
         if seqno in self.listeners:
+            # The special sequence numbers are shared by every caller of that
+            # command, so overwriting the entry orphaned the waiter already
+            # parked on it: its future was never resolved and never cancelled,
+            # and its eventual timeout tore down a session that was healthy.
             self.debug(f"listener exists for {seqno}")
-            if seqno == self.HEARTBEAT_SEQNO:
-                raise Exception(f"listener exists for {seqno}")
+            raise Exception(f"listener exists for {seqno}")
 
         self.debug("Command %d waiting for seq. number %d", cmd, seqno)
         future = asyncio.Future()
@@ -315,7 +318,10 @@ class MessageDispatcher(ContextualLogger):
                 f"Command {cmd} timed out waiting for sequence number {seqno}"
             )
         finally:
-            self.listeners.pop(seqno, True)
+            # Remove only our own future: a later waiter for the same special
+            # sequence number must keep its listener when we time out.
+            if self.listeners.get(seqno) is future:
+                self.listeners.pop(seqno, None)
 
     def _release_listener(self, seqno, msg):
         if seqno not in self.listeners:
@@ -369,9 +375,14 @@ class MessageDispatcher(ContextualLogger):
 
             try:
                 header = parser.parse_header(self.buffer, logger=self)
-            except parser.DecodeError as ex:
+            except Exception as ex:
                 # Corrupt header (e.g. insane length): skip this prefix and
                 # resync on the next one instead of dropping the connection.
+                # Catch everything, not just DecodeError: struct.unpack raises
+                # struct.error and a short/odd buffer raises TypeError or
+                # IndexError, and this runs inside data_received - asyncio
+                # closes the transport on any exception that escapes, which
+                # for a Zigbee hub means every sub-device behind it dies.
                 self.debug(f"Corrupt header, resyncing: {ex}")
                 self.buffer = self.buffer[4:]
                 continue
@@ -388,7 +399,10 @@ class MessageDispatcher(ContextualLogger):
                     no_retcode=False,
                     logger=self,
                 )
-            except parser.DecodeError as ex:
+            except Exception as ex:
+                # Same reasoning as the header above: unpack_message walks
+                # attacker-controlled lengths and can raise struct.error or
+                # ValueError, and an exception here would close the socket.
                 self.debug(f"Failed to unpack message, resyncing: {ex}")
                 self.buffer = self.buffer[4:]
                 continue
@@ -402,7 +416,14 @@ class MessageDispatcher(ContextualLogger):
                 self.warning(f"Dropping message with bad CRC/HMAC (cmd {msg.cmd})")
                 continue
 
-            self._dispatch(msg)
+            try:
+                self._dispatch(msg)
+            except Exception as ex:
+                # A listener or the status callback must never be able to
+                # close the transport. On a gateway that socket is shared by
+                # every sub-device behind it, so one malformed push would
+                # take the whole floor offline.
+                self.exception(f"Unhandled error dispatching cmd {msg.cmd}: {ex}")
 
     def _dispatch(self, msg: TuyaMessage):
         """Dispatch a message to someone that is listening."""
@@ -666,14 +687,27 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         def _status_update(msg, ack=False):
             if msg.seqno > 0:
                 if msg.seqno >= self.seqno:
-                    self.seqno = msg.seqno + 1
+                    # msg.seqno is an untrusted u32 straight off the wire. A
+                    # single frame with a huge sequence number would otherwise
+                    # push our counter past the field width, and every packet
+                    # we send afterwards would be built with a truncated or
+                    # unpackable seqno.
+                    self.seqno = (msg.seqno + 1) & 0xFFFFFFFF
                 if ack:
                     self.debug(
                         f"Got update ack message update seqno only. msg.seqno={msg.seqno} self.seqno={self.seqno}"
                     )
                     return
 
-            decoded_message: dict = self._decode_payload(msg.payload)
+            decoded_message = self._decode_payload(msg.payload)
+            if not isinstance(decoded_message, dict):
+                # _decode_payload returns None for a payload the device
+                # reports as "data unvalid", and this runs inside
+                # data_received: letting the TypeError out would close the
+                # socket shared by every sub-device of a gateway.
+                self.debug(f"Ignoring undecodable payload of cmd {msg.cmd}")
+                return
+
             cid = None
 
             # Sub-devices query message.
@@ -911,8 +945,13 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
 
         try:
             await self.transport_write(enc_payload)
-        except Exception:  # pylint: disable=broad-except
-            return self.clean_up_session()
+        except Exception as ex:  # pylint: disable=broad-except
+            # The command never left the machine. Returning None here made a
+            # lost write indistinguishable from an ACK, so the caller kept the
+            # optimistic value and the interface showed a state the device
+            # never reached.
+            self.clean_up_session()
+            raise ConnectionError(f"Failed to send command {real_cmd}: {ex}") from ex
         msg = await self.dispatcher.wait_for(seqno, payload.cmd)
         if msg is None:
             self.debug("Wait was aborted for seqno %d", seqno)
@@ -1077,7 +1116,14 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
             payload = payload[len(PROTOCOL_VERSION_BYTES_31) :]
             # Decrypt payload
             # Remove 16-bytes of MD5 hexdigest of payload
-            payload = cipher.decrypt(payload[16:])
+            try:
+                payload = cipher.decrypt(payload[16:])
+            except Exception as ex:  # pylint: disable=broad-except
+                # Same treatment as the 3.2+ branches below: a payload we
+                # cannot decrypt is a bad key or line noise, not a reason to
+                # let an exception reach data_received and close the socket.
+                self.debug("Failed to decrypt a 3.1 payload (%s)", ex)
+                return self.error_json(ERR_PAYLOAD)
         elif self.version >= 3.2:  # 3.2 or 3.3 or 3.4
             # Trim header for non-default device type
             if payload.startswith(self.version_bytes):

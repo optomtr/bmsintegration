@@ -183,7 +183,13 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
                 # the `available` property reflects it.
                 self._status = {}
             else:
-                self._status = {**self._status, **status}
+                # Mirror the device cache instead of merging into ours. The
+                # device always dispatches its whole status, so a merge could
+                # only ever add keys - which made the optimistic rollback
+                # unreachable: rolling back a first-ever command pops the
+                # datapoint from the device cache, and a merge kept the
+                # optimistic value here forever.
+                self._status = dict(status)
 
             if not self._loaded:
                 self._loaded = True
