@@ -159,6 +159,10 @@ class LocalTuyaSensor(LocalTuyaEntity, SensorEntity):
             sub_entity = LocalTuyaSensor(
                 self._device, self._device_config.as_dict(), self._dp_id
             )
+            # A sub-sensor reads the same base64 datapoint as its parent, so
+            # without this it would try to spawn its own sub-sensors on every
+            # status update - forever, three throwaway entities at a time.
+            sub_entity._has_sub_entities = True
             setattr(sub_entity, "_attr_sub_sensor", sensor)
             setattr(sub_entity, "_attr_unique_id", f"{self.unique_id}_{sensor}")
             setattr(sub_entity, "_attr_name", f"{self.name} {sensor.capitalize()}")
@@ -167,13 +171,18 @@ class LocalTuyaSensor(LocalTuyaEntity, SensorEntity):
             setattr(sub_entity, "_attr_native_unit_of_measurement", MAP_UOM[sensor])
             sub_entities.append(sub_entity)
 
-        # Sub entities shouldn't have add entities attr.
-        if sub_entities and self.componet_add_entities:
-            self._has_sub_entities = True
-            self.componet_add_entities(sub_entities)
-            er.async_get(self.hass).async_update_entity(
-                self.entity_id, hidden_by=er.RegistryEntryHider.INTEGRATION
-            )
+        # Mark the attempt either way: if the platform callback is missing the
+        # sub-sensors can never be added, and retrying on every status update
+        # only burns CPU for the life of the installation.
+        self._has_sub_entities = True
+        if not sub_entities or not self.componet_add_entities:
+            self.debug("Sub-sensors cannot be added: no platform callback")
+            return
+
+        self.componet_add_entities(sub_entities)
+        er.async_get(self.hass).async_update_entity(
+            self.entity_id, hidden_by=er.RegistryEntryHider.INTEGRATION
+        )
 
 
 async_setup_entry = partial(async_setup_entry, DOMAIN, LocalTuyaSensor, flow_schema)

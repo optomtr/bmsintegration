@@ -265,7 +265,7 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
                 scene_value = self.dp_value(CONF_SCENE)
                 if is_write_only and not scene_value:
                     scenes = SCENE_LIST_RGBW_BLE
-                elif scene_value and len(scene_value) <= 20:
+                elif isinstance(scene_value, str) and 0 < len(scene_value) <= 20:
                     scenes = SCENE_LIST_RGBW_255
                 elif self._config.get(CONF_BRIGHTNESS) is None:
                     scenes = SCENE_LIST_RGB_1000
@@ -629,8 +629,10 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
             color_mode = self._modes.white
             states[self._config.get(CONF_BRIGHTNESS)] = brightness
 
-        if color_mode is not None:
-            states[self._config.get(CONF_COLOR_MODE)] = color_mode
+        # A plain dimmer has no colour-mode datapoint configured, and
+        # states[None] = ... put a null key into the command payload.
+        if color_mode is not None and (mode_dp := self._config.get(CONF_COLOR_MODE)):
+            states[mode_dp] = color_mode
 
         await self.async_set_dps(states)
 
@@ -650,7 +652,15 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
         if ColorMode.HS in self.supported_color_modes:
             color = self.dp_value(CONF_COLOR)
             if color is not None and not self.is_white_mode:
-                self.__from_color(color)
+                try:
+                    self.__from_color(color)
+                except (TypeError, ValueError, IndexError) as ex:
+                    # The colour datapoint is decoded with int(..., 16) over
+                    # fixed-width slices. A short, empty or non-hex value -
+                    # a gateway sending a partial payload, or a firmware that
+                    # reports "" while the lamp boots - raised out of the
+                    # status callback and froze the entity's whole update.
+                    self.debug("Ignoring undecodable colour %r (%s)", color, ex)
             elif self._brightness is None:
                 self._brightness = self._upper_brightness
 

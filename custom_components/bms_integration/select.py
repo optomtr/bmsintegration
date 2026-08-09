@@ -79,7 +79,10 @@ class LocalTuyaSelect(LocalTuyaEntity, SelectEntity):
     async def async_select_option(self, option: str) -> None:
         """Update the current value."""
         option_value = self._options.to_tuya(option)
-        self.debug("Sending Option: " + option + " -> " + option_value)
+        # Options come from an ObjectSelector, so a datapoint value entered as
+        # `1: Low` is an int here. String concatenation raised TypeError and
+        # the command never reached the device.
+        self.debug("Sending Option: %s -> %s", option, option_value)
         await self._device.set_dp(option_value, self._dp_id)
 
     def status_updated(self):

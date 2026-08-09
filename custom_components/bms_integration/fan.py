@@ -74,7 +74,10 @@ class LocalTuyaFan(LocalTuyaEntity, FanEntity):
             int(self._config.get(CONF_FAN_SPEED_MIN, 1)),
             int(self._config.get(CONF_FAN_SPEED_MAX, 9)),
         )
-        self._ordered_list = self._config.get(CONF_FAN_ORDERED_LIST).split(",")
+        # A config carried over by hand or by the migration tool may not have
+        # this key at all; .split() on None aborted the setup of every fan on
+        # the entry, not just this one.
+        self._ordered_list = (self._config.get(CONF_FAN_ORDERED_LIST) or "").split(",")
 
         if isinstance(self._ordered_list, list) and len(self._ordered_list) > 1:
             self._use_ordered_list = True

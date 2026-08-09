@@ -62,6 +62,20 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+def _scaled(value, precision: float):
+    """Multiply a datapoint by its precision, tolerating a non-numeric report.
+
+    A thermostat that answers with a string ("25") or an error token made
+    `value * precision` raise TypeError inside the status callback, which
+    aborted the whole update for the entity.
+    """
+    try:
+        return float(value) * precision
+    except (TypeError, ValueError):
+        return None
+
+
+
 
 HVAC_OFF = {HVACMode.OFF.value: "off"}  # Migrate to 3
 RENAME_HVAC_MODE_SETS = {  # Migrate to 3
@@ -536,13 +550,21 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
         if self.has_config(CONF_TARGET_TEMPERATURE_DP) and (
             target_dp_value := self.dp_value(CONF_TARGET_TEMPERATURE_DP)
         ) is not None:
-            self._target_temperature = target_dp_value * self._precision_target
+            scaled = _scaled(target_dp_value, self._precision_target)
+            if scaled is None:
+                self.debug("Ignoring non-numeric target temperature %r", target_dp_value)
+            else:
+                self._target_temperature = scaled
 
         # Update current temperature
         if self.has_config(CONF_CURRENT_TEMPERATURE_DP) and (
             current_dp_temp := self.dp_value(CONF_CURRENT_TEMPERATURE_DP)
         ) is not None:
-            self._current_temperature = current_dp_temp * self._precision
+            scaled = _scaled(current_dp_temp, self._precision)
+            if scaled is None:
+                self.debug("Ignoring non-numeric temperature %r", current_dp_temp)
+            else:
+                self._current_temperature = scaled
 
         # Force the Current temperature and Target temperature to matching the unit.
         if self._target_temp_forced_to_celsius:

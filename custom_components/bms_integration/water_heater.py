@@ -46,6 +46,20 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+def _scaled(value, precision: float):
+    """Multiply a datapoint by its precision, tolerating a non-numeric report.
+
+    A thermostat that answers with a string ("25") or an error token made
+    `value * precision` raise TypeError inside the status callback, which
+    aborted the whole update for the entity.
+    """
+    try:
+        return float(value) * precision
+    except (TypeError, ValueError):
+        return None
+
+
+
 
 TEMPERATURE_CELSIUS = "celsius"
 TEMPERATURE_FAHRENHEIT = "fahrenheit"
@@ -211,12 +225,20 @@ class LocalTuyaWaterHeater(LocalTuyaEntity, WaterHeaterEntity):
         # used to raise a TypeError and abort the whole status update.
         if self.has_config(CONF_TARGET_TEMPERATURE_DP):
             if (target := self.dp_value(CONF_TARGET_TEMPERATURE_DP)) is not None:
-                self._target_temperature = target * self._precision_target
+                scaled = _scaled(target, self._precision_target)
+                if scaled is None:
+                    self.debug("Ignoring non-numeric target temperature %r", target)
+                else:
+                    self._target_temperature = scaled
 
         # Update current temperature
         if self.has_config(CONF_CURRENT_TEMPERATURE_DP):
             if (current := self.dp_value(CONF_CURRENT_TEMPERATURE_DP)) is not None:
-                self._current_temperature = current * self._precision
+                scaled = _scaled(current, self._precision)
+                if scaled is None:
+                    self.debug("Ignoring non-numeric temperature %r", current)
+                else:
+                    self._current_temperature = scaled
 
         # Update modes states
         if not self._state:

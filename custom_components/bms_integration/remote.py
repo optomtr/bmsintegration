@@ -238,6 +238,13 @@ class LocalTuyaRemote(LocalTuyaEntity, RemoteEntity):
 
         async with self._lock:
             for command in commands:
+                # Arm from a clean slate. self._event was only cleared in the
+                # finally below, AFTER the wait, and self._last_code starts as
+                # None after every restart - so the device's first ordinary
+                # status report set the event, the wait returned instantly and
+                # the PREVIOUS code was stored as the new command.
+                self._event.clear()
+                self._last_code = None
                 await self.send_signal(ControlMode.STUDY, rf=is_rf)
                 persistent_notification.async_create(
                     self.hass,
@@ -249,6 +256,10 @@ class LocalTuyaRemote(LocalTuyaEntity, RemoteEntity):
                 try:
                     self.debug(f"Waiting for code from DP: {self._dp_recieve}")
                     await asyncio.wait_for(self._event.wait(), timeout)
+                    if self._last_code is None:
+                        raise ServiceValidationError(
+                            f"Device reported an empty code for: {command}"
+                        )
                     await self.save_new_command(device, command, self._last_code)
                 except TimeoutError:
                     raise ServiceValidationError(f"Timeout: Failed to learn: {command}")
@@ -365,9 +376,11 @@ class LocalTuyaRemote(LocalTuyaEntity, RemoteEntity):
 
         commands = devices_data[device]
         if command not in commands:
-            commands.pop("rf", False)
+            # Report the available names without touching the stored dict:
+            # this used to delete a genuinely learned command called "rf".
+            available = [name for name in commands if name != "rf"]
             raise ServiceValidationError(
-                f"Couldn't find the command {command} for in {device} device. the available commands for this device is: {list(commands)}"
+                f"Couldn't find the command {command} for in {device} device. the available commands for this device is: {available}"
             )
 
         # For now this only works if the command is in the list of commands of this device.
@@ -456,9 +469,11 @@ class LocalTuyaRemote(LocalTuyaEntity, RemoteEntity):
 
         commands = devices_data[device]
         if command not in commands:
-            commands.pop("rf", False)
+            # Report the available names without touching the stored dict:
+            # this used to delete a genuinely learned command called "rf".
+            available = [name for name in commands if name != "rf"]
             raise ServiceValidationError(
-                f"Couldn't find the command {command} for in {device} device. the available commands for this device is: {list(commands)}"
+                f"Couldn't find the command {command} for in {device} device. the available commands for this device is: {available}"
             )
 
         command = devices_data[device][command]

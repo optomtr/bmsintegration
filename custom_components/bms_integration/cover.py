@@ -433,16 +433,34 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
                 )
                 curr_pos = 0 if stopped and closed else (100 if stopped else 50)
 
-            if self._position_inverted:
-                curr_pos = 100 - curr_pos
-
-            self._current_cover_position = curr_pos
+            if curr_pos is None:
+                # The DP is configured but the device has not published it
+                # yet. A Zigbee sub-device behind the X5 sends its datapoints
+                # incrementally after every reconnect, so this is the normal
+                # state for a second or two - and inverting None raised
+                # TypeError right inside the status callback.
+                self.debug("Position DP not reported yet; keeping the last position")
+            else:
+                try:
+                    curr_pos = float(curr_pos)
+                except (TypeError, ValueError):
+                    self.debug("Ignoring non-numeric position %r", curr_pos)
+                else:
+                    if self._position_inverted:
+                        curr_pos = 100 - curr_pos
+                    self._current_cover_position = round(curr_pos)
 
         if (
             self._config[CONF_POSITIONING_MODE] == MODE_TIME_BASED
             and self._state != self._previous_state
         ):
-            if self._previous_state != self._stop_cmd:
+            if self._previous_state is None or self._device.is_connecting:
+                # First status of a (re)connect: there is no previous state to
+                # integrate from, and _timer_start still holds the moment the
+                # entity was created. Integrating that interval drove the
+                # position straight to 0 or 100 on every reconnect.
+                self.debug("Skipping the time-based estimate on the first status")
+            elif self._previous_state != self._stop_cmd:
                 # the state has changed, and the cover was moving
                 time_diff = time.time() - self._timer_start
                 pos_diff = round(time_diff / self._config[CONF_SPAN_TIME] * 100.0)

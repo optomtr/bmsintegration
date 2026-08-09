@@ -53,6 +53,22 @@ class LocalTuyaBinarySensor(LocalTuyaEntity, BinarySensorEntity):
         self._reset_timer: float = self._config.get(CONF_RESET_TIMER, 0)
         self._reset_timer_interval: CALLBACK_TYPE | None = None
 
+    async def async_added_to_hass(self):
+        """Register the one cancel hook this entity will ever need."""
+        await super().async_added_to_hass()
+        # Register the hook ONCE. Passing the live unsub to async_on_remove on
+        # every trigger only appended to Home Assistant's _on_remove list: a
+        # motion sensor that fires a few hundred times a day grew that list
+        # without bound, and every entry but the last was already spent.
+        self.async_on_remove(self._cancel_reset_timer)
+
+    @callback
+    def _cancel_reset_timer(self) -> None:
+        """Cancel a pending off-timer, if any."""
+        if self._reset_timer_interval is not None:
+            self._reset_timer_interval()
+            self._reset_timer_interval = None
+
     @property
     def is_on(self):
         """Return sensor state."""
@@ -70,9 +86,7 @@ class LocalTuyaBinarySensor(LocalTuyaEntity, BinarySensorEntity):
             self._is_on = False
 
         if self._reset_timer and self._is_on:
-            if self._reset_timer_interval is not None:
-                self._reset_timer_interval()
-                self._reset_timer_interval = None
+            self._cancel_reset_timer()
 
             @callback
             def async_reset_state(now):
@@ -86,12 +100,10 @@ class LocalTuyaBinarySensor(LocalTuyaEntity, BinarySensorEntity):
                 self._is_on = False
                 self.async_write_ha_state()
 
+            # The cancel hook was registered once in async_added_to_hass.
             self._reset_timer_interval = async_call_later(
                 self.hass, self._reset_timer, async_reset_state
             )
-            # Cancel a pending reset when the entity is removed, otherwise it
-            # would write state on a dead entity after a reload.
-            self.async_on_remove(self._reset_timer_interval)
 
     # No need to restore state for a sensor
     async def restore_state_when_connected(self):
