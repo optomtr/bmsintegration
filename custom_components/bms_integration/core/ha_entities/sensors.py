@@ -8,8 +8,6 @@
 
 from homeassistant.components.sensor import SensorStateClass, SensorDeviceClass
 from homeassistant.const import (
-    CONCENTRATION_MICROGRAMS_PER_CUBIC_METER,
-    CONCENTRATION_PARTS_PER_MILLION,
     CONF_UNIT_OF_MEASUREMENT,
     DEGREE,
     LIGHT_LUX,
@@ -24,6 +22,21 @@ from homeassistant.const import (
     UnitOfTime,
     UnitOfVolume,
 )
+
+# Home Assistant 2026.8 deprecated the flat CONCENTRATION_* constants in favour
+# of enums, and will remove them in 2027.8. Import the new names where they
+# exist and fall back on older cores, so one file serves both without emitting
+# a deprecation warning on every start.
+try:  # Home Assistant >= 2026.8
+    from homeassistant.const import UnitOfDensity, UnitOfRatio
+
+    CONCENTRATION_MICROGRAMS_PER_CUBIC_METER = UnitOfDensity.MICROGRAMS_PER_CUBIC_METER
+    CONCENTRATION_PARTS_PER_MILLION = UnitOfRatio.PARTS_PER_MILLION
+except ImportError:  # pragma: no cover - older cores have only the constants
+    from homeassistant.const import (  # noqa: F401
+        CONCENTRATION_MICROGRAMS_PER_CUBIC_METER,
+        CONCENTRATION_PARTS_PER_MILLION,
+    )
 
 from .base import (
     DPCode,

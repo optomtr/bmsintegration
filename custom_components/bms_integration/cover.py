@@ -480,6 +480,16 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
         if action == STATE_SET_CMD and position is not None:
             curr_pos = self.current_cover_position
             self._set_new_position = position
+            if curr_pos is None:
+                # The device has not reported a position yet - a cover without a
+                # position DP, or one that has not spoken since startup. The
+                # direction of travel is then unknowable, and guessing it raised
+                # TypeError right out of the set_cover_position service (seen 23
+                # times in a day on a site with 13 curtains). Stay stopped and
+                # let the device's own report settle the state.
+                self._current_state_action = STATE_STOPPED
+                self.schedule_update_ha_state()
+                return
             pos_diff = position - curr_pos
             # Prevent stuck state when interrupted on middle of cmd
             if state == STATE_STOPPED:
