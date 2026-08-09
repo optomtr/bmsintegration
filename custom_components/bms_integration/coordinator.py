@@ -57,6 +57,10 @@ RECONNECT_BACKOFF_SECONDS = (1, 2, 5, 10, 20, 30, 60)
 # broken. A gateway socket carries every sub-device behind it, so a single
 # child that stopped answering must not be able to reconnect the whole hub.
 COMMAND_FAILURES_BEFORE_RESET = 3
+# The cloud is only a helper for key rotation, and a rotated key is rare. Ask
+# at most this often per device so an unreachable device cannot turn into a
+# steady stream of cloud requests.
+CLOUD_KEY_REFRESH_INTERVAL = 3600.0
 AVAILABILITY_REPORT_FILE = "bms_integration_availability.jsonl"
 # The report is a troubleshooting aid, not an archive: rotate it so a
 # flapping device cannot fill the (often SD-card) disk over months.
@@ -72,6 +76,14 @@ GATEWAY_WATCHDOG_FAILURE_THRESHOLD = 2
 # int(): HEARTBEAT_INTERVAL is a float, so "//" yielded a float that never
 # compared equal to the integer offline counter.
 MIN_OFFLINE_EVENTS = int(5 * 60 // HEARTBEAT_INTERVAL)
+# Cap for the reconnect loop's idle poll (waiting for a gateway to come back,
+# or for a sub-device the gateway reports as offline).
+RECONNECT_IDLE_MAX_SECONDS = 30.0
+
+
+def _idle_wait(waits: int) -> float:
+    """Backoff for a reconnect loop that is only waiting on a precondition."""
+    return min(RECONNECT_IDLE_MAX_SECONDS, float(2 ** min(waits - 1, 5)))
 
 
 class HassLocalTuyaData(NamedTuple):
@@ -112,6 +124,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._node_id: str = self._device_config.node_id
         self._subdevice_off_count: int = 0
         self._command_failures: int = 0
+        self._last_key_refresh: float = -CLOUD_KEY_REFRESH_INTERVAL
 
         # last_update_time: Sleep timer, a device that reports the status every x seconds then goes into sleep.
         self._last_update_time = time.monotonic() - 5
@@ -357,7 +370,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 break  # Succeed break while loop
             except asyncio.CancelledError:
                 await self.abort_connect()
-                self._task_connect = None
+                self._clear_connect_task()
                 return
             except OSError as e:
                 await self.abort_connect()
@@ -433,7 +446,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 update_localkey = True
             except asyncio.CancelledError as e:
                 await self.abort_connect()
-                self._task_connect = None
+                self._clear_connect_task()
             except Exception as e:
                 if not (self._fake_gateway and "Not found" in str(e)):
                     e = "Sub device is not connected" if self.is_subdevice else e
@@ -476,7 +489,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                         self.hass, self._async_refresh, timedelta(seconds=scan_inv)
                     )
 
-                self._task_connect = None
+                self._clear_connect_task()
                 self._health_check_failures = 0
                 # Ensure the connected sub-device is in its gateway's sub_devices
                 # and reset offline/absent counters
@@ -526,13 +539,30 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                     self.debug(f"Failed to refresh the local key: {ex}", force=True)
             self._ensure_reconnect_task()
 
-        self._task_connect = None
+        self._clear_connect_task()
+
+    def _clear_connect_task(self) -> None:
+        """Drop the connect-task reference, but only from the task that owns it.
+
+        Both directions of this bookkeeping used to go wrong. A connect
+        attempt that was cancelled cleared the reference of the *live* one
+        that had already replaced it, so `is_connecting` stayed False while a
+        connection was in progress; and a stale reference left behind meant
+        `needs_recovery` never fired, which is precisely the "unavailable
+        until you reload the integration" state.
+        """
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:  # pragma: no cover - no running loop
+            current = None
+        if self._task_connect is None or self._task_connect is current:
+            self._task_connect = None
 
     async def abort_connect(self):
         """Abort the connect process to the interface[device]"""
         if self.is_subdevice:
             self._interface = None
-            self._task_connect = None
+            self._clear_connect_task()
 
         if self._interface is not None:
             await self._interface.close()
@@ -874,6 +904,12 @@ class TuyaDevice(TuyaListener, ContextualLogger):
     async def _async_reconnect(self):
         """Task: continuously attempt to reconnect to the device."""
         attempts = 0
+        # Waiting on a precondition is not a failed attempt, so it must not
+        # move `attempts` (that would corrupt the reconnect report). It must
+        # not spin at 1 Hz for years either: a sub-device that is genuinely
+        # gone kept this loop turning every second for the life of the
+        # installation. Back the idle poll off instead.
+        idle_waits = 0
         try:
             while not self.is_closing:
                 try:
@@ -882,16 +918,19 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                         self.is_subdevice
                         and self._subdevice_off_count >= MIN_OFFLINE_EVENTS
                     ):
-                        await asyncio.sleep(1)
+                        idle_waits += 1
+                        await asyncio.sleep(_idle_wait(idle_waits))
                         continue
 
                     # for sub-devices, if the gateway isn't connected then no need for reconnect.
                     if self.gateway and (
                         not self.gateway.connected or self.gateway.is_connecting
                     ):
-                        await asyncio.sleep(3)
+                        idle_waits += 1
+                        await asyncio.sleep(_idle_wait(idle_waits))
                         continue
 
+                    idle_waits = 0
                     if not self._task_connect:
                         await self.async_connect()
                     if self._task_connect:
@@ -976,6 +1015,15 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         if self._entry.data.get(CONF_NO_CLOUD, True):
             return self.info("Ensure that localkey hasn't changed and it's correct")
 
+        # This runs after every failed connect. The cloud client's forced
+        # refresh interval is shorter than any reconnect backoff, so a device
+        # that is simply switched off produced a cloud request per attempt -
+        # around a thousand a day, for as long as it stayed off.
+        now = time.monotonic()
+        if (now - self._last_key_refresh) < CLOUD_KEY_REFRESH_INTERVAL:
+            return self.debug("Skipping the cloud key refresh: asked recently")
+        self._last_key_refresh = now
+
         self.info(f"Trying to update local-key...")
         dev_id = self._device_config.id
         cloud_api = self._hass_entry.cloud_data
@@ -1042,10 +1090,18 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             # - We want only to update if status changed except for 1 DP trigger, for scene controls.
             if len(self._interface.dispatched_dps) == 1:
                 dp, value = next(iter(self._interface.dispatched_dps.items()))
-                data = {"dp": dp, "value": value}
+                data = {"dp": dp, "value": value}  # scalars: safe to publish
                 fire_event(event_device_dp_triggered, data)
             if old_status != new_status:
-                data = {"old_status": old_status, "new_status": new_status}
+                # Snapshot both sides. old_status IS self._status and
+                # new_status IS the protocol's live cache bucket for this cid,
+                # and both are mutated immediately after this call - an
+                # automation reading the event later saw old_status equal to
+                # new_status and could never tell what had changed.
+                data = {
+                    "old_status": dict(old_status),
+                    "new_status": dict(new_status),
+                }
                 fire_event(event_status_update, data)
 
     def _get_gateway(self):

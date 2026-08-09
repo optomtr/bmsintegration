@@ -221,7 +221,18 @@ class BmsControlCenter extends HTMLElement {
     try {
       const jobs = [this.ws("overview").then((r) => (this.d.overview = r))];
       if (sc === "map")
-        jobs.push(this.ws("topology").then((r) => { if (onScreen()) this.d.topology = r; }));
+        jobs.push(this.ws("topology").then((r) => {
+          if (!onScreen()) return;
+          this.d.topology = r;
+          // Отбрасываем свёрнутые узлы, которых больше нет: за недели работы
+          // вкладки набор копил идентификаторы удалённых устройств.
+          if (this.s.collapsed.size) {
+            const alive = new Set();
+            const walk = (n) => { alive.add(n.id); (n.children || []).forEach(walk); };
+            (r.tree || []).forEach(walk);
+            this.s.collapsed = new Set([...this.s.collapsed].filter((id) => alive.has(id)));
+          }
+        }));
       if (sc === "device" && devId)
         jobs.push(this.ws("device", { device_id: devId })
           .then((r) => { if (this.s.deviceId === devId) this.d.device = r; })
@@ -352,7 +363,16 @@ class BmsControlCenter extends HTMLElement {
       overview: () => this.vOverview(), map: () => this.vMap(), device: () => this.vDevice(),
       add: () => this.vAdd(), events: () => this.vEvents(), settings: () => this.vSettings(),
     }[this.s.screen];
-    main.innerHTML = view ? view() : "";
+    try {
+      main.innerHTML = view ? view() : "";
+    } catch (err) {
+      // paint() runs outside refresh()'s try/catch. A view that trips over an
+      // unexpected shape from the backend used to leave the panel frozen on
+      // its last frame with nothing on screen to say why.
+      main.innerHTML = `<div class="pad"><div class="card err">${icon("i-alert", 15, C.bad)}
+        Ошибка отображения: ${esc(err?.message || String(err))}</div></div>`;
+      return;
+    }
     if (silent) {
       main.scrollTop = scroll;
       if (main.parentElement) main.parentElement.scrollTop = outerScroll;
@@ -1053,11 +1073,23 @@ class BmsControlCenter extends HTMLElement {
       return;
     }
     if (a === "export") {
-      const blob = new Blob([JSON.stringify(this.d.report?.entries || [], null, 2)], { type: "application/json" });
+      // Кнопка обещает «redacted» — значит адреса и идентификаторы устройств
+      // в файл не попадают: такие выгрузки прикладывают к обращениям.
+      const entries = (this.d.report?.entries || []).map((e) => {
+        const { host, device_id, node_id, gateway_id, ...safe } = e;
+        return safe;
+      });
+      const blob = new Blob([JSON.stringify(entries, null, 2)], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
-      link.href = url; link.download = "bms-events.json"; link.click();
-      URL.revokeObjectURL(url);
+      link.href = url;
+      link.download = "bms-events.json";
+      // Anchor must be in the document and the URL must outlive the click,
+      // or Firefox and older WebKit never start the download.
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
       return this.toast("Файл событий сохранён");
     }
 

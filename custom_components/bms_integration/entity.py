@@ -22,7 +22,7 @@ from homeassistant.const import (
     STATE_UNKNOWN,
     ATTR_VIA_DEVICE,
 )
-from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceInfo, async_get as async_get_dev_reg
 from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
     async_dispatcher_send,
@@ -244,7 +244,14 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
             sw_version=device_config.protocol_version,
         )
         if self._device.is_subdevice and self._device.id != self._device.gateway.id:
-            device_info[ATTR_VIA_DEVICE] = (DOMAIN, f"local_{self._device.gateway.id}")
+            # Only claim a parent that actually exists. Nothing registers a
+            # device directly - a registry entry appears because an entity
+            # declares it - so a hub whose datapoints are cloud-only has no
+            # entities and therefore no registry entry, and pointing at it
+            # left every child orphaned in the device tree.
+            gateway_id = (DOMAIN, f"local_{self._device.gateway.id}")
+            if async_get_dev_reg(self.hass).async_get_device(identifiers={gateway_id}):
+                device_info[ATTR_VIA_DEVICE] = gateway_id
         return device_info
 
     @property

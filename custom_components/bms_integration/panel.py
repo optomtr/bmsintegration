@@ -138,7 +138,15 @@ def _async_setup_log_buffer(hass: HomeAssistant, domain_data: dict) -> None:
     buffer: deque = deque(maxlen=LOG_BUFFER_SIZE)
     handler = _RingLogHandler(buffer)
     handler.setFormatter(logging.Formatter("%(message)s"))
-    logging.getLogger(f"custom_components.{DOMAIN}").addHandler(handler)
+    logger = logging.getLogger(f"custom_components.{DOMAIN}")
+    logger.addHandler(handler)
+    # A handler's level is irrelevant if the logger drops the record first:
+    # Logger.debug() short-circuits on the effective level, so the panel's
+    # DEBUG filter could never match anything on a default install. Lift the
+    # logger to INFO at least - debug still requires the user to ask for it in
+    # configuration.yaml, which is what makes a per-device trace readable.
+    if logger.getEffectiveLevel() > logging.INFO:
+        logger.setLevel(logging.INFO)
     domain_data[DATA_LOG_BUFFER] = buffer
     domain_data[DATA_LOG_HANDLER] = handler
 

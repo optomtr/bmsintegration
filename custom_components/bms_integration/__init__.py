@@ -39,6 +39,7 @@ from .panel import async_remove_panel, async_setup_panel
 from .websocket import async_register_websocket_api
 from .const import (
     ATTR_UPDATED_AT,
+    CONF_FRIENDLY_NAME,
     CONF_GATEWAY_ID,
     CONF_NODE_ID,
     CONF_NO_CLOUD,
@@ -62,6 +63,15 @@ STARTUP_RECOVERY_STAGGER_SECONDS = 0.3
 # Minimum time between two discovery-driven address changes of one device.
 # Each change reloads the whole config entry, so flapping must be damped.
 DISCOVERY_UPDATE_COOLDOWN = 60.0
+# An address change costs a full config-entry reload, so confirm it over
+# several broadcasts (they arrive about every 5 s) before believing it.
+DISCOVERY_ADDRESS_CONFIRMATIONS = 3
+# Two hosts claiming one device id - a cloned device, a dual-homed gateway, a
+# spoofed datagram - make the address oscillate. Rate limiting only slows that
+# to one reload a minute, forever. After this many changes inside the window,
+# stop following the address and say so: the device needs a static lease.
+DISCOVERY_FLAP_LIMIT = 5
+DISCOVERY_FLAP_WINDOW = 3600.0
 
 SERVICE_SET_DP = "set_dp"
 SERVICE_UPDATE_DPS = "update_dps"
@@ -87,6 +97,9 @@ async def async_setup(hass: HomeAssistant, config: dict):
     device_cache = {}
     # device_id -> monotonic timestamp of the last address change applied.
     _last_ip_update: dict[str, float] = {}
+    _address_confirmations: dict[str, tuple[str, int]] = {}
+    _address_history: dict[str, list[float]] = {}
+    _address_frozen: set[str] = set()
 
     async def _handle_reload(service: ServiceCall):
         """Handle reload service call."""
@@ -140,6 +153,58 @@ async def async_setup(hass: HomeAssistant, config: dict):
         except Exception as ex:  # pylint: disable=broad-except
             raise HomeAssistantError(f"Failed to request DPS update: {ex}") from ex
 
+    def _address_change_ok(device_id: str, device_ip: str) -> bool:
+        """Decide whether to follow a device to a new address.
+
+        Every address change reloads the whole config entry and drops every
+        connection in it, so this is deliberately conservative: confirm the
+        new address over several broadcasts, keep the existing rate limit,
+        and stop following a device whose address keeps flipping rather than
+        reloading the entry once a minute for the rest of the installation's
+        life.
+        """
+        now = time.monotonic()
+        if device_id in _address_frozen:
+            return False
+
+        seen_ip, count = _address_confirmations.get(device_id, ("", 0))
+        count = count + 1 if seen_ip == device_ip else 1
+        _address_confirmations[device_id] = (device_ip, count)
+        if count < DISCOVERY_ADDRESS_CONFIRMATIONS:
+            return False
+
+        last_update = _last_ip_update.get(device_id)
+        if last_update is not None and (now - last_update) < DISCOVERY_UPDATE_COOLDOWN:
+            _LOGGER.debug(
+                "Ignoring address change for %s to %s: updated %.0fs ago",
+                device_id,
+                device_ip,
+                now - last_update,
+            )
+            return False
+
+        history = [
+            at
+            for at in _address_history.get(device_id, [])
+            if now - at < DISCOVERY_FLAP_WINDOW
+        ]
+        if len(history) >= DISCOVERY_FLAP_LIMIT:
+            _address_frozen.add(device_id)
+            _LOGGER.error(
+                "Адрес устройства %s менялся %d раз за час — больше не следим "
+                "за ним автоматически. Задайте устройству постоянный адрес "
+                "(резервирование в роутере) и перезагрузите интеграцию.",
+                device_id,
+                len(history),
+            )
+            return False
+
+        history.append(now)
+        _address_history[device_id] = history
+        _last_ip_update[device_id] = now
+        _address_confirmations.pop(device_id, None)
+        return True
+
     def _device_discovered(device: dict):
         """Update address of device if it has changed."""
         device_ip = device["ip"]
@@ -178,41 +243,44 @@ async def async_setup(hass: HomeAssistant, config: dict):
         if not entry.state == ConfigEntryState.LOADED:
             return
 
-        new_data = copy.deepcopy(dict(entry.data))
-        updated = False
+        # Work out what would change before copying anything. This runs on
+        # every datagram - roughly every 5 s per device, on two ports - and
+        # deep copying 49 device configs each time only to discard the copy
+        # was pure waste.
+        changes: dict[str, dict[str, str]] = {}
         for dev_id, host in device_cache[device_id].items():
             if dev_id not in entry.data[CONF_DEVICES]:
                 continue
             dev_entry = entry.data[CONF_DEVICES][dev_id]
+            dev_changes = {}
             if host != device_ip:
-                updated = True
-                new_data[CONF_DEVICES][dev_id][CONF_HOST] = device_ip
-                device_cache[device_id][dev_id] = device_ip
-
+                dev_changes[CONF_HOST] = device_ip
             if (p_key := dev_entry.get(CONF_PRODUCT_KEY)) and p_key != product_key:
-                updated = True
-                new_data[CONF_DEVICES][dev_id][CONF_PRODUCT_KEY] = product_key
+                dev_changes[CONF_PRODUCT_KEY] = product_key
+            if dev_changes:
+                changes[dev_id] = dev_changes
+
         # Update settings if something changed, otherwise try to connect. Updating
         # settings triggers a reload of the config entry, which tears down the device
         # so no need to connect in that case.
-        if not updated:
+        if not changes:
+            _address_confirmations.pop(device_id, None)
             return
 
-        # Rate limit: two hosts claiming the same gwId (a cloned device, a
-        # spoofed broadcast, a dual-homed gateway) used to flip the address
-        # back and forth, and every flip reloaded the whole config entry -
-        # dropping the connection of every device in it.
-        now = time.monotonic()
-        last_update = _last_ip_update.get(device_id)
-        if last_update is not None and (now - last_update) < DISCOVERY_UPDATE_COOLDOWN:
-            _LOGGER.debug(
-                "Ignoring address change for %s to %s: updated %.0fs ago",
-                device_id,
-                device_ip,
-                now - last_update,
-            )
+        if any(CONF_HOST in c for c in changes.values()) and not _address_change_ok(
+            device_id, device_ip
+        ):
             return
-        _last_ip_update[device_id] = now
+
+        new_data = copy.deepcopy(dict(entry.data))
+        for dev_id, dev_changes in changes.items():
+            new_data[CONF_DEVICES][dev_id].update(dev_changes)
+            # Only now that the change is really being applied may the cache
+            # record it. Writing it before the checks above meant a suppressed
+            # change was dropped for good instead of retried: the next
+            # broadcast compared against an address we never wrote.
+            if CONF_HOST in dev_changes:
+                device_cache[device_id][dev_id] = device_ip
 
         _LOGGER.debug(
             "Updating keys for device %s: %s %s", device_id, device_ip, product_key
@@ -421,6 +489,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
             # Parent Devices.
             if not (node_id := config.get(CONF_NODE_ID)):
+                if (clash := devices.get(host)) is not None:
+                    # Two configured devices claim the same address - usually a
+                    # DHCP lease that moved onto an address another device is
+                    # configured with. The dict is keyed by host, so the second
+                    # object simply replaced the first, and from then on the
+                    # first device's entities sent their commands to the second
+                    # device's hardware. Keep whoever got there first and say
+                    # plainly which device is parked and why.
+                    _LOGGER.error(
+                        "Устройство %s настроено на адрес %s, уже занятый "
+                        "устройством %s: оно не будет запущено. Задайте "
+                        "устройствам разные адреса.",
+                        config.get(CONF_FRIENDLY_NAME) or dev_id,
+                        host,
+                        clash.id,
+                    )
+                    continue
                 devices[host] = (dev := TuyaDevice(hass, entry, config))
                 connect_to_devices.append(dev)
                 continue

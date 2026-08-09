@@ -81,8 +81,18 @@ class templates:
             config_name + ".yaml" if not config_name.endswith(".yaml") else config_name
         )
         fname = fname.replace(" ", "_")
+        # config_name is the device's friendly name, i.e. free text typed in
+        # the config flow. Keep the write inside the templates directory: a
+        # name like "../../configuration" would otherwise pick the path.
+        fname = os.path.basename(fname)
+        if not fname or fname in (".yaml", "..yaml"):
+            raise ValueError(f"Invalid template name: {config_name!r}")
         template_dir = os.path.dirname(templates_dir.__file__)
         template_file = os.path.join(template_dir, fname)
+        if os.path.dirname(os.path.realpath(template_file)) != os.path.realpath(
+            template_dir
+        ):
+            raise ValueError(f"Invalid template name: {config_name!r}")
 
         cls.yaml_dump(export_config, template_file)
 

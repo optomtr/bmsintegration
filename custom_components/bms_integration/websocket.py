@@ -135,7 +135,9 @@ def _dps_values(device: TuyaDevice | None) -> dict:
     return dict(device._status or {})
 
 
-def _device_rows(hass: HomeAssistant) -> list[dict[str, Any]]:
+def _device_rows(
+    hass: HomeAssistant, with_entities: bool = True
+) -> list[dict[str, Any]]:
     """Describe every configured device, with its live connection state."""
     dev_reg = dr.async_get(hass)
     ent_reg = er.async_get(hass)
@@ -237,7 +239,10 @@ def _device_rows(hass: HomeAssistant) -> list[dict[str, Any]]:
                     "area_id": area_id,
                     "area_name": area.name if area else None,
                     "entity_count": len(entities),
-                    "entities": entities,
+                    # The overview renders counts only. Shipping a few hundred
+                    # entity objects with it every 6 seconds, for months, is
+                    # bandwidth and JSON work nobody looks at.
+                    "entities": entities if with_entities else [],
                     "dps_count": len(_dps_values(device)),
                 }
             )
@@ -316,7 +321,7 @@ def _read_report(hass: HomeAssistant, limit: int, device_id: str | None) -> list
 @callback
 def ws_overview(hass: HomeAssistant, connection, msg: dict) -> None:
     """Every device with its live state, plus the health summary."""
-    rows = _device_rows(hass)
+    rows = _device_rows(hass, with_entities=False)
     entries = []
     for entry_id, _data in _entries(hass):
         entry = hass.config_entries.async_get_entry(entry_id)
@@ -636,8 +641,19 @@ async def ws_action(hass: HomeAssistant, connection, msg: dict) -> None:
     started = time.monotonic()
     try:
         if msg["action"] == "reconnect":
-            await target.async_recover("panel request")
-            detail = "Переподключение запущено"
+            if not target.needs_recovery:
+                # async_recover is a no-op unless the device is disconnected
+                # with no task running; reporting success either way told the
+                # operator a device sitting in its 60 s backoff had just been
+                # reconnected.
+                detail = (
+                    "Устройство уже на связи"
+                    if target.connected
+                    else "Переподключение уже идёт"
+                )
+            else:
+                await target.async_recover("panel request")
+                detail = "Переподключение запущено"
         elif msg["action"] == "status_test":
             if target._interface is None:
                 raise RuntimeError("нет соединения с устройством")
@@ -666,14 +682,34 @@ async def ws_action(hass: HomeAssistant, connection, msg: dict) -> None:
 @websocket_api.async_response
 async def ws_reload(hass: HomeAssistant, connection, msg: dict) -> None:
     """Reload one config entry, or every entry of this integration."""
-    entry_ids = (
-        [msg["entry_id"]]
-        if msg.get("entry_id")
-        else [entry_id for entry_id, _ in _entries(hass)]
-    )
+    ours = [entry_id for entry_id, _ in _entries(hass)]
+    if requested := msg.get("entry_id"):
+        # Never reload another integration's entry just because a client asked.
+        if requested not in ours:
+            connection.send_error(
+                msg["id"], "not_found", "Запись не принадлежит этой интеграции"
+            )
+            return
+        entry_ids = [requested]
+    else:
+        entry_ids = ours
+
+    failed = []
     for entry_id in entry_ids:
-        await hass.config_entries.async_reload(entry_id)
-    connection.send_result(msg["id"], {"ok": True, "reloaded": len(entry_ids)})
+        try:
+            await hass.config_entries.async_reload(entry_id)
+        except Exception as ex:  # noqa: BLE001 - report, do not abort the rest
+            _LOGGER.warning("Перезагрузка записи %s не удалась: %s", entry_id, ex)
+            failed.append(entry_id)
+
+    connection.send_result(
+        msg["id"],
+        {
+            "ok": not failed,
+            "reloaded": len(entry_ids) - len(failed),
+            "failed": len(failed),
+        },
+    )
 
 
 @websocket_api.websocket_command(
@@ -699,12 +735,19 @@ async def ws_set_dp(hass: HomeAssistant, connection, msg: dict) -> None:
     raw = msg["value"]
     if isinstance(raw, str):
         # The panel sends what the operator typed; accept the obvious literals
-        # so a boolean datapoint does not receive the string "true".
+        # so a boolean datapoint does not receive the string "true". Anything
+        # that does not parse stays a string - "--5" passed the old isdigit()
+        # test and then raised ValueError out of the handler.
         lowered = raw.strip().lower()
         if lowered in ("true", "false"):
             raw = lowered == "true"
-        elif lowered.lstrip("-").isdigit():
-            raw = int(lowered)
+        else:
+            for cast in (int, float):
+                try:
+                    raw = cast(lowered)
+                    break
+                except ValueError:
+                    continue
 
     _LOGGER.warning(
         "Экспертная запись DP: устройство %s, DP %s = %r (пользователь %s)",

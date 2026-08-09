@@ -139,6 +139,11 @@ TIMEOUT_REPLY = 5
 # fixed subset of devices flap-disconnect every 2 heartbeats on a busy gateway.
 SUBDEVICE_ABSENT_CYCLES = 2
 
+# How long an identical INFO message is demoted to debug before it is written
+# at INFO again. Long enough that a permanent fault cannot flood the log,
+# short enough that the fault stays visible to whoever reads it.
+INFO_REPEAT_SECONDS = 3600
+
 # DPS that are known to be safe to use with update_dps (0x12) command
 UPDATE_DPS_WHITELIST = [18, 19, 20]  # Socket (Wi-Fi)
 
@@ -222,6 +227,8 @@ class ContextualLogger:
         self._enable_debug = False
 
         self._last_warning = ""
+        self._last_info = ""
+        self._last_info_at = 0.0
 
     def set_logger(self, logger, device_id, enable_debug=False, name=None):
         """Set base logger to use."""
@@ -238,10 +245,25 @@ class ContextualLogger:
         return self._logger.log(logging.DEBUG, msg, *args)
 
     def info(self, msg, *args, clear_warning=False):
-        """Info level log. clear_warning to re-enable warnings msgs if duplicated"""
+        """Info level log. clear_warning to re-enable warnings msgs if duplicated.
+
+        An exact repeat is demoted to debug for a while. A permanent fault -
+        a device that is simply gone, a gateway whose key was rotated - hits
+        the same INFO line on every reconnect attempt, i.e. once a minute for
+        as long as it lasts; over a year of an unattended installation that
+        alone writes gigabytes into home-assistant.log. Repeating it hourly is
+        enough to keep the fault visible.
+        """
         if clear_warning:
             self._last_warning = ""
+            self._last_info = ""
 
+        now = time.monotonic()
+        if msg == self._last_info and (now - self._last_info_at) < INFO_REPEAT_SECONDS:
+            return self._logger.log(logging.DEBUG, msg, *args)
+
+        self._last_info = msg
+        self._last_info_at = now
         return self._logger.log(logging.INFO, msg, *args)
 
     def warning(self, msg, *args):
@@ -1238,14 +1260,19 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
                 payload = cipher.decrypt(payload, False, decode_text=False)
             except Exception as ex:
                 self.debug(
-                    "session key step 2 decrypt failed, payload=%r with len:%d (%s)",
-                    payload,
+                    "session key step 2 decrypt failed, %d bytes (%s)",
                     len(payload),
                     ex,
                 )
                 return False
 
-        self.debug("decrypted session key negotiation step 2: payload=%r", payload)
+        # Invariant: session-key material never reaches the log. This payload
+        # is remote_nonce || HMAC(local_key, local_nonce), and local_nonce is
+        # a hardcoded constant - printing it hands anyone with the log an
+        # offline oracle against the device's local key.
+        self.debug(
+            "decrypted session key negotiation step 2: %d bytes", len(payload)
+        )
 
         if len(payload) < 48:
             self.debug("session key negotiation step 2 failed, too short response")
@@ -1255,11 +1282,9 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         hmac_check = hmac.new(self.local_key, self.local_nonce, sha256).digest()
 
         if hmac_check != payload[16:48]:
-            self.debug(
-                "session key negotiation step 2 failed HMAC check! wanted=%r but got=%r",
-                binascii.hexlify(hmac_check),
-                binascii.hexlify(payload[16:48]),
-            )
+            # Only that it failed - the expected HMAC is derived from the
+            # local key and must not be written anywhere.
+            self.debug("session key negotiation step 2 failed the HMAC check")
             # The peer failed to prove knowledge of the local key: negotiating
             # further would silently derive a garbage session key.
             return False

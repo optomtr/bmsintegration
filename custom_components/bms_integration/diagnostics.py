@@ -47,7 +47,18 @@ async def async_get_config_entry_diagnostics(
             if ob := data[CLOUD_DEVICES][dev_id].get(obf):
                 data[CLOUD_DEVICES][dev_id][obf] = obfuscate(ob, obf_len, obf_len)
     if discovery := hass.data[DOMAIN].get(DATA_DISCOVERY):
-        data["Discovered_Devices"] = discovery.devices
+        # The discovery table is a full map of the LAN - every Tuya device on
+        # it, with its address and key material fields. Diagnostics dumps are
+        # attached to public issues, so give it the same treatment the cloud
+        # device list already gets a few lines above.
+        discovered = copy.deepcopy(discovery.devices)
+        for found in discovered.values():
+            if not isinstance(found, dict):
+                continue
+            for obf, obf_len in DATA_OBFUSCATE.items():
+                if value := found.get(obf):
+                    found[obf] = obfuscate(value, obf_len, obf_len)
+        data["Discovered_Devices"] = discovered
     return data
 
 
