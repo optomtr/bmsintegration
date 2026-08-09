@@ -258,8 +258,10 @@ async def test_subdev_chunked_query():
         """Один цикл опроса: кадры ответа, затем оценка на границе цикла."""
         for f in frames:
             proto._msg_subdevs_query({"data": f})
-            if proto._sub_devs_query_task:
-                await proto._sub_devs_query_task
+            # Every frame of a cycle starts its own dispatch task; all of them
+            # must be awaited, not just the most recent one.
+            if proto._sub_devs_query_tasks:
+                await asyncio.gather(*list(proto._sub_devs_query_tasks))
         proto._evaluate_subdevices_cycle()
 
     # Цикл 1: A в кадре 1, B в кадре 2, D — только nearby, C не упомянут.
@@ -294,6 +296,15 @@ async def test_subdev_chunked_query():
     # offline из кадра доставляется немедленно.
     await cycle([{"online": ["cidA"], "offline": ["cidB"], "nearby": ["cidD", "cidC"]}])
     check("offline из кадра доставляется сразу", subs["cidB"].states[-1] == OFFLINE)
+
+    # Каждый кадр цикла запускает свою задачу: раньше следующий кадр затирал
+    # ссылку, и предыдущую задачу мог собрать сборщик мусора на полпути.
+    proto._msg_subdevs_query({"data": {"online": ["cidA"]}})
+    proto._msg_subdevs_query({"data": {"online": ["cidB"]}})
+    check("задачи всех кадров удерживаются", len(proto._sub_devs_query_tasks) == 2,
+          f"tasks={len(proto._sub_devs_query_tasks)}")
+    await asyncio.gather(*list(proto._sub_devs_query_tasks))
+    check("завершённые задачи убираются из набора", proto._sub_devs_query_tasks == set())
 
     # clean_up_session сбрасывает аккумулятор.
     proto._subdev_absent_cycles["cidC"] = 5

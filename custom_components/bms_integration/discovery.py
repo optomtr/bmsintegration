@@ -57,6 +57,12 @@ def decrypt_udp(message):
     return decrypt(message, UDP_KEY)
 
 
+# Rebinding a UDP listener usually fails only while the interface is still
+# coming back, so retry patiently rather than giving up on the first refusal.
+RESTART_BACKOFF_SECONDS = (1, 5, 15, 30, 60)
+RESTART_MAX_ATTEMPTS = 30
+
+
 class TuyaDiscovery(asyncio.DatagramProtocol):
     """Datagram handler listening for Tuya broadcast messages."""
 
@@ -65,6 +71,8 @@ class TuyaDiscovery(asyncio.DatagramProtocol):
         self.devices = {}
         self._listeners = []
         self._callback = callback
+        self._closing = False
+        self._restart_task: asyncio.Task | None = None
 
     async def start(self):
         """Start discovery by listening to broadcasts."""
@@ -91,13 +99,66 @@ class TuyaDiscovery(asyncio.DatagramProtocol):
             raise errors[0]
 
         self._listeners = opened
+        self._closing = False
         _LOGGER.debug("Listening to broadcasts on UDP port 6666, 6667")
 
     def close(self):
         """Stop discovery."""
+        self._closing = True
         self._callback = None
+        if self._restart_task is not None:
+            self._restart_task.cancel()
+            self._restart_task = None
         for transport, _ in self._listeners:
             transport.close()
+        self._listeners = []
+
+    def error_received(self, exc):
+        """A datagram error is not a reason to stop listening."""
+        _LOGGER.debug("Discovery socket error: %s", exc)
+
+    def connection_lost(self, exc):
+        """Rebind after the endpoint dies.
+
+        This object is created once and closed only when Home Assistant stops.
+        Without this, an endpoint that died - an interface going down, the
+        address being taken over - left discovery silently deaf for the rest
+        of the run: no address change would ever be noticed again.
+        """
+        if self._closing or self._restart_task is not None:
+            return
+        _LOGGER.warning("Обнаружение устройств прервано (%s), перезапускаю", exc)
+        self._restart_task = asyncio.get_running_loop().create_task(self._restart())
+
+    async def _restart(self):
+        """Reopen the listeners, backing off while the bind keeps failing."""
+        delay = RESTART_BACKOFF_SECONDS[0]
+        try:
+            for transport, _ in self._listeners:
+                transport.close()
+            self._listeners = []
+            for attempt in range(RESTART_MAX_ATTEMPTS):
+                await asyncio.sleep(delay)
+                if self._closing:
+                    return
+                try:
+                    await self.start()
+                except Exception as ex:  # pylint: disable=broad-except
+                    delay = RESTART_BACKOFF_SECONDS[
+                        min(attempt + 1, len(RESTART_BACKOFF_SECONDS) - 1)
+                    ]
+                    _LOGGER.debug("Discovery restart failed (%s), retrying", ex)
+                    continue
+                _LOGGER.info("Обнаружение устройств восстановлено")
+                return
+            _LOGGER.error(
+                "Не удалось восстановить обнаружение устройств. Смена адресов "
+                "не будет замечена до перезапуска Home Assistant."
+            )
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._restart_task = None
 
     def datagram_received(self, data, addr):
         """Handle received broadcast message."""

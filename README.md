@@ -101,7 +101,12 @@ the license text.
 - The panel escapes every value it renders, ignores a late answer for a device
   the operator has navigated away from, keeps focus and scroll during its
   background refresh, and stops polling while the tab is hidden.
-- The `set_dp` and `reload` services are admin-only, matching the panel.
+- The `set_dp` and `reload` services are admin-only, matching the panel, and
+  answer with a readable error instead of a bare `KeyError` when the device or
+  its entry is gone.
+- UDP discovery rebinds itself if its socket dies. It used to be opened once
+  and never checked, so a listener that died left the installation unable to
+  notice an address change for the rest of the run.
 - Dispatcher signals and remote storage/service domain use the BMS Integration domain.
 
 ## Install

@@ -17,6 +17,7 @@ python3 tests/test_protocol.py        # pytuya framing, crypto, payloads
 python3 tests/test_coordinator.py     # TuyaDevice reconnect/watchdog logic
 python3 tests/test_platform_logic.py  # entity and platform level behaviour
 python3 tests/test_panel_api.py       # panel + websocket privileged surface
+python3 tests/test_discovery.py       # UDP input handling and socket recovery
 ```
 
 `run_all.py` discovers `test_*.py` rather than listing the suites, so a new
@@ -42,6 +43,10 @@ was silently never executed.
   command rollback, and the platform defects found by the audit (lock
   direction, alarm feature flags, water heater and vacuum crashes, base64
   sensor decoding, and others).
+- `test_discovery.py` — the only component that parses input from anything on
+  the LAN: malformed datagrams cannot raise out of the endpoint, the device
+  cache is bounded, and a listener that dies rebinds itself instead of leaving
+  discovery deaf until Home Assistant restarts.
 - `test_panel_api.py` — the only surface a browser can reach: every registered
   WebSocket command requires admin and declares a schema, raw datapoint writes
   are audited, no secret reaches the frontend, the panel registers once per

@@ -572,7 +572,11 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         self.listener = weakref.ref(listener)
         self.dispatcher = self._setup_dispatcher()
         self.heartbeater: asyncio.Task | None = None
-        self._sub_devs_query_task: asyncio.Task | None = None
+        # One poll cycle arrives as several frames, and each frame starts its
+        # own dispatch task. A single reference was clobbered by the next
+        # frame, leaving earlier tasks unreferenced - free to be collected
+        # mid-flight, and with their exceptions never retrieved.
+        self._sub_devs_query_tasks: set[asyncio.Task] = set()
         # Sub-device online poll is aggregated across all frames of one cycle.
         # _subdev_seen_cids collects every cid named in any frame of the current
         # cycle; _subdev_absent_cycles counts consecutive full-cycle misses per
@@ -658,10 +662,10 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
                         device.subdevice_state_updated(SubdeviceState.OFFLINE)
             except asyncio.CancelledError:
                 pass
-            finally:
-                self._sub_devs_query_task = None
 
-        self._sub_devs_query_task = self.loop.create_task(_action(on_devs, off_devs))
+        task = self.loop.create_task(_action(on_devs, off_devs))
+        self._sub_devs_query_tasks.add(task)
+        task.add_done_callback(self._sub_devs_query_tasks.discard)
 
     def _evaluate_subdevices_cycle(self):
         """Decide ABSENT for the cycle that just ended, then start a new one.
@@ -857,8 +861,10 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         if self.heartbeater:
             await self.heartbeater
 
-        if self._sub_devs_query_task:
-            await self._sub_devs_query_task
+        if self._sub_devs_query_tasks:
+            await asyncio.gather(
+                *list(self._sub_devs_query_tasks), return_exceptions=True
+            )
 
     def clean_up_session(self):
         """Clean up session."""
@@ -876,8 +882,8 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         if self.heartbeater:
             self.heartbeater.cancel()
 
-        if self._sub_devs_query_task:
-            self._sub_devs_query_task.cancel()
+        for task in list(self._sub_devs_query_tasks):
+            task.cancel()
 
         if self.is_connected:
             self.transport.close()

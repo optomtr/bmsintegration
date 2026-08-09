@@ -90,6 +90,31 @@ SERVICE_UPDATE_DPS_SCHEMA = vol.Schema(
 )
 
 
+def _device_for_service(hass: HomeAssistant, entry: ConfigEntry, dev_id: str):
+    """Resolve a device for a service call, or say what is missing.
+
+    Every lookup here used to be unguarded, so calling a service for a device
+    whose entry is unloaded, or that was removed from the entry, raised a bare
+    KeyError at the caller instead of something an automation author can read.
+    """
+    config = (entry.data.get(CONF_DEVICES) or {}).get(dev_id)
+    if not config:
+        raise HomeAssistantError(f"device {dev_id} is not in this config entry")
+
+    host = config.get(CONF_HOST)
+    if node_id := config.get(CONF_NODE_ID):
+        host = f"{host}_{node_id}"
+
+    entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if entry_data is None:
+        raise HomeAssistantError(f"config entry {entry.title} is not loaded")
+
+    device = entry_data.devices.get(host)
+    if device is None:
+        raise HomeAssistantError(f"device {dev_id} has no running connection")
+    return device
+
+
 async def async_setup(hass: HomeAssistant, config: dict):
     """Set up the LocalTuya integration component."""
     hass.data.setdefault(DOMAIN, {})
@@ -120,10 +145,7 @@ async def async_setup(hass: HomeAssistant, config: dict):
         if not entry or not entry.entry_id:
             raise HomeAssistantError("unknown device id")
 
-        host = entry.data[CONF_DEVICES][dev_id].get(CONF_HOST)
-        if node_id := entry.data[CONF_DEVICES][dev_id].get(CONF_NODE_ID):
-            host = f"{host}_{node_id}"
-        device: TuyaDevice = hass.data[DOMAIN][entry.entry_id].devices[host]
+        device = _device_for_service(hass, entry, dev_id)
         if not device.connected:
             raise HomeAssistantError("not connected to device")
         value = event.data[CONF_VALUE]
@@ -139,10 +161,7 @@ async def async_setup(hass: HomeAssistant, config: dict):
         if not entry or not entry.entry_id:
             raise HomeAssistantError("unknown device id")
 
-        host = entry.data[CONF_DEVICES][dev_id].get(CONF_HOST)
-        if node_id := entry.data[CONF_DEVICES][dev_id].get(CONF_NODE_ID):
-            host = f"{host}_{node_id}"
-        device: TuyaDevice = hass.data[DOMAIN][entry.entry_id].devices[host]
+        device = _device_for_service(hass, entry, dev_id)
         if not device.connected:
             raise HomeAssistantError("not connected to device")
 
@@ -785,15 +804,25 @@ def _run_async_listen(hass: HomeAssistant, entry: ConfigEntry):
 
         device_registry = dr.async_get(hass).async_get(event.data["device_id"])
 
-        if not device_registry.disabled:
+        if device_registry is None or not device_registry.disabled:
             return
 
-        hass_localtuya: HassLocalTuyaData = hass.data[DOMAIN][entry.entry_id]
+        # A registry entry can still carry this config entry after the device
+        # was removed from it, and the entry itself may be mid-unload. Neither
+        # is worth a KeyError traceback on the event bus.
+        hass_localtuya: HassLocalTuyaData | None = hass.data.get(DOMAIN, {}).get(
+            entry.entry_id
+        )
+        if hass_localtuya is None:
+            return
 
         dev_id = _device_id_by_identifiers(device_registry.identifiers)
-        host_ip = entry.data[CONF_DEVICES][dev_id][CONF_HOST]
+        config = (entry.data.get(CONF_DEVICES) or {}).get(dev_id)
+        if not config:
+            return
 
-        if cid := entry.data[CONF_DEVICES][dev_id].get(CONF_NODE_ID):
+        host_ip = config.get(CONF_HOST)
+        if cid := config.get(CONF_NODE_ID):
             host_ip = f"{host_ip}_{cid}"
 
         device = hass_localtuya.devices.get(host_ip)

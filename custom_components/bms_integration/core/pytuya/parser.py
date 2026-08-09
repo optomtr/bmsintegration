@@ -10,6 +10,10 @@ from .cipher import AESCipher
 
 _LOGGER = logging.getLogger(__name__)
 
+# Tuya LAN frames stay well under this; tinytuya uses the same order of
+# magnitude. It exists to reject a corrupt length, not to cap real traffic.
+MAX_PAYLOAD_BYTES = 16 * 1024
+
 
 def pack_message(msg: TuyaMessage, hmac_key: bytes = None):
     """Pack a TuyaMessage into bytes."""
@@ -203,13 +207,21 @@ def parse_header(data: bytes, logger=_LOGGER):
         total_length = payload_len + header_len + len(Affix.suffix_6699.bin)
     else:
         err = f"Prefix Does not match! {prefix} known {set(p for p in Affix.prefixes)}"
-        logger.error(err)
+        logger.debug(err)
         raise DecodeError(err)
 
-    # sanity check. currently the max payload length is somewhere around 300 bytes
-    if payload_len > 2000:
-        err = f"Header claims the packet size is over 2000 bytes!  It is most likely corrupt. Claimed size: {payload_len} bytes. fmt: {fmt} unpacked: {unpacked}"
-        logger.error(err)
+    # Sanity check. A gateway answering subdev_online_stat_query for dozens of
+    # children sends far more than the ~300 bytes a single device does, so the
+    # old 2000-byte cap could reject a legitimate reply - forever, and at ERROR
+    # on every poll cycle. Use the LAN protocol's real ceiling, and let the
+    # caller decide how loudly to complain: this runs inside data_received,
+    # where a corrupt frame is expected input, not an incident.
+    if payload_len > MAX_PAYLOAD_BYTES:
+        err = (
+            f"Header claims a payload of {payload_len} bytes, over the "
+            f"{MAX_PAYLOAD_BYTES} byte maximum: most likely corrupt"
+        )
+        logger.debug(err)
         raise DecodeError(err)
 
     return TuyaHeader(prefix, seqno, cmd, payload_len, total_length)
