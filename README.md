@@ -238,5 +238,9 @@ python3 tests/run_all.py
 ```
 
 Suites are discovered, not listed: a new `tests/test_*.py` runs automatically.
+`tools/tuya_device_sim.py` simulates a Zigbee hub with sub-devices - including
+a reply split over several frames, children reported offline or only "nearby",
+and a device that answers nothing at all - so the protocol can be exercised
+against a real socket without hardware.
 See `tests/README.md` for what each suite covers. CI runs these suites plus
 `hassfest` and HACS validation on every push.

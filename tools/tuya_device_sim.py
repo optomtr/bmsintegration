@@ -236,9 +236,21 @@ class Codec:
 # Server
 # --------------------------------------------------------------------------- #
 class Simulator:
-    def __init__(self, devices: dict, offline: set[str]):
+    def __init__(
+        self,
+        devices: dict,
+        offline: set[str],
+        offline_cids: set[str] | None = None,
+        nearby_cids: set[str] | None = None,
+        subdev_chunk: int = 0,
+    ):
         self.devices = devices
         self.offline = offline
+        # Sub-devices the hub reports as offline / only "nearby", and how many
+        # children it lists per reply frame.
+        self.offline_cids = offline_cids or set()
+        self.nearby_cids = nearby_cids or set()
+        self.subdev_chunk = subdev_chunk
         self.codec = Codec(LOCAL_KEY)
         self.push_seqno = 1000
 
@@ -291,13 +303,17 @@ class Simulator:
         dev_id = body.get("devId") or body.get("gwId")
         cid = body.get("cid")
 
+        # The offline gate has to come first. Answering heartbeats while
+        # ignoring everything else is not a state a real device can be in, and
+        # it is exactly the state the gateway watchdog exists to detect: a
+        # socket that is still up after the Zigbee service died.
+        if dev_id in self.offline:
+            _LOGGER.info("ignoring %s: marked offline in the scenario", dev_id)
+            return dev_id
+
         if msg.cmd == CMDType.HEART_BEAT:
             writer.write(self.codec.frame(msg.seqno, CMDType.HEART_BEAT, None))
             await writer.drain()
-            return dev_id
-
-        if dev_id in self.offline:
-            _LOGGER.info("ignoring %s: marked offline in the scenario", dev_id)
             return dev_id
 
         state = self._state_for(dev_id, cid)
@@ -332,8 +348,60 @@ class Simulator:
                 await self._push_status(writer, dict(state), cid)
             return dev_id
 
+        if msg.cmd == CMDType.LAN_EXT_STREAM:
+            await self._respond_subdev_query(writer, msg, body, dev_id)
+            return dev_id
+
         _LOGGER.debug("unhandled cmd %s from %s", msg.cmd, dev_id)
         return dev_id
+
+    async def _respond_subdev_query(self, writer, msg, body: dict, dev_id):
+        """Answer subdev_online_stat_query the way a Zigbee hub does.
+
+        A real hub splits the answer over several frames and does not repeat
+        every child in every frame - the behaviour that made a fixed subset of
+        devices flap-disconnect in production. --subdev-chunk reproduces it.
+        """
+        req = body.get("reqType") or (body.get("data") or {}).get("reqType")
+        if req != "subdev_online_stat_query":
+            _LOGGER.debug("unhandled ext stream %r from %s", req, dev_id)
+            return
+
+        gateway = self.devices.get(dev_id)
+        if gateway is None:
+            for candidate in self.devices.values():
+                if candidate.get("sub_devices"):
+                    gateway = candidate
+                    break
+        if gateway is None:
+            return
+
+        children = list(gateway.get("sub_devices") or {})
+        online = [cid for cid in children if cid not in self.offline_cids]
+        offline = [cid for cid in children if cid in self.offline_cids]
+        nearby = [cid for cid in children if cid in self.nearby_cids]
+        online = [cid for cid in online if cid not in nearby]
+
+        chunk = self.subdev_chunk or max(len(online), 1)
+        frames = [online[i : i + chunk] for i in range(0, len(online), chunk)] or [[]]
+        # Anything that is not "online" rides on the last frame, as a hub does.
+        for index, part in enumerate(frames):
+            data = {"online": part}
+            if index == len(frames) - 1:
+                data["offline"] = offline
+                data["nearby"] = nearby
+            writer.write(
+                self.codec.frame(
+                    msg.seqno, CMDType.LAN_EXT_STREAM, {"data": data}
+                )
+            )
+            await writer.drain()
+            if index != len(frames) - 1:
+                await asyncio.sleep(0.05)
+        _LOGGER.info(
+            "subdev query -> %d online in %d frame(s), %d offline, %d nearby",
+            len(online), len(frames), len(offline), len(nearby),
+        )
 
     async def _push_status(self, writer, dps: dict, cid: str | None):
         self.push_seqno += 1
@@ -360,8 +428,10 @@ async def broadcast_presence(devices: dict, advertise_ip: str, stop: asyncio.Eve
 
     announcements = []
     for dev_id, dev in devices.items():
-        if dev["kind"] == "gateway":
-            continue  # a hub announces itself, its children do not
+        # A hub announces itself and its children do not - and the hub's own
+        # broadcast is the one that matters, because an address change on it
+        # moves every sub-device behind it. The old `continue` here did the
+        # opposite of this comment and skipped the hub.
         if only_ids and dev_id not in only_ids:
             continue  # this simulator instance does not host that device
         announcements.append(
@@ -398,7 +468,13 @@ async def broadcast_presence(devices: dict, advertise_ip: str, stop: asyncio.Eve
 
 async def main_async(args):
     devices = build_scenario()
-    sim = Simulator(devices, offline=set(args.offline or []))
+    sim = Simulator(
+        devices,
+        offline=set(args.offline or []),
+        offline_cids=set(args.offline_cid or []),
+        nearby_cids=set(args.nearby_cid or []),
+        subdev_chunk=args.subdev_chunk,
+    )
     server = await asyncio.start_server(sim.handle, args.host, args.port)
     stop = asyncio.Event()
     if args.advertise:
@@ -409,6 +485,11 @@ async def main_async(args):
     _LOGGER.info("listening on %s:%s - %d simulated devices", args.host, args.port, total)
     if args.offline:
         _LOGGER.info("pretending offline: %s", ", ".join(args.offline))
+    if args.offline_cid or args.nearby_cid or args.subdev_chunk:
+        _LOGGER.info(
+            "sub-device reporting: offline=%s nearby=%s chunk=%s",
+            args.offline_cid or [], args.nearby_cid or [], args.subdev_chunk or "all",
+        )
     async with server:
         await server.serve_forever()
 
@@ -418,6 +499,13 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=6668)
     ap.add_argument("--offline", nargs="*", help="device ids that must not answer")
+    ap.add_argument("--offline-cid", nargs="*", metavar="CID",
+                    help="sub-devices the hub reports as offline")
+    ap.add_argument("--nearby-cid", nargs="*", metavar="CID",
+                    help="sub-devices the hub reports only as nearby")
+    ap.add_argument("--subdev-chunk", type=int, default=0, metavar="N",
+                    help="split the sub-device reply into frames of N children, "
+                         "the way a busy hub does (0 = one frame)")
     ap.add_argument("--advertise", metavar="IP",
                     help="announce the devices on UDP 6667 from this address")
     ap.add_argument("--announce-to", nargs="*", metavar="IP",
