@@ -1039,6 +1039,15 @@ class TimerListenerDecoratorTest(unittest.TestCase):
             elif isinstance(dec, ast.Attribute):
                 yield dec.attr
 
+    # A listener that cannot be resolved statically is a FAILURE, not a skip.
+    # The previous version quietly ignored keyword arguments, attribute
+    # references and partials - i.e. most of the ways this call can be
+    # written - so the guard passed while the very regression it exists for
+    # could walk straight back in. `self.<name>` and module-level names are
+    # resolved; a lambda is inherently safe (it cannot be decorated, and HA
+    # treats it as a plain sync callable, so we reject it outright).
+    LISTENER_KEYWORDS = ("action", "listener", "callback")
+
     def _assert_listeners_are_callbacks(self, *relative):
         source, path = self._module_source(*relative)
         tree = ast.parse(source)
@@ -1051,33 +1060,349 @@ class TimerListenerDecoratorTest(unittest.TestCase):
             elif isinstance(node, ast.FunctionDef):
                 sync_defs[node.name] = node
 
+        checked = 0
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
             index = self.SCHEDULERS.get(name)
-            if index is None or len(node.args) <= index:
+            if index is None:
                 continue
 
-            listener = node.args[index]
-            if not isinstance(listener, ast.Name):
-                continue  # a lambda or an expression: nothing to check statically
-            if listener.id in async_defs or listener.id not in sync_defs:
-                continue
+            listener = None
+            if len(node.args) > index:
+                listener = node.args[index]
+            else:
+                for keyword in node.keywords:
+                    if keyword.arg in self.LISTENER_KEYWORDS:
+                        listener = keyword.value
+                        break
 
+            where = f"{os.path.basename(path)}:{node.lineno}: {name}()"
+            self.assertIsNotNone(listener, f"{where}: no listener argument found")
+
+            # Resolve `foo` and `self.foo` to a definition in this module.
+            if isinstance(listener, ast.Name):
+                target = listener.id
+            elif isinstance(listener, ast.Attribute) and isinstance(
+                listener.value, ast.Name
+            ):
+                target = listener.attr
+            else:
+                self.fail(
+                    f"{where}: listener is a {type(listener).__name__}, which this "
+                    "guard cannot verify. Pass a named function decorated with "
+                    "@callback (or an async def) so the check stays meaningful."
+                )
+
+            if target in async_defs:
+                continue  # a coroutine function is scheduled on the loop
+            self.assertIn(
+                target,
+                sync_defs,
+                f"{where}: listener {target}() is not defined in this module, so "
+                "its @callback cannot be verified here",
+            )
+            checked += 1
             self.assertIn(
                 "callback",
-                set(self._decorator_names(sync_defs[listener.id])),
-                f"{os.path.basename(path)}:{node.lineno}: {name}() gets the plain "
-                f"sync function {listener.id}(); it needs @callback or Home "
-                f"Assistant will run it in an executor thread",
+                set(self._decorator_names(sync_defs[target])),
+                f"{where} gets the plain sync function {target}(); it needs "
+                "@callback or Home Assistant will run it in an executor thread",
             )
+        return checked
 
     def test_entry_setup_listeners(self):
         self._assert_listeners_are_callbacks("__init__.py")
 
     def test_coordinator_listeners(self):
         self._assert_listeners_are_callbacks("coordinator.py")
+
+    def test_every_module_of_the_integration(self):
+        """Two of eighteen files were checked; the rest schedule timers too."""
+        root = os.path.join(
+            os.path.dirname(SCRATCH), "custom_components", "bms_integration"
+        )
+        checked = 0
+        for folder, _dirs, files in os.walk(root):
+            for name in sorted(files):
+                if not name.endswith(".py"):
+                    continue
+                relative = os.path.relpath(os.path.join(folder, name), root)
+                checked += self._assert_listeners_are_callbacks(
+                    *relative.split(os.sep)
+                )
+        self.assertGreater(checked, 0, "the guard resolved no listener at all")
+
+# --------------------------------------------------------------------------- #
+# Command failures must not tear down a shared gateway socket
+# --------------------------------------------------------------------------- #
+class TestCommandFailureHandling(Base):
+    """One unresponsive sub-device reconnected the whole hub.
+
+    set_status() reacted to ANY command exception by resetting the connection,
+    and for a sub-device that forwards straight to the gateway - whose socket
+    every other child shares. The pilot site logged 29 lost commands and 138
+    gateway handshakes in a single day this way.
+    """
+
+    def _armed(self, exc):
+        dev = self.make_device()
+        iface = FakeInterface()
+
+        async def failing_set_dps(payload, cid=None):
+            raise exc
+
+        iface.set_dps = failing_set_dps
+        dev._interface = iface
+        resets = []
+
+        async def record_reset(reason, event):
+            resets.append((reason, event))
+
+        dev._async_reset_stale_connection = record_reset
+        return dev, resets
+
+    async def test_timeout_is_reported_to_the_caller(self):
+        dev, _ = self._armed(TimeoutError("Command 13 timed out"))
+        dev._pending_status = {"1": True}
+        # The optimistic value is already on screen; only an exception here
+        # makes the entity roll it back.
+        with self.assertRaises(TimeoutError):
+            await dev.set_status()
+
+    async def test_single_timeout_keeps_the_shared_session(self):
+        dev, resets = self._armed(TimeoutError("Command 13 timed out"))
+        for _ in range(coordinator.COMMAND_FAILURES_BEFORE_RESET - 1):
+            dev._pending_status = {"1": True}
+            with contextlib.suppress(TimeoutError):
+                await dev.set_status()
+        self.assertEqual(resets, [], "a reply timeout is not proof the socket died")
+
+    async def test_repeated_timeouts_do_reset(self):
+        dev, resets = self._armed(TimeoutError("Command 13 timed out"))
+        for _ in range(coordinator.COMMAND_FAILURES_BEFORE_RESET):
+            dev._pending_status = {"1": True}
+            with contextlib.suppress(TimeoutError):
+                await dev.set_status()
+        self.assertEqual(len(resets), 1)
+
+    async def test_success_clears_the_counter(self):
+        dev, resets = self._armed(TimeoutError("t"))
+        dev._pending_status = {"1": True}
+        with contextlib.suppress(TimeoutError):
+            await dev.set_status()
+
+        async def ok(payload, cid=None):
+            return None
+
+        dev._interface.set_dps = ok
+        dev._pending_status = {"1": True}
+        await dev.set_status()
+        self.assertEqual(dev._command_failures, 0)
+
+        async def failing(payload, cid=None):
+            raise TimeoutError("t")
+
+        dev._interface.set_dps = failing
+        dev._pending_status = {"1": True}
+        with contextlib.suppress(TimeoutError):
+            await dev.set_status()
+        self.assertEqual(resets, [], "the earlier failure must not still count")
+
+    async def test_connection_error_resets_at_once(self):
+        dev, resets = self._armed(ConnectionResetError("socket gone"))
+        dev._pending_status = {"1": True}
+        with self.assertRaises(ConnectionResetError):
+            await dev.set_status()
+        self.assertEqual(len(resets), 1, "a dead socket must reconnect immediately")
+
+
+class TestConnectTaskBookkeeping(Base):
+    """Only the task that owns the reference may clear it."""
+
+    async def test_foreign_task_does_not_clear(self):
+        dev = self.make_device()
+
+        async def parked():
+            await asyncio.sleep(3600)
+
+        live = asyncio.get_running_loop().create_task(parked())
+        self._aux_tasks.append(live)
+        dev._task_connect = live
+        # A cancelled earlier attempt running its cleanup used to null this,
+        # so is_connecting reported False while a connect was in progress.
+        dev._clear_connect_task()
+        self.assertIs(dev._task_connect, live)
+
+    async def test_owning_task_clears(self):
+        dev = self.make_device()
+        cleared = asyncio.Event()
+
+        async def owner():
+            dev._clear_connect_task()
+            cleared.set()
+
+        task = asyncio.get_running_loop().create_task(owner())
+        dev._task_connect = task
+        self._aux_tasks.append(task)
+        await asyncio.wait_for(cleared.wait(), 5)
+        self.assertIsNone(dev._task_connect)
+
+
+class TestEventPayloadIsSnapshotted(Base):
+    """An automation must see what changed, not two references to one dict."""
+
+    async def test_old_and_new_status_are_copies(self):
+        dev = self.make_device()
+        fired = []
+
+        class Bus:
+            def async_listeners(self):
+                return {f"{DOMAIN}_status_update": 1}
+
+            def async_fire(self, event, data):
+                fired.append(data)
+
+        dev.hass.bus = Bus()
+        dev._interface = FakeInterface()
+        dev._interface.dispatched_dps = {"1": True, "2": False}
+
+        old = {"1": False}
+        new = {"1": True}
+        dev._handle_event(old, new)
+        old["1"] = "mutated afterwards"
+
+        self.assertEqual(len(fired), 1)
+        self.assertEqual(fired[0]["old_status"], {"1": False})
+        self.assertEqual(fired[0]["new_status"], {"1": True})
+
+
+class TestAvailabilityReportRotation(Base):
+    """The report lives on the SD card of a machine nobody visits.
+
+    Coverage used to be a substring grep for the constant and the os.replace
+    call, which passes even if the rotation never happens.
+    """
+
+    async def test_report_rotates_and_keeps_one_generation(self):
+        import json as _json
+
+        dev = self.make_device()
+        path = self.hass.config.path(coordinator.AVAILABILITY_REPORT_FILE)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        for stale in (path, f"{path}.1"):
+            if os.path.exists(stale):
+                os.remove(stale)
+        self.addCleanup(
+            lambda: [
+                os.remove(p) for p in (path, f"{path}.1") if os.path.exists(p)
+            ]
+        )
+
+        # Just over the cap, so the next write must rotate.
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("x" * (coordinator.AVAILABILITY_REPORT_MAX_BYTES + 1))
+            handle.write("\n")
+
+        await dev._async_write_availability_report({"event": "marker", "n": 1})
+
+        self.assertTrue(os.path.exists(f"{path}.1"), "the old generation is gone")
+        self.assertLess(
+            os.path.getsize(path),
+            coordinator.AVAILABILITY_REPORT_MAX_BYTES,
+            "the report was not rotated",
+        )
+        with open(path, encoding="utf-8") as handle:
+            lines = [line for line in handle.read().splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(_json.loads(lines[0])["event"], "marker")
+
+        # A second rotation must not leave a third generation behind.
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write("y" * (coordinator.AVAILABILITY_REPORT_MAX_BYTES + 1))
+        await dev._async_write_availability_report({"event": "marker", "n": 2})
+        self.assertFalse(os.path.exists(f"{path}.2"))
+
+    async def test_report_carries_no_secret(self):
+        dev = self.make_device(local_key="0123456789abcdef")
+        written = []
+
+        async def capture(payload):
+            written.append(payload)
+
+        dev._async_write_availability_report = capture
+        dev._availability_report("disconnect_detected", "socket closed")
+        # _availability_report schedules the write; let it run (do not cancel).
+        await asyncio.gather(*self.hass.created_tasks)
+        self.assertEqual(len(written), 1)
+        blob = repr(written[0])
+        self.assertNotIn("0123456789abcdef", blob, "the local key is in the report")
+        self.assertNotIn("local_key", blob)
+
+
+class SourceGuards(unittest.TestCase):
+    """Guards for fixes whose call site cannot be driven without a full HA."""
+
+    def _src(self, name):
+        path = os.path.join(
+            os.path.dirname(SCRATCH), "custom_components", "bms_integration", name
+        )
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_entity_mirrors_the_device_cache(self):
+        # A merge cannot express a removed datapoint, which is exactly what an
+        # optimistic rollback of a first-ever command does.
+        entity = self._src("entity.py")
+        self.assertIn("self._status = dict(status)", entity)
+        self.assertNotIn("self._status = {**self._status, **status}", entity)
+
+    def test_unload_reports_the_platform_result(self):
+        init = self._src("__init__.py")
+        self.assertIn("unloaded = await hass.config_entries.async_unload_platforms", init)
+        self.assertIn("if not unloaded:", init)
+
+    def test_panel_is_not_removed_on_reload(self):
+        # The panel is global; tearing it down on every entry reload dropped
+        # the operator's log and leaked one aiohttp static resource per cycle.
+        init = self._src("__init__.py")
+        unload = init[init.index("async def async_unload_entry") :]
+        unload = unload[: unload.index("async def async_remove_entry")]
+        self.assertNotIn("async_remove_panel(hass)", unload)
+        self.assertIn("async def async_remove_entry", init)
+
+    def test_admin_only_services(self):
+        init = self._src("__init__.py")
+        self.assertIn("async_register_admin_service(hass, DOMAIN, SERVICE_RELOAD", init)
+        self.assertIn("SERVICE_SET_DP, _handle_set_dp", init)
+        registration = init[init.index("SERVICE_SET_DP, _handle_set_dp") - 200 :][:260]
+        self.assertIn("async_register_admin_service", registration)
+
+    def test_discovery_confirms_and_latches_address_changes(self):
+        init = self._src("__init__.py")
+        for token in (
+            "DISCOVERY_ADDRESS_CONFIRMATIONS",
+            "DISCOVERY_FLAP_LIMIT",
+            "_address_frozen",
+            "_address_change_ok",
+        ):
+            self.assertIn(token, init)
+        # The cache may only record an address that was really applied.
+        apply_block = init[init.index("new_data = copy.deepcopy(dict(entry.data))") :]
+        self.assertIn("device_cache[device_id][dev_id] = device_ip", apply_block[:900])
+
+    def test_binary_sensor_registers_one_removal_hook(self):
+        sensor = self._src("binary_sensor.py")
+        self.assertIn("self.async_on_remove(self._cancel_reset_timer)", sensor)
+        self.assertNotIn("self.async_on_remove(self._reset_timer_interval)", sensor)
+
+    def test_session_key_material_is_not_logged(self):
+        proto = self._src(os.path.join("core", "pytuya", "__init__.py"))
+        self.assertNotIn(
+            'self.debug("decrypted session key negotiation step 2: payload=%r"', proto
+        )
+        self.assertNotIn("binascii.hexlify(hmac_check)", proto)
 
 
 if __name__ == "__main__":

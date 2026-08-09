@@ -644,7 +644,13 @@ class TuyaDevice(TuyaListener, ContextualLogger):
 
     async def _async_handle_command_failure(self, ex: Exception) -> None:
         """Decide whether one failed command means the transport is broken."""
-        if isinstance(ex, (ConnectionError, OSError)) or not self.connected:
+        # TimeoutError is a subclass of OSError, so it has to be excluded
+        # explicitly - otherwise every reply timeout takes the reset path and
+        # nothing below this line ever runs.
+        transport_gone = isinstance(ex, (ConnectionError, OSError)) and not isinstance(
+            ex, TimeoutError
+        )
+        if transport_gone or not self.connected:
             # The socket itself is gone: reconnect at once.
             self._command_failures = 0
             await self._async_reset_stale_connection(

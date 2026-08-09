@@ -74,6 +74,34 @@ the license text.
   behind it offline. A hub's own datapoints are often cloud-pull only, so its
   LAN status query returns nothing; that is no longer treated as a failed
   handshake when the device has sub-devices.
+- A corrupt or hostile frame, a payload the device reports as "data unvalid",
+  or a fault in a listener no longer closes the socket. Everything in that
+  path runs inside `data_received`, and on a Zigbee hub that socket is shared
+  by every sub-device behind it, so one bad frame took a whole floor offline.
+- A command that fails no longer looks like a command that succeeded: a lost
+  write raises instead of returning None, `set_status` re-raises instead of
+  swallowing, and the entity's optimistic value is rolled back for real.
+- A reply timeout on one sub-device no longer reconnects its gateway. The
+  shared session is reset immediately only on a connection-level error, and
+  otherwise after three failures in a row. The pilot site logged 29 lost
+  commands and 138 gateway handshakes in one day before this.
+- Repeated INFO messages are demoted to debug for an hour, so a permanent
+  fault cannot fill the log; session-key material and the discovery table are
+  no longer written to logs or diagnostics.
+- An address heard over UDP is confirmed over several broadcasts before it is
+  applied, and a device whose address keeps flipping is left alone instead of
+  reloading the whole config entry once a minute forever.
+- Two devices configured on one address no longer collapse into one object -
+  the integration says which device is parked and why.
+- Motion sensors, base64 power sensors and the reconnect loop no longer grow
+  a list, respawn entities or spin at 1 Hz for the life of the installation.
+- Covers, lights, thermostats, selects, fans and the IR remote survive a
+  datapoint that is missing, empty or of the wrong type instead of freezing
+  the entity until Home Assistant restarts.
+- The panel escapes every value it renders, ignores a late answer for a device
+  the operator has navigated away from, keeps focus and scroll during its
+  background refresh, and stops polling while the tab is hidden.
+- The `set_dp` and `reload` services are admin-only, matching the panel.
 - Dispatcher signals and remote storage/service domain use the BMS Integration domain.
 
 ## Install
@@ -204,5 +232,6 @@ pip install cryptography
 python3 tests/run_all.py
 ```
 
+Suites are discovered, not listed: a new `tests/test_*.py` runs automatically.
 See `tests/README.md` for what each suite covers. CI runs these suites plus
 `hassfest` and HACS validation on every push.

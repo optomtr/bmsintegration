@@ -302,6 +302,159 @@ async def test_subdev_chunked_query():
           proto._subdev_absent_cycles == {} and proto._subdev_seen_cids == set())
 
 
+
+async def test_data_received_never_kills_the_socket():
+    """Anything that escapes add_data() closes the transport.
+
+    On a Zigbee hub that socket is shared by every sub-device behind it, so a
+    single corrupt or hostile frame took the whole floor offline. add_data()
+    only caught parser.DecodeError, while unpack_message walks lengths taken
+    straight off the wire and can raise struct.error, ValueError or IndexError.
+    """
+    print("\n== add_data: битый кадр не рвёт общий сокет ==")
+
+    got = []
+    d = pytuya.MessageDispatcher("deviceid123456789012", lambda m, ack=False: got.append(m), 3.3, KEY)
+    d.set_logger(__import__("logging").getLogger("test"), "deviceid123456789012")
+
+    good = make_55aa(7, int(CMDType.STATUS), json.dumps({"dps": {"1": True}}).encode())
+
+    # A header that parses but whose body is truncated inside the frame the
+    # header claims, i.e. exactly the shape a fragmented hostile frame has.
+    hostile = bytearray(good)
+    hostile[12:16] = struct.pack(">I", 40)  # declared length smaller than real
+    try:
+        d.add_data(bytes(hostile))
+        raised = None
+    except Exception as ex:  # noqa: BLE001
+        raised = ex
+    check("битый кадр не выбрасывает исключение", raised is None, repr(raised))
+
+    # A wrong declared length inevitably eats into whatever follows in the
+    # stream - that byte range is lost either way. What must not happen is
+    # the dispatcher dying: the next clean frame still has to arrive.
+    d.add_data(good)
+    d.add_data(good)
+    check("следующий чистый кадр доставлен", len(got) >= 1, f"got={len(got)}")
+
+    # A listener that raises must not reach the transport either.
+    boom = pytuya.MessageDispatcher(
+        "deviceid123456789012",
+        lambda m, ack=False: (_ for _ in ()).throw(RuntimeError("listener bug")),
+        3.3,
+        KEY,
+    )
+    boom.set_logger(__import__("logging").getLogger("test"), "deviceid123456789012")
+    try:
+        boom.add_data(good)
+        raised = None
+    except Exception as ex:  # noqa: BLE001
+        raised = ex
+    check("исключение слушателя не доходит до транспорта", raised is None, repr(raised))
+
+
+async def test_status_update_survives_undecodable_payload():
+    """A payload the device reports as "data unvalid" decodes to None.
+
+    _status_update then evaluated `"dps" not in None` - TypeError, inside
+    data_received, socket closed for all 49 sub-devices.
+    """
+    print("\n== _status_update: неразбираемый payload ==")
+
+    proto = pytuya.TuyaProtocol(
+        "deviceid123456789012", KEY.decode(), 3.3, False, pytuya.EmptyListener()
+    )
+    handler = proto.dispatcher.callback_status_update
+
+    class Msg:
+        seqno = 5
+        cmd = int(CMDType.STATUS)
+        payload = b"x"
+
+    proto._decode_payload = lambda payload: None
+    try:
+        handler(Msg())
+        raised = None
+    except Exception as ex:  # noqa: BLE001
+        raised = ex
+    check("None из _decode_payload не выбрасывает", raised is None, repr(raised))
+
+
+async def test_seqno_resync_is_bounded():
+    """msg.seqno is an untrusted u32; the counter must stay inside 32 bits."""
+    print("\n== seqno: ресинк ограничен 32 битами ==")
+
+    proto = pytuya.TuyaProtocol(
+        "deviceid123456789012", KEY.decode(), 3.3, False, pytuya.EmptyListener()
+    )
+    handler = proto.dispatcher.callback_status_update
+    proto._decode_payload = lambda payload: {"dps": {"1": True}}
+
+    class Msg:
+        seqno = 0xFFFFFFFF
+        cmd = int(CMDType.STATUS)
+        payload = b"x"
+
+    handler(Msg())
+    check("seqno не выходит за 32 бита", proto.seqno <= 0xFFFFFFFF, f"seqno={proto.seqno}")
+    struct.pack(">I", proto.seqno)  # raises if the fix regressed
+
+
+async def test_wait_for_refuses_to_orphan_a_waiter():
+    """Overwriting a listener orphaned the waiter already parked on it.
+
+    Its future was never resolved and never cancelled; the eventual timeout
+    then tore down a session that was perfectly healthy.
+    """
+    print("\n== wait_for: дубль не сиротит ждущего ==")
+
+    d = pytuya.MessageDispatcher("deviceid123456789012", lambda m, ack=False: None, 3.3, KEY)
+    d.set_logger(__import__("logging").getLogger("test"), "deviceid123456789012")
+    seqno = d.SUB_DEVICE_QUERY_SEQNO
+
+    first = asyncio.get_running_loop().create_task(
+        d.wait_for(seqno, int(CMDType.LAN_EXT_STREAM), timeout=5)
+    )
+    await asyncio.sleep(0)  # let it register
+
+    try:
+        await d.wait_for(seqno, int(CMDType.LAN_EXT_STREAM), timeout=0.05)
+        check("второй ожидающий отвергнут", False)
+    except Exception as ex:  # noqa: BLE001
+        check("второй ожидающий отвергнут", "listener exists" in str(ex), repr(ex))
+
+    check("первый listener на месте", d.listeners.get(seqno) is not None)
+    d._release_listener(seqno, "reply")
+    check("первый ожидающий получает ответ", await asyncio.wait_for(first, 1) == "reply")
+
+
+async def test_info_repeat_is_rate_limited():
+    """A permanent fault repeated the same INFO line about once a minute."""
+    print("\n== info(): повтор не заливает журнал ==")
+
+    import logging as _logging
+
+    records = []
+
+    class Capture(_logging.Handler):
+        def emit(self, record):
+            records.append(record.levelno)
+
+    logger = _logging.getLogger("test.info.repeat")
+    logger.setLevel(_logging.DEBUG)
+    logger.addHandler(Capture())
+
+    ctx = pytuya.ContextualLogger()
+    ctx.set_logger(logger, "deviceid123456789012")
+    for _ in range(5):
+        ctx.info("Ensure that localkey hasn't changed and it's correct")
+
+    infos = records.count(_logging.INFO)
+    check("одинаковый INFO пишется один раз", infos == 1, f"infos={infos}")
+    check("повторы уходят в debug", records.count(_logging.DEBUG) == 4)
+    ctx.info("другое сообщение")
+    check("другое сообщение пишется на INFO", records.count(_logging.INFO) == 2)
+
 async def main():
     await test_dispatcher()
     await test_dispatcher_6699()
@@ -310,6 +463,11 @@ async def main():
     await test_negotiation_hmac_reject()
     await test_gcm_nonce_unique()
     await test_subdev_chunked_query()
+    await test_data_received_never_kills_the_socket()
+    await test_status_update_survives_undecodable_payload()
+    await test_seqno_resync_is_bounded()
+    await test_wait_for_refuses_to_orphan_a_waiter()
+    await test_info_repeat_is_rate_limited()
     print(f"\n===== ИТОГ: PASS {len(PASS)} / FAIL {len(FAIL)} =====")
     if FAIL:
         print("Провалено:", *FAIL, sep="\n  - ")
