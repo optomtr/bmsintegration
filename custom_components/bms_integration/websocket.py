@@ -45,6 +45,11 @@ DATA_WS_REGISTERED = "ws_registered"
 # while it still counts as available inside the reconnect grace window.
 QUIET_WARN_SECONDS = 120
 
+# How much of the availability report's tail to parse per request. The panel
+# only ever shows a few hundred recent events, so reading the whole 2 MiB file
+# every few seconds was pure waste.
+REPORT_TAIL_BYTES = 256 * 1024
+
 # Keys that must never leave the backend, whatever the panel asks for.
 SECRET_KEYS = frozenset(
     {"local_key", "client_secret", "client_id", "user_id", "password", "token"}
@@ -177,11 +182,23 @@ def _device_rows(hass: HomeAssistant) -> list[dict[str, Any]]:
                     ent_reg, registry_device.id, include_disabled_entities=True
                 ):
                     state = hass.states.get(entity.entity_id)
+                    # The datapoint an entity is wired to is encoded in its
+                    # unique_id (see LocalTuyaEntity.unique_id). The panel
+                    # needs it to pair an entity with its configuration:
+                    # matching on the platform prefix instead printed the
+                    # first channel's datapoint for every gang of a 4-gang
+                    # switch.
+                    prefix = f"local_{dev_id}_"
+                    unique_id = entity.unique_id or ""
+                    dp_id = (
+                        unique_id[len(prefix) :] if unique_id.startswith(prefix) else ""
+                    )
                     entities.append(
                         {
                             "entity_id": entity.entity_id,
                             "name": entity.name or entity.original_name or entity.entity_id,
                             "domain": entity.entity_id.split(".")[0],
+                            "dp_id": dp_id,
                             "state": state.state if state else None,
                             "disabled": entity.disabled_by is not None,
                         }
@@ -260,9 +277,22 @@ def _read_report(hass: HomeAssistant, limit: int, device_id: str | None) -> list
     path = hass.config.path(AVAILABILITY_REPORT_FILE)
     if not os.path.exists(path):
         return []
-    # The writer caps the file at 2 MiB, so reading its tail stays cheap.
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        lines = fh.readlines()[-3000:]
+    # Seek to the tail instead of materialising the file. The writer caps it
+    # at 2 MiB, and the panel asks for this every few seconds: readlines()
+    # parsed all ~5000 lines of a busy site's report each time, only to keep
+    # the last few hundred.
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            size = os.fstat(fh.fileno()).st_size
+            if size > REPORT_TAIL_BYTES:
+                fh.seek(size - REPORT_TAIL_BYTES)
+                fh.readline()  # discard the partial line we landed in
+            lines = fh.readlines()[-3000:]
+    except OSError as err:
+        # The report can be rotated out from under us between the exists()
+        # check and the open; an unreadable report is not worth an error.
+        _LOGGER.debug("Отчёт доступности не прочитан: %s", err)
+        return []
     out = []
     for line in lines:
         line = line.strip()
@@ -543,17 +573,45 @@ def ws_discovered(hass: HomeAssistant, connection, msg: dict) -> None:
 
     found = []
     for dev_id, info in (getattr(discovery, "devices", {}) or {}).items():
+        # Every field here comes from an unauthenticated UDP broadcast that
+        # anything on the LAN can send. Coerce and bound it: a gwId that was
+        # not a string used to make this command raise for the whole panel.
+        if not isinstance(info, dict):
+            continue
+        dev_id = str(dev_id)[:64]
         found.append(
             {
                 "device_id": dev_id,
-                "host": info.get("ip"),
-                "protocol": str(info.get("version") or ""),
-                "product_key": info.get("productKey") or "",
+                "host": str(info.get("ip") or "")[:64],
+                "protocol": str(info.get("version") or "")[:16],
+                "product_key": str(info.get("productKey") or "")[:64],
                 "configured": dev_id in known,
             }
         )
     found.sort(key=lambda d: (d["configured"], d["device_id"]))
     connection.send_result(msg["id"], {"devices": found, "listening": discovery is not None})
+
+
+def _resolve_device(
+    hass: HomeAssistant, dev_id: str, node_id: str | None
+) -> TuyaDevice | None:
+    """Find the device object a panel command should act on.
+
+    When a Zigbee gateway is not configured as a device of its own, one
+    sub-device config produces TWO objects: the promoted `_fake_gateway` that
+    owns the socket and carries no state, and the sub-device itself. Both
+    answer to the same id and node id, so a plain scan could hand a command to
+    the stand-in - which addresses the hub, not the node the panel is showing.
+    """
+    fallback: TuyaDevice | None = None
+    for _entry_id, data in _entries(hass):
+        for device in data.devices.values():
+            if device.id != dev_id or device._node_id != node_id:
+                continue
+            if not device.is_fake_gateway:
+                return device
+            fallback = fallback or device
+    return fallback
 
 
 @websocket_api.websocket_command(
@@ -569,14 +627,7 @@ def ws_discovered(hass: HomeAssistant, connection, msg: dict) -> None:
 async def ws_action(hass: HomeAssistant, connection, msg: dict) -> None:
     """Nudge one device: reconnect it, or ask it for its datapoints."""
     dev_id, node_id = msg["device_id"], msg.get("node_id")
-    target: TuyaDevice | None = None
-    for _entry_id, data in _entries(hass):
-        for device in data.devices.values():
-            if device.id == dev_id and device._node_id == node_id:
-                target = device
-                break
-        if target:
-            break
+    target = _resolve_device(hass, dev_id, node_id)
 
     if target is None:
         connection.send_error(msg["id"], "not_found", f"Устройство {dev_id} не найдено")
@@ -639,14 +690,7 @@ async def ws_reload(hass: HomeAssistant, connection, msg: dict) -> None:
 async def ws_set_dp(hass: HomeAssistant, connection, msg: dict) -> None:
     """Expert raw datapoint write, audited in the integration's own log."""
     dev_id, node_id = msg["device_id"], msg.get("node_id")
-    target: TuyaDevice | None = None
-    for _entry_id, data in _entries(hass):
-        for device in data.devices.values():
-            if device.id == dev_id and device._node_id == node_id:
-                target = device
-                break
-        if target:
-            break
+    target = _resolve_device(hass, dev_id, node_id)
 
     if target is None:
         connection.send_error(msg["id"], "not_found", f"Устройство {dev_id} не найдено")

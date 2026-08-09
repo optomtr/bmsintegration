@@ -7,6 +7,14 @@
  * фронтенд не читает ни runtime-объекты, ни файлы напрямую.
  */
 
+// ------------------------------------------------------------ параметры --
+// Опрос панели. Отчёт и журнал читаются с диска на каждый запрос, поэтому
+// берём короткий хвост: панель показывает недавние события, а не архив.
+const POLL_MS = 6000;
+const REPORT_LIMIT = 200;
+const LOG_LIMIT = 200;
+const OVERVIEW_REPORT_LIMIT = 40;
+
 // ---------------------------------------------------------------- палитра --
 const C = {
   bg: "#F0F3F6", card: "#FFFFFF", line: "#E4E9EE", div: "#EDF0F3",
@@ -128,7 +136,7 @@ const kv = (rows) => `
     ${rows.map(([k, v]) => `
       <div style="display:flex;align-items:center;gap:10px;padding:8px 11px;border-bottom:1px solid ${C.div};background:#F7F9FB">
         <span style="font-size:11px;color:${C.mut3};flex:0 0 130px">${esc(k)}</span>
-        <span style="font-size:11.5px;color:${C.ink2};font-family:${MONO};flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${v}</span>
+        <span style="font-size:11.5px;color:${C.ink2};font-family:${MONO};flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(v)}</span>
       </div>`).join("")}
   </div>`;
 
@@ -171,9 +179,25 @@ class BmsControlCenter extends HTMLElement {
 
   connectedCallback() {
     this.build();
-    this._timer = setInterval(() => this.refresh(true), 6000);
+    this._timer = setInterval(() => this.tick(), POLL_MS);
+    // A wall panel left on this screen for weeks must not keep polling while
+    // nobody is looking at it, and must be current the moment it is.
+    this._onVisibility = () => {
+      if (document.visibilityState === "visible") this.refresh(true);
+    };
+    document.addEventListener("visibilitychange", this._onVisibility);
   }
-  disconnectedCallback() { clearInterval(this._timer); }
+  disconnectedCallback() {
+    clearInterval(this._timer);
+    document.removeEventListener("visibilitychange", this._onVisibility);
+  }
+
+  tick() {
+    if (document.visibilityState === "hidden") return;
+    if (this._inflight) return;
+    if (this._retryAt && Date.now() < this._retryAt) return;
+    this.refresh(true);
+  }
 
   // ------------------------------------------------------------- данные --
   ws(type, payload = {}) {
@@ -182,26 +206,52 @@ class BmsControlCenter extends HTMLElement {
 
   async refresh(silent = false) {
     if (!this._hass) return;
+    // One request set at a time: a slow backend used to stack a new set on
+    // top of the previous one every 6 seconds.
+    if (this._inflight) return;
+    this._inflight = true;
     if (!silent) this.s.busy = true, this.paintHeader();
+    // Snapshot what was asked for. The operator can navigate or open another
+    // device while these are in flight, and a late answer must not be written
+    // over the screen that replaced it - the device card in particular, whose
+    // buttons would then act on a device the user is no longer looking at.
+    const sc = this.s.screen;
+    const devId = this.s.deviceId;
+    const onScreen = () => this.s.screen === sc;
     try {
       const jobs = [this.ws("overview").then((r) => (this.d.overview = r))];
-      const sc = this.s.screen;
-      if (sc === "map") jobs.push(this.ws("topology").then((r) => (this.d.topology = r)));
-      if (sc === "device" && this.s.deviceId)
-        jobs.push(this.ws("device", { device_id: this.s.deviceId }).then((r) => (this.d.device = r)).catch(() => (this.d.device = null)));
-      if (sc === "add") jobs.push(this.ws("discovered").then((r) => (this.d.discovered = r)));
+      if (sc === "map")
+        jobs.push(this.ws("topology").then((r) => { if (onScreen()) this.d.topology = r; }));
+      if (sc === "device" && devId)
+        jobs.push(this.ws("device", { device_id: devId })
+          .then((r) => { if (this.s.deviceId === devId) this.d.device = r; })
+          .catch(() => { if (this.s.deviceId === devId) this.d.device = null; }));
+      if (sc === "add")
+        jobs.push(this.ws("discovered").then((r) => { if (onScreen()) this.d.discovered = r; }));
       if (sc === "events") {
-        jobs.push(this.ws("report", { limit: 300 }).then((r) => (this.d.report = r)));
-        jobs.push(this.ws("logs", { limit: 300 }).then((r) => (this.d.logs = r)));
+        jobs.push(this.ws("report", { limit: REPORT_LIMIT }).then((r) => { if (onScreen()) this.d.report = r; }));
+        jobs.push(this.ws("logs", { limit: LOG_LIMIT }).then((r) => { if (onScreen()) this.d.logs = r; }));
       }
+      // Лента последних событий на «Обзоре» берётся из того же отчёта. Без
+      // этого запроса она читала несуществующее поле overview.recent и
+      // оставалась пустой всю сессию, пока не открыть «События».
+      if (sc === "overview")
+        jobs.push(this.ws("report", { limit: OVERVIEW_REPORT_LIMIT }).then((r) => { if (onScreen()) this.d.report = r; }));
       await Promise.all(jobs);
       this.s.updatedAt = new Date();
       this._err = null;
+      this._fails = 0;
+      this._retryAt = 0;
     } catch (e) {
       this._err = e?.message || String(e);
+      // Back off rather than re-asking a failing backend every 6 seconds.
+      this._fails = (this._fails || 0) + 1;
+      this._retryAt = Date.now() + Math.min(60000, POLL_MS * 2 ** Math.min(this._fails, 4));
+    } finally {
+      this._inflight = false;
     }
     this.s.busy = false;
-    this.paint();
+    this.paint(silent);
   }
 
   go(screen, extra = {}) {
@@ -283,11 +333,17 @@ class BmsControlCenter extends HTMLElement {
     }).join("");
   }
 
-  paint() {
+  paint(silent = false) {
     if (!this._built) return;
     this.paintHeader();
     this.paintNav();
     const main = this.shadowRoot.getElementById("main");
+    // A background refresh must never throw away what the operator is doing:
+    // repainting main replaces every node, which drops focus, the caret and a
+    // half-typed value. Header and navigation above are cheap and stay live.
+    if (silent && this.holdsLiveInput()) return;
+    const scroll = main.scrollTop;
+    const outerScroll = main.parentElement ? main.parentElement.scrollTop : 0;
     if (this._err) {
       main.innerHTML = `<div class="pad"><div class="card err">${icon("i-alert", 15, C.bad)} ${esc(this._err)}</div></div>`;
       return;
@@ -297,9 +353,27 @@ class BmsControlCenter extends HTMLElement {
       add: () => this.vAdd(), events: () => this.vEvents(), settings: () => this.vSettings(),
     }[this.s.screen];
     main.innerHTML = view ? view() : "";
+    if (silent) {
+      main.scrollTop = scroll;
+      if (main.parentElement) main.parentElement.scrollTop = outerScroll;
+    }
+  }
+
+  holdsLiveInput() {
+    const active = this.shadowRoot.activeElement;
+    return !!active && ["INPUT", "TEXTAREA", "SELECT"].includes(active.tagName);
   }
 
   // ----------------------------------------------------- фильтр по записи --
+  // Данные для ДЕЙСТВИЯ берём из полного списка, а не из rows(): rows()
+  // отфильтрован выбранной записью в шапке, и команда саб-устройству уходила
+  // с node_id = null — то есть в шлюз, а не в нужный узел.
+  deviceRow(deviceId) {
+    const open = this.d.device?.device;
+    if (open && open.device_id === deviceId) return open;
+    return (this.d.overview?.devices || []).find((r) => r.device_id === deviceId) || null;
+  }
+
   rows() {
     const all = this.d.overview?.devices || [];
     return this.s.entryFilter === "all" ? all : all.filter((r) => r.entry_id === this.s.entryFilter);
@@ -365,7 +439,7 @@ class BmsControlCenter extends HTMLElement {
       </button>`;
     }).join("") : empty("Шлюзов нет — все устройства подключаются напрямую", "i-wifi", C.mut);
 
-    const incidents = (this.d.report?.entries || this.d.overview.recent || []).slice(-8).reverse();
+    const incidents = (this.d.report?.entries || []).slice(-8).reverse();
     const feed = incidents.length ? incidents.map((e) => {
       const m = EVENT_META[e.event] || { label: e.event, color: C.mut, icon: "i-dots" };
       return `<div class="inc">
@@ -443,47 +517,14 @@ class BmsControlCenter extends HTMLElement {
         <span style="font-family:${MONO};opacity:.7">${s[k] || 0}</span></button>`;
     }).join("");
 
-    const rowsHtml = [];
-    const walk = (node, depth) => {
-      const match = !this.s.search ||
-        (node.name + " " + (node.meta || "") + " " + (node.node || "")).toLowerCase().includes(this.s.search);
-      const stateOk = !this.s.mapState || node.state === this.s.mapState;
-      const incOk = !this.s.incidentsOnly || node.state !== "online";
-      const kids = node.children || [];
-      const collapsed = this.s.collapsed.has(node.id);
-      const childHtml = collapsed ? [] : kids.map((k) => walk(k, depth + 1)).filter(Boolean);
-      const showSelf = match && stateOk && incOk;
-      if (!showSelf && !childHtml.length) return null;
-
-      const k = KIND[node.kind] || KIND.device;
-      const st = ST[node.state] || ST.config;
-      const sel = this.s.selected === node.id;
-      const html = `
-        <div class="trow ${sel ? "sel" : ""}" data-act="select" data-node="${esc(node.id)}" data-device="${esc(node.device_id || "")}">
-          <span class="tmark" style="background:${sel ? C.accent : "transparent"}"></span>
-          <span class="tname">
-            <span style="width:${depth * 18}px;flex:0 0 auto"></span>
-            ${kids.length
-              ? `<button class="tchev" data-act="toggle" data-node="${esc(node.id)}">${icon(collapsed ? "i-chev-r" : "i-chev-d", 13)}</button>`
-              : `<span class="tdot"></span>`}
-            ${icon(k.icon, 15, k.color)}
-            <span class="tlabel">
-              <span style="font-size:${k.size};font-weight:${k.weight};color:${C.ink};font-family:${k.font}">${esc(node.name)}</span>
-              <span class="tmeta">${esc(node.meta || "")}</span>
-            </span>
-          </span>
-          <span style="width:172px;flex:0 0 auto">${pill(node.state, node.kind)}</span>
-          <span class="tval">${esc(node.value || "")}</span>
-          <span class="tnode">${esc(node.node || "")}</span>
-        </div>`;
-      rowsHtml.push(showSelf ? html : "");
-      childHtml.forEach(() => {});
-      return html;
-    };
     const flat = [];
+    // Пока действует фильтр, обходим всё дерево: иначе поиск не находит
+    // устройство, спрятанное под свёрнутым узлом («Свернуть всё» сворачивает
+    // и корень), и панель отвечает «Ничего не найдено» про живое устройство.
+    const filtering = !!(this.s.search || this.s.mapState || this.s.incidentsOnly);
     const walk2 = (node, depth) => {
       const kids = node.children || [];
-      const collapsed = this.s.collapsed.has(node.id);
+      const collapsed = !filtering && this.s.collapsed.has(node.id);
       flat.push({ node, depth });
       if (!collapsed) kids.forEach((k) => walk2(k, depth + 1));
     };
@@ -500,7 +541,7 @@ class BmsControlCenter extends HTMLElement {
     const tree = visible.map(({ node, depth }) => {
       const k = KIND[node.kind] || KIND.device;
       const kids = node.children || [];
-      const collapsed = this.s.collapsed.has(node.id);
+      const collapsed = !filtering && this.s.collapsed.has(node.id);
       const sel = this.s.selected === node.id;
       return `<div class="trow ${sel ? "sel" : ""}" data-act="select" data-node="${esc(node.id)}" data-device="${esc(node.device_id || "")}">
         <span class="tmark" style="background:${sel ? C.accent : "transparent"}"></span>
@@ -564,7 +605,7 @@ class BmsControlCenter extends HTMLElement {
       fields.push(["Адрес", row.host], ["Протокол", row.protocol]);
       fields.push(["Последний ответ", age(row.last_update_age)]);
       if (row.retries) fields.push(["Попыток подряд", row.retries]);
-      if (row.last_error) fields.push(["Последняя ошибка", esc(row.last_error)]);
+      if (row.last_error) fields.push(["Последняя ошибка", row.last_error]);
       fields.push(["Сущностей", row.entity_count]);
     }
 
@@ -657,16 +698,16 @@ class BmsControlCenter extends HTMLElement {
       ["Доступно для HA", r.available ? "да" : "нет"],
       ["Последний ответ", age(r.last_update_age) + (r.last_update_age !== null ? " назад" : "")],
       ["Попыток подряд", r.retries || 0],
-      ["Последняя ошибка", esc(r.last_error || "—")],
+      ["Последняя ошибка", r.last_error || "—"],
       ["Отладка устройства", r.enable_debug ? "включена" : "выключена"],
     ];
     const chain = [
-      ["Запись конфигурации", esc(r.entry_id.slice(-10))],
+      ["Запись конфигурации", String(r.entry_id || "").slice(-10)],
       ["Транспорт", r.is_subdevice ? "через шлюз Zigbee" : "прямое Wi-Fi подключение"],
-      ["Шлюз", d.gateway ? esc(d.gateway.name) : "—"],
-      ["Node ID", esc(r.node_id || "—")],
+      ["Шлюз", d.gateway ? d.gateway.name : "—"],
+      ["Node ID", r.node_id || "—"],
       ["Дочерних устройств", d.children.length],
-      ["Комната", esc(r.area_name || "не назначена")],
+      ["Комната", r.area_name || "не назначена"],
     ];
     const kids = d.children.length ? `
       ${cardOpen(`Дочерние устройства · ${d.children.length}`)}
@@ -699,7 +740,10 @@ class BmsControlCenter extends HTMLElement {
     const map = {};
     (d.entity_configs || []).forEach((c) => (map[c.id] = c));
     const rows = d.device.entities.map((e) => {
-      const cfg = Object.values(map).find((c) => e.entity_id.startsWith(c.platform + "."));
+      // Сопоставление строго по датапоинту из unique_id. Поиск по префиксу
+      // платформы давал один и тот же DP всем каналам многоклавишного
+      // выключателя.
+      const cfg = (e.dp_id && map[e.dp_id]) || null;
       const mapping = cfg ? Object.entries(cfg.mapping).filter(([k]) => k !== "platform")
         .map(([k, v]) => `${k.replace(/_dp$/, "")}=${v}`).join(" · ") : "";
       const bad = e.state === "unavailable" || e.state === "unknown";
@@ -771,7 +815,7 @@ class BmsControlCenter extends HTMLElement {
     const c = d.config;
     const fields = Object.entries(c)
       .filter(([k]) => !["entities", "dps_strings"].includes(k))
-      .map(([k, v]) => [k, esc(typeof v === "object" ? JSON.stringify(v) : String(v))]);
+      .map(([k, v]) => [k, typeof v === "object" ? JSON.stringify(v) : String(v)]);
     return `${cardOpen("Транспорт и устройство",
       `<span class="small mut">ключи и секреты не передаются в панель</span>`)}
       <div style="padding:14px">${kv(fields)}</div>${cardClose}
@@ -902,7 +946,7 @@ class BmsControlCenter extends HTMLElement {
           <div><b style="color:${e.problems ? C.bad : C.ok}">${e.problems}</b><span>${
             plural(e.problems, "проблема", "проблемы", "проблем").replace(/^\d+\s/, "")}</span></div>
         </div>
-        ${kv([["Идентификатор", esc(e.entry_id)], ["Облачный аккаунт", e.no_cloud ? "не привязан" : "привязан"]])}
+        ${kv([["Идентификатор", e.entry_id], ["Облачный аккаунт", e.no_cloud ? "не привязан" : "привязан"]])}
         <div style="display:flex;gap:7px;flex-wrap:wrap">
           ${btn("Показать на карте", { act: "nav", data: 'data-nav="map"', ico: "i-network" })}
           ${btn("Перезагрузить запись", { act: "reload-entry", data: `data-entry="${esc(e.entry_id)}"`, danger: true, ico: "i-refresh" })}
@@ -1019,7 +1063,7 @@ class BmsControlCenter extends HTMLElement {
 
     // ---- действия, меняющие состояние --------------------------------
     if (a === "dev-refresh" || a === "dev-reconnect" || a === "dev-test") {
-      const row = this.rows().find((r) => r.device_id === id);
+      const row = this.deviceRow(id);
       const action = a === "dev-refresh" ? "refresh" : a === "dev-test" ? "status_test" : "reconnect";
       el.disabled = true;
       try {

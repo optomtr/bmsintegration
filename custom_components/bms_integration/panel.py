@@ -26,6 +26,7 @@ PANEL_COMPONENT = "bms-devices-panel"
 STATIC_URL_PATH = "/bms_integration_panel"
 
 DATA_PANEL_REGISTERED = "panel_registered"
+DATA_STATIC_REGISTERED = "panel_static_registered"
 DATA_LOG_BUFFER = "log_buffer"
 DATA_LOG_HANDLER = "log_handler"
 
@@ -66,6 +67,73 @@ async def async_setup_panel(hass: HomeAssistant) -> None:
     domain_data = hass.data.setdefault(DOMAIN, {})
     if domain_data.get(DATA_PANEL_REGISTERED):
         return
+    # Claim the slot before the first await. Home Assistant sets config
+    # entries up concurrently, so two entries used to get past this check
+    # together and each added its own log handler - the first was then
+    # orphaned on the logger for the rest of the process.
+    domain_data[DATA_PANEL_REGISTERED] = True
+
+    try:
+        _async_setup_log_buffer(hass, domain_data)
+
+        integration = await async_get_integration(hass, DOMAIN)
+        version = integration.version or "dev"
+
+        panel_dir = hass.config.path(f"custom_components/{DOMAIN}/panel")
+
+        # aiohttp has no API to unregister a static route, so this may happen
+        # exactly once per Home Assistant run. It is deliberately tracked
+        # apart from the sidebar panel, which does come and go.
+        if not domain_data.get(DATA_STATIC_REGISTERED):
+            await _async_register_static(hass, panel_dir)
+            domain_data[DATA_STATIC_REGISTERED] = True
+
+        # Bust the browser cache on the file itself, not just on the release: a
+        # panel that keeps serving yesterday's JavaScript is indistinguishable
+        # from a panel that is broken.
+        def _asset_stamp() -> str:
+            try:
+                return str(int(os.path.getmtime(os.path.join(panel_dir, "panel.js"))))
+            except OSError:
+                return "0"
+
+        stamp = await hass.async_add_executor_job(_asset_stamp)
+
+        try:
+            await panel_custom.async_register_panel(
+                hass,
+                webcomponent_name=PANEL_COMPONENT,
+                sidebar_title=PANEL_TITLE,
+                sidebar_icon=PANEL_ICON,
+                frontend_url_path=PANEL_URL_PATH,
+                # The query string busts the browser cache on every upgrade;
+                # without it a stale panel silently outlives the release.
+                module_url=f"{STATIC_URL_PATH}/panel.js?v={version}-{stamp}",
+                embed_iframe=False,
+                require_admin=True,
+            )
+        except ValueError:
+            # Already registered - a reload of one entry must not fail here.
+            pass
+    except Exception:
+        # Never leave the flag claimed for a registration that did not happen,
+        # or the panel would stay missing until Home Assistant restarts.
+        domain_data[DATA_PANEL_REGISTERED] = False
+        raise
+
+    _LOGGER.info("Панель управления зарегистрирована: /%s (v%s)", PANEL_URL_PATH, version)
+
+
+@callback
+def _async_setup_log_buffer(hass: HomeAssistant, domain_data: dict) -> None:
+    """Attach the in-memory log handler once per Home Assistant run.
+
+    The buffer outlives config-entry reloads on purpose: an operator watching
+    the panel's log while reconnecting a device would otherwise lose exactly
+    the lines that explain what happened.
+    """
+    if domain_data.get(DATA_LOG_HANDLER) is not None:
+        return
 
     buffer: deque = deque(maxlen=LOG_BUFFER_SIZE)
     handler = _RingLogHandler(buffer)
@@ -73,43 +141,6 @@ async def async_setup_panel(hass: HomeAssistant) -> None:
     logging.getLogger(f"custom_components.{DOMAIN}").addHandler(handler)
     domain_data[DATA_LOG_BUFFER] = buffer
     domain_data[DATA_LOG_HANDLER] = handler
-
-    integration = await async_get_integration(hass, DOMAIN)
-    version = integration.version or "dev"
-
-    panel_dir = hass.config.path(f"custom_components/{DOMAIN}/panel")
-    await _async_register_static(hass, panel_dir)
-
-    # Bust the browser cache on the file itself, not just on the release: a
-    # panel that keeps serving yesterday's JavaScript is indistinguishable
-    # from a panel that is broken.
-    def _asset_stamp() -> str:
-        try:
-            return str(int(os.path.getmtime(os.path.join(panel_dir, "panel.js"))))
-        except OSError:
-            return "0"
-
-    stamp = await hass.async_add_executor_job(_asset_stamp)
-
-    try:
-        await panel_custom.async_register_panel(
-            hass,
-            webcomponent_name=PANEL_COMPONENT,
-            sidebar_title=PANEL_TITLE,
-            sidebar_icon=PANEL_ICON,
-            frontend_url_path=PANEL_URL_PATH,
-            # The query string busts the browser cache on every upgrade;
-            # without it a stale panel silently outlives the release.
-            module_url=f"{STATIC_URL_PATH}/panel.js?v={version}-{stamp}",
-            embed_iframe=False,
-            require_admin=True,
-        )
-    except ValueError:
-        # Already registered - a reload of one entry must not fail here.
-        pass
-
-    domain_data[DATA_PANEL_REGISTERED] = True
-    _LOGGER.info("Панель управления зарегистрирована: /%s (v%s)", PANEL_URL_PATH, version)
 
 
 async def _async_register_static(hass: HomeAssistant, panel_dir: str) -> None:
@@ -126,18 +157,26 @@ async def _async_register_static(hass: HomeAssistant, panel_dir: str) -> None:
 
 @callback
 def async_remove_panel(hass: HomeAssistant) -> None:
-    """Remove the panel and stop capturing the log."""
+    """Remove the panel and stop capturing the log.
+
+    Only for the integration being removed for good. Unloading a config entry
+    to reload it must NOT come through here: the panel is global, and tearing
+    it down on every reload made it disappear from the sidebar for a moment,
+    dropped the log the operator was reading, and leaked one aiohttp static
+    resource per cycle.
+    """
     domain_data = hass.data.get(DOMAIN, {})
-    if not domain_data.get(DATA_PANEL_REGISTERED):
-        return
 
     handler = domain_data.pop(DATA_LOG_HANDLER, None)
     if handler is not None:
         logging.getLogger(f"custom_components.{DOMAIN}").removeHandler(handler)
     domain_data.pop(DATA_LOG_BUFFER, None)
 
+    if not domain_data.get(DATA_PANEL_REGISTERED):
+        return
+
     try:
         frontend.async_remove_panel(hass, PANEL_URL_PATH)
-    except Exception:  # noqa: BLE001 - removal is best effort on reload
+    except Exception:  # noqa: BLE001 - removal is best effort
         pass
     domain_data[DATA_PANEL_REGISTERED] = False

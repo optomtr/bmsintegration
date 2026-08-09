@@ -25,6 +25,7 @@ from homeassistant.const import (
 from homeassistant.core import Event, HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_call_later, async_track_time_interval
+from homeassistant.helpers.service import async_register_admin_service
 
 from .coordinator import (
     GATEWAY_WATCHDOG_INTERVAL,
@@ -223,10 +224,14 @@ async def async_setup(hass: HomeAssistant, config: dict):
         """Clean up resources when shutting down."""
         discovery.close()
 
-    hass.services.async_register(DOMAIN, SERVICE_RELOAD, _handle_reload)
+    # Writing a raw datapoint and reloading the integration are admin actions:
+    # the panel's WebSocket equivalents require admin, and the services must
+    # not be the way around that check. async_register_admin_service still
+    # lets automations and scripts call them (they run without a user).
+    async_register_admin_service(hass, DOMAIN, SERVICE_RELOAD, _handle_reload)
 
-    hass.services.async_register(
-        DOMAIN, SERVICE_SET_DP, _handle_set_dp, schema=SERVICE_SET_DP_SCHEMA
+    async_register_admin_service(
+        hass, DOMAIN, SERVICE_SET_DP, _handle_set_dp, schema=SERVICE_SET_DP_SCHEMA
     )
     hass.services.async_register(
         DOMAIN,
@@ -607,19 +612,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unloading the Tuya platforms."""
-    # Unload the platforms.
-    await hass.config_entries.async_unload_platforms(entry, PLATFORMS.values())
-    hass.data[DOMAIN].pop(entry.entry_id)
+    # Report the real result. Discarding it and returning True told Home
+    # Assistant an entry was unloaded when some of its entities were still
+    # live; the reload that followed then built a second set on top.
+    unloaded = await hass.config_entries.async_unload_platforms(
+        entry, PLATFORMS.values()
+    )
+    if not unloaded:
+        _LOGGER.warning("Не удалось выгрузить платформы записи %s", entry.title)
+        return False
 
-    # The panel is global: drop it only when the last entry goes away, or a
-    # reload of one entry would leave the sidebar empty.
-    if not any(
-        isinstance(value, HassLocalTuyaData) for value in hass.data[DOMAIN].values()
-    ):
-        async_remove_panel(hass)
+    hass.data[DOMAIN].pop(entry.entry_id, None)
 
+    # The panel is global and deliberately survives a reload: see
+    # async_remove_panel. It is dropped in async_remove_entry instead.
     _LOGGER.info("Unload completed")
     return True
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Drop the global panel once the last config entry is removed."""
+    remaining = [
+        other
+        for other in hass.config_entries.async_entries(DOMAIN)
+        if other.entry_id != entry.entry_id
+    ]
+    if not remaining:
+        async_remove_panel(hass)
 
 
 async def update_listener(hass: HomeAssistant, config_entry: ConfigEntry):
