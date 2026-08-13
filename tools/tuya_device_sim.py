@@ -359,6 +359,7 @@ class Simulator:
         nearby_cids: set[str] | None = None,
         subdev_chunk: int = 0,
         protocol: str = PROTOCOL,
+        reply_delay: float = 0.0,
     ):
         self.devices = devices
         self.offline = offline
@@ -368,6 +369,11 @@ class Simulator:
         self.nearby_cids = nearby_cids or set()
         self.subdev_chunk = subdev_chunk
         self.protocol = protocol
+        # A real hub relays each command over Zigbee one at a time, so a burst
+        # of commands queues up behind it. Without this the simulator answers
+        # instantly and no amount of load ever reproduces a reply timeout.
+        self.reply_delay = reply_delay
+        self._relay_lock = asyncio.Lock()
         self.push_seqno = 1000
 
     def _state_for(self, dev_id: str | None, cid: str | None) -> dict | None:
@@ -468,6 +474,10 @@ class Simulator:
             return dev_id
 
         if msg.cmd in (CMDType.CONTROL, CMDType.CONTROL_NEW):
+            if self.reply_delay:
+                # Serialised, like the hub's single Zigbee radio.
+                async with self._relay_lock:
+                    await asyncio.sleep(self.reply_delay)
             dps = body.get("dps") or inner.get("dps") or {}
             if state is not None:
                 state.update(dps)
@@ -654,6 +664,7 @@ async def main_async(args):
         nearby_cids=set(args.nearby_cid or []),
         subdev_chunk=args.subdev_chunk,
         protocol=args.protocol,
+        reply_delay=args.reply_delay,
     )
     server = await asyncio.start_server(sim.handle, args.host, args.port)
     stop = asyncio.Event()
@@ -680,6 +691,9 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=6668)
     ap.add_argument("--offline", nargs="*", help="device ids that must not answer")
+    ap.add_argument("--reply-delay", type=float, default=0.0, metavar="SEC",
+                    help="seconds the hub spends relaying each command, "
+                         "serialised - reproduces a burst overloading a hub")
     ap.add_argument("--protocol", default=PROTOCOL, choices=["3.3", "3.4", "3.5"],
                     help="LAN protocol to speak (the pilot gateway is 3.5)")
     ap.add_argument("--offline-cid", nargs="*", metavar="CID",

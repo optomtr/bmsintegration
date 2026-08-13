@@ -203,6 +203,76 @@ class EndToEnd(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await proto.status(), {"32": "normal"})
 
 
+class MassToggleBurst(unittest.IsolatedAsyncioTestCase):
+    """Twelve light groups switched at once, through one hub.
+
+    Reported from a site: a mass on/off sometimes left a few groups not
+    switched. A hub relays commands over a single Zigbee radio, so a burst
+    queues up behind it and the later replies pass TIMEOUT_REPLY. That alone
+    is survivable - what was not, is treating one reply timeout as a dead
+    transport: the reset tore down the socket every other sub-device shares,
+    and everything still queued behind it was lost.
+    """
+
+    GROUPS = 12
+    RELAY = 0.6  # seconds the hub spends relaying each command
+
+    async def asyncSetUp(self):
+        self.devices = sim_module.build_scenario()
+        gateway = self.devices[GATEWAY_ID]
+        gateway["sub_devices"] = {
+            f"simcid{index:010d}": {"name": f"Группа {index}", "dps": {"1": False}}
+            for index in range(1, self.GROUPS + 1)
+        }
+        self.cids = list(gateway["sub_devices"])
+        self.sim = sim_module.Simulator(
+            self.devices, offline=set(), protocol="3.5", reply_delay=self.RELAY
+        )
+        self.server = await asyncio.start_server(self.sim.handle, "127.0.0.1", 0)
+        self.port = self.server.sockets[0].getsockname()[1]
+
+    async def asyncTearDown(self):
+        self.server.close()
+        await self.server.wait_closed()
+
+    async def test_no_command_is_lost_when_the_hub_falls_behind(self):
+        proto = await pytuya.connect(
+            "127.0.0.1",
+            GATEWAY_ID,
+            SIM_KEY,
+            3.5,
+            False,
+            GatewayListener(self.cids),
+            self.port,
+        )
+        try:
+            outcomes = await asyncio.gather(
+                *[proto.set_dp(True, "1", cid=cid) for cid in self.cids],
+                return_exceptions=True,
+            )
+            timed_out = [r for r in outcomes if isinstance(r, TimeoutError)]
+            self.assertTrue(
+                timed_out,
+                "the hub kept up, so this run proves nothing - raise RELAY",
+            )
+
+            # The socket every sub-device shares must still be up.
+            self.assertTrue(proto.is_connected, "a slow hub closed the shared session")
+
+            # Let the hub work through its queue, then check the hardware.
+            await asyncio.sleep(self.GROUPS * self.RELAY + 2)
+            not_switched = [
+                cid
+                for cid in self.cids
+                if self.devices[GATEWAY_ID]["sub_devices"][cid]["dps"]["1"] is not True
+            ]
+            self.assertEqual(
+                not_switched, [], f"{len(not_switched)} of {self.GROUPS} groups never switched"
+            )
+        finally:
+            await asyncio.wait_for(proto.close(), 5)
+
+
 class EndToEnd34(EndToEnd):
     """The same suite over a negotiated 3.4 session."""
 
