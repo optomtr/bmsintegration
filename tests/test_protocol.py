@@ -466,6 +466,49 @@ async def test_info_repeat_is_rate_limited():
     ctx.info("другое сообщение")
     check("другое сообщение пишется на INFO", records.count(_logging.INFO) == 2)
 
+
+async def test_abort_gives_waiters_an_error_not_cancellation():
+    """Гибель сессии не должна отменять вызывающего.
+
+    abort() отменял futures ожидающих команд, и CancelledError уходил из
+    обработчика сервиса наружу. В Home Assistant это не сообщение об ошибке,
+    а отмена: скрипт, отправляющий пачку команд, обрывался на середине.
+    Нагрузочный прогон на 30 мигающих шлюзах дал 53 таких случая из 18 315.
+    """
+    print("\n== abort(): ожидающие получают ошибку связи, а не отмену ==")
+
+    d = pytuya.MessageDispatcher("deviceid123456789012", lambda m, ack=False: None, 3.3, KEY)
+    d.set_logger(__import__("logging").getLogger("test"), "deviceid123456789012")
+
+    waiter = asyncio.get_running_loop().create_task(
+        d.wait_for(11, int(CMDType.CONTROL), timeout=30)
+    )
+    await asyncio.sleep(0)          # дать зарегистрироваться
+    d.abort()
+
+    try:
+        await waiter
+        check("ожидающий получает исключение", False)
+    except asyncio.CancelledError:
+        check("ожидающий НЕ получает CancelledError", False, "прилетела отмена")
+    except ConnectionError as ex:
+        check("ожидающий получает ConnectionError", True)
+        check("причина названа", "session" in str(ex).lower(), str(ex))
+
+    check("слушатели вычищены", d.listeners == {})
+
+    # Отмена самой задачи вызывающего по-прежнему должна работать как отмена.
+    second = asyncio.get_running_loop().create_task(
+        d.wait_for(12, int(CMDType.CONTROL), timeout=30)
+    )
+    await asyncio.sleep(0)
+    second.cancel()
+    try:
+        await second
+        check("отмена задачи вызывающего сохраняется", False)
+    except asyncio.CancelledError:
+        check("отмена задачи вызывающего сохраняется", True)
+
 async def main():
     await test_dispatcher()
     await test_dispatcher_6699()
@@ -479,6 +522,7 @@ async def main():
     await test_seqno_resync_is_bounded()
     await test_wait_for_refuses_to_orphan_a_waiter()
     await test_info_repeat_is_rate_limited()
+    await test_abort_gives_waiters_an_error_not_cancellation()
     print(f"\n===== ИТОГ: PASS {len(PASS)} / FAIL {len(FAIL)} =====")
     if FAIL:
         print("Провалено:", *FAIL, sep="\n  - ")

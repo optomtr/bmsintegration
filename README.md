@@ -101,6 +101,12 @@ the license text.
 - The panel escapes every value it renders, ignores a late answer for a device
   the operator has navigated away from, keeps focus and scroll during its
   background refresh, and stops polling while the tab is hidden.
+- A gateway dropping mid-command no longer cancels the caller. Pending waiters
+  were released by cancelling their futures, so a CancelledError travelled out
+  of the service call - which in Home Assistant is not an error message but
+  task cancellation, stopping a script halfway through a batch. They now get a
+  connection error instead. A stress run of 18 315 commands across 30 flapping
+  hubs surfaced 53 of these.
 - The `set_dp` and `reload` services are admin-only, matching the panel, and
   answer with a readable error instead of a bare `KeyError` when the device or
   its entry is gone.
@@ -238,6 +244,17 @@ python3 tests/run_all.py
 ```
 
 Suites are discovered, not listed: a new `tests/test_*.py` runs automatically.
+`tools/stress_test.py` runs the whole fleet without hardware: it starts N hub
+simulators, builds real `TuyaDevice` objects on top of them and drives a cold
+start, a command storm, hub outages, address changes (as entry reloads) and a
+chaos phase where slow hubs flap under continuous load, checking that nothing
+is left without a recovery task and that tasks, listeners and memory do not
+grow. The default is 30 hubs and 720 devices.
+
+```bash
+python3 tools/stress_test.py --hubs 30 --per-hub 23 --chaos 5
+```
+
 `tools/tuya_device_sim.py` simulates a Zigbee hub with sub-devices over
 protocol 3.3, 3.4 or 3.5 - including a session-key handshake, a reply split
 over several frames, children reported offline or only "nearby", and a device
