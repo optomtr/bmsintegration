@@ -271,7 +271,7 @@
           "select_options": "Each line represents [ device_value: friendly name ]",
           "swing_modes": "Each line represents [ device_value: friendly name ]",
           "swing_horizontal_modes": "Each line represents [ device_value: friendly name ]",
-          "alarm_supported_states": "Each line represents [ supported state: device value ] [Supported States](https://developers.home-assistant.io/docs/core/entity/alarm-control-panel/#states)",
+          "alarm_supported_states": "Each line represents [ supported state: device value ]. Supported states: disarmed, armed_home, armed_away, armed_night, armed_vacation, armed_custom_bypass, triggered",
           "humidifier_available_modes": "Each line represents [ device_value: friendly name ]",
           "fan_speed_list": "Each line represents [ device_value: friendly name ]",
           "device_class": "Find out more about [Device Classes](https://www.home-assistant.io/integrations/homeassistant/#device-class)",
