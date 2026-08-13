@@ -264,18 +264,18 @@
           "swing_horizontal_modes": "(Необязательно) Доступные режимы горизонтальных жалюзи"
         },
         "data_description": {
-          "hvac_mode_set": "Каждая строка задаёт [ режим_hvac: значение_устройства ] [Поддерживаемые режимы HVAC](https://developers.home-assistant.io/docs/core/entity/climate/#hvac-modes)",
-          "hvac_action_set": "Каждая строка задаёт [ действие_hvac: значение_устройства ] [Поддерживаемые действия HVAC](https://developers.home-assistant.io/docs/core/entity/climate/#hvac-action)",
+          "hvac_mode_set": "Каждая строка задаёт [ режим_hvac: значение_устройства ] Поддерживаемые режимы HVAC",
+          "hvac_action_set": "Каждая строка задаёт [ действие_hvac: значение_устройства ] Поддерживаемые действия HVAC",
           "preset_set": "Каждая строка задаёт [ значение_устройства: отображаемое имя ]",
           "scene_values": "Каждая строка задаёт [ значение_устройства: отображаемое имя ]",
           "select_options": "Каждая строка задаёт [ значение_устройства: отображаемое имя ]",
           "swing_modes": "Каждая строка задаёт [ значение_устройства: отображаемое имя ]",
           "swing_horizontal_modes": "Каждая строка задаёт [ значение_устройства: отображаемое имя ]",
-          "alarm_supported_states": "Каждая строка задаёт [ поддерживаемое состояние: значение устройства ] [Поддерживаемые состояния](https://developers.home-assistant.io/docs/core/entity/alarm-control-panel/#states)",
+          "alarm_supported_states": "Каждая строка задаёт [ поддерживаемое состояние: значение устройства ] Поддерживаемые состояния",
           "humidifier_available_modes": "Каждая строка задаёт [ значение_устройства: отображаемое имя ]",
           "fan_speed_list": "Каждая строка задаёт [ значение_устройства: отображаемое имя ]",
-          "device_class": "Подробнее о [классах устройств](https://www.home-assistant.io/integrations/homeassistant/#device-class)",
-          "state_class": "Подробнее о [классах состояний](https://developers.home-assistant.io/docs/core/entity/sensor/#available-state-classes)"
+          "device_class": "Подробнее о классах устройств",
+          "state_class": "Подробнее о классах состояний"
         }
       }
     }
