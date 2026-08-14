@@ -217,6 +217,27 @@ class PanelFrontend(unittest.TestCase):
         result = subprocess.run([node, script], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_panel_receives_hass(self):
+        """Данные должны доходить до панели при любом порядке инициализации.
+
+        Отрисовка экранов этого не проверяет: она подставляет данные готовыми.
+        Панель зависла у оператора на «Загрузка…» именно тут - Home Assistant
+        присвоил el.hass до апгрейда элемента, присвоение перекрыло сеттер, и
+        запросы не ушли ни разу.
+        """
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node не установлен")
+        script = os.path.join(REPO_ROOT, "tests", "js", "lifecycle.js")
+        result = subprocess.run([node, script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_upgrade_race_is_handled_in_source(self):
+        """Возврат собственных свойств должен стоять в connectedCallback."""
+        panel = source("panel", "panel.js")
+        connected = panel[panel.index("connectedCallback()") :][:900]
+        self.assertIn("reclaimProperty(\"hass\")", connected)
+
     def test_parses_as_javascript(self):
         node = shutil.which("node")
         if not node:

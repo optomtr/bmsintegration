@@ -169,6 +169,21 @@ the license text.
   self-recovery, 7 072/7 072 commands delivered while garbage preceded every
   third reply, and a soak with zero task/listener/memory growth.
 
+### The panel stuck on "Загрузка…"
+
+Home Assistant assigns `el.hass` as soon as it creates a panel element. If the
+panel module has not finished loading, the element is not upgraded yet and
+that assignment lands as an **own property**, shadowing the prototype setter
+for good: the setter never runs, `refresh()` returns on its first line, and
+the panel sits on its loading placeholder forever. The race gets likelier as
+the file grows, which is why it only started biting recently. The element now
+reclaims such properties on connect.
+
+Found alongside it: a throw while painting the header or the navigation bar
+aborted `paint()` before the main area was written, which looks identical to
+the same freeze. Those two are now painted inside their own guard, and the
+navigation no longer assumes the overview reply carries a summary.
+
 ## Install
 
 ### Manual

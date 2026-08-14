@@ -184,6 +184,14 @@ class BmsControlCenter extends HTMLElement {
 
   connectedCallback() {
     this.build();
+    // Home Assistant присваивает el.hass, как только создаст элемент. Если
+    // модуль панели к этому моменту ещё не загрузился, элемент не апгрейднут,
+    // и присвоение оседает СОБСТВЕННЫМ полем экземпляра - поверх сеттера
+    // прототипа. Сеттер не сработает уже никогда: панель навсегда остаётся на
+    // «Загрузка…», потому что refresh() выходит на проверке this._hass.
+    // Гонка тем вероятнее, чем крупнее файл панели, поэтому проявилась она
+    // не сразу. Забираем такие поля обратно на сеттер.
+    this.reclaimProperty("hass");
     this._timer = setInterval(() => this.tick(), POLL_MS);
     // A wall panel left on this screen for weeks must not keep polling while
     // nobody is looking at it, and must be current the moment it is.
@@ -195,6 +203,13 @@ class BmsControlCenter extends HTMLElement {
   disconnectedCallback() {
     clearInterval(this._timer);
     document.removeEventListener("visibilitychange", this._onVisibility);
+  }
+
+  reclaimProperty(name) {
+    if (!Object.prototype.hasOwnProperty.call(this, name)) return;
+    const value = this[name];
+    delete this[name];
+    this[name] = value;   // теперь попадёт в сеттер прототипа
   }
 
   tick() {
@@ -371,7 +386,8 @@ class BmsControlCenter extends HTMLElement {
   }
 
   paintNav() {
-    const problems = this.d.overview ? this.d.overview.summary.total - this.d.overview.summary.online : 0;
+    const sum = this.d.overview?.summary;
+    const problems = sum ? (sum.total || 0) - (sum.online || 0) : 0;
     this.shadowRoot.getElementById("nav").innerHTML = NAV.map((n) => {
       const on = this.s.screen === n.id;
       const badge = n.id === "events" && problems > 0
@@ -383,8 +399,16 @@ class BmsControlCenter extends HTMLElement {
 
   paint(silent = false) {
     if (!this._built) return;
-    this.paintHeader();
-    this.paintNav();
+    // Шапка и навигация рисуются до основного блока, и раньше их исключение
+    // выбрасывало из paint() целиком: главная область оставалась на прежнем
+    // кадре - для оператора это неотличимо от вечной «Загрузка…». Пусть
+    // неполные данные ломают одну полоску интерфейса, а не всю панель.
+    try {
+      this.paintHeader();
+      this.paintNav();
+    } catch (err) {
+      console.error("BMS: не удалось отрисовать шапку", err);
+    }
     const main = this.shadowRoot.getElementById("main");
     // A background refresh must never throw away what the operator is doing:
     // repainting main replaces every node, which drops focus, the caret and a
