@@ -20,6 +20,7 @@ python3 tests/test_panel_api.py       # panel + websocket privileged surface
 python3 tests/test_discovery.py       # UDP input handling and socket recovery
 python3 tests/test_end_to_end.py      # the protocol against a real socket
 python3 tests/test_replace.py         # replacing a device without losing it
+python3 tests/test_lockdown.py        # no request escapes when the cloud is off
 ```
 
 `run_all.py` discovers `test_*.py` rather than listing the suites, so a new
@@ -45,6 +46,11 @@ was silently never executed.
   command rollback, and the platform defects found by the audit (lock
   direction, alarm feature flags, water heater and vacuum crashes, base64
   sensor decoding, and others).
+- `test_lockdown.py` — the network layer is replaced with one that fails the
+  test on any contact, then every public cloud method is called: if a single
+  path slipped past the latch, the suite goes red. Also asserts the check sits
+  ahead of the token refresh, and that the network is reached only from the one
+  place the latch guards.
 - `test_replace.py` — what a replacement must preserve and what it must refuse:
   a credentials-only change touches no registry, a physical replacement moves
   every `unique_id` and the device-registry identifier while keeping the same

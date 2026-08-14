@@ -326,6 +326,8 @@ OPT_GRACE_PERIOD = "availability_grace_period"
 OPT_STARTUP_GRACE = "startup_grace_period"
 OPT_WATCHDOG_INTERVAL = "gateway_watchdog_interval"
 OPT_DEBUG = "integration_debug"
+# Изолированный режим: полный запрет обмена с облаком Tuya.
+OPT_LOCKDOWN = "cloud_lockdown"
 
 DEFAULT_GRACE_PERIOD = 120
 DEFAULT_STARTUP_GRACE = 300

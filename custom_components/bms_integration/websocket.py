@@ -40,6 +40,7 @@ from .const import (
     OPT_DEBUG,
     OPT_GRACE_PERIOD,
     OPT_HOME_NAME,
+    OPT_LOCKDOWN,
     OPT_STARTUP_GRACE,
     OPT_WATCHDOG_INTERVAL,
 )
@@ -304,6 +305,11 @@ def ws_settings(hass: HomeAssistant, connection, msg: dict) -> None:
                     OPT_WATCHDOG_INTERVAL, DEFAULT_WATCHDOG_INTERVAL
                 ),
                 "debug": bool(options.get(OPT_DEBUG, False)),
+                "lockdown": bool(options.get(OPT_LOCKDOWN, False)),
+                "cloud_configured": not entry.data.get("no_cloud", True),
+                "blocked_requests": getattr(
+                    (_data.cloud_data if _data else None), "blocked_requests", 0
+                ),
             }
         )
     connection.send_result(
@@ -328,6 +334,7 @@ def ws_settings(hass: HomeAssistant, connection, msg: dict) -> None:
         vol.Optional("startup_grace"): vol.All(int, vol.Range(min=0, max=7200)),
         vol.Optional("watchdog_interval"): vol.All(int, vol.Range(min=10, max=600)),
         vol.Optional("debug"): bool,
+        vol.Optional("lockdown"): bool,
     }
 )
 @websocket_api.require_admin
@@ -346,6 +353,7 @@ def ws_update_settings(hass: HomeAssistant, connection, msg: dict) -> None:
         ("startup_grace", OPT_STARTUP_GRACE),
         ("watchdog_interval", OPT_WATCHDOG_INTERVAL),
         ("debug", OPT_DEBUG),
+        ("lockdown", OPT_LOCKDOWN),
     ):
         if key in msg:
             options[option] = msg[key]

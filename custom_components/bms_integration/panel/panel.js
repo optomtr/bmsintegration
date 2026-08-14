@@ -247,8 +247,9 @@ class BmsControlCenter extends HTMLElement {
       }
       if (sc === "rooms")
         jobs.push(this.ws("areas").then((r) => { if (onScreen()) this.d.areas = r; }));
-      if (sc === "settings")
-        jobs.push(this.ws("settings").then((r) => { if (onScreen()) this.d.settings = r; }));
+      // Настройки тянем всегда: по ним рисуется значок изолированного режима
+      // в шапке, а он должен быть виден на любом экране.
+      jobs.push(this.ws("settings").then((r) => (this.d.settings = r)));
       if (sc === "device" && devId)
         jobs.push(this.ws("replace_preview", { device_id: devId })
           .then((r) => { if (this.s.deviceId === devId) this.d.replace = r; }));
@@ -322,11 +323,24 @@ class BmsControlCenter extends HTMLElement {
     this.paint();
   }
 
+  lockdownBadge() {
+    /* Режим должен быть виден не только на экране настроек: инженер на объекте
+       должен сразу понимать, почему ключи не обновляются. */
+    const locked = (this.d.settings?.entries || []).some((e) => e.lockdown);
+    if (!locked) return "";
+    return `<span title="Обмен с облаком Tuya запрещён настройками"
+      style="display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 9px;
+      border-radius:5px;background:${soft(C.bad, 0.1)};color:${C.bad};
+      font-size:11.5px;font-weight:600;white-space:nowrap">
+      ${icon("i-alert", 12)}Изолированный режим</span>`;
+  }
+
   paintHeader() {
     const s = this.s;
     const upd = s.updatedAt ? hhmmss(s.updatedAt) : "—";
     const ex = s.expert;
     this.shadowRoot.getElementById("hactions").innerHTML = `
+      ${this.lockdownBadge()}
       <div class="chip-sel">
         ${icon("i-home", 14, C.mut)}
         <select data-act="entry">
@@ -1165,6 +1179,24 @@ class BmsControlCenter extends HTMLElement {
           "То же самое, но сразу после запуска Home Assistant, когда парк ещё поднимается.")}
         ${field(`set-dog-${e.entry_id}`, "Проверка шлюзов", e.watchdog_interval,
           "Как часто опрашивать шлюзы настоящим запросом: сокет остаётся открытым и после смерти сервиса за ним.")}
+        <div style="display:flex;align-items:center;gap:10px;padding:9px 0;
+                    border-bottom:1px solid ${C.div}">
+          <span style="flex:1">
+            <span style="display:block;font-size:12.5px;color:${
+              e.lockdown ? C.bad : C.ink2};font-weight:${e.lockdown ? 600 : 400}">
+              Изолированный режим</span>
+            <span class="small mut">Полностью запрещает интеграции обмен с облаком Tuya.
+              Управление устройствами идёт по локальной сети и не меняется.
+              ${e.cloud_configured
+                ? "Облачный аккаунт привязан: ключи и список устройств перестанут обновляться, замена устройства делается вручную в панели."
+                : "Облачный аккаунт не привязан — режим просто закрывает путь наружу окончательно."}
+              ${e.blocked_requests
+                ? `<b style="color:${C.bad}">Заблокировано запросов с момента запуска: ${e.blocked_requests}.</b>`
+                : ""}</span>
+          </span>
+          <input id="set-lock-${esc(e.entry_id)}" type="checkbox" ${e.lockdown ? "checked" : ""}
+                 style="width:18px;height:18px">
+        </div>
         <div style="display:flex;align-items:center;gap:10px;padding:9px 0">
           <span style="flex:1">
             <span style="display:block;font-size:12.5px;color:${C.ink2}">Подробный журнал</span>
@@ -1408,6 +1440,7 @@ class BmsControlCenter extends HTMLElement {
           startup_grace: num(`set-start-${entryId}`, 300),
           watchdog_interval: num(`set-dog-${entryId}`, 30),
           debug: !!root.getElementById(`set-debug-${entryId}`)?.checked,
+          lockdown: !!root.getElementById(`set-lock-${entryId}`)?.checked,
         });
         this.toast("Настройки сохранены, запись перезагружается");
       } catch (err) { this.toast(err?.message || "Не удалось сохранить", true); }

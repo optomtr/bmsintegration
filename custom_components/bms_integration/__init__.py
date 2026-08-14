@@ -43,6 +43,7 @@ from .const import (
     CONF_FRIENDLY_NAME,
     DEFAULT_WATCHDOG_INTERVAL,
     OPT_DEBUG,
+    OPT_LOCKDOWN,
     OPT_WATCHDOG_INTERVAL,
     CONF_GATEWAY_ID,
     CONF_NODE_ID,
@@ -478,7 +479,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     tuya_api = TuyaCloudApi(region, client_id, secret, user_id)
     no_cloud = entry.data.get(CONF_NO_CLOUD, True)
 
-    if no_cloud:
+    # Изолированный режим ставится ДО первого обращения: замок стоит в самом
+    # клиенте, поэтому мимо него не пройдёт ни один путь, включая обновление
+    # токена и подтягивание ключей при неудачном подключении.
+    lockdown = bool((entry.options or {}).get(OPT_LOCKDOWN))
+    tuya_api.set_lockdown(lockdown)
+    # Общий замок: достаточно одной изолированной записи, чтобы наружу не ходил
+    # никто, включая клиент, который создаёт себе мастер настройки.
+    TuyaCloudApi.set_global_lockdown(
+        any(
+            bool((other.options or {}).get(OPT_LOCKDOWN))
+            for other in hass.config_entries.async_entries(DOMAIN)
+        )
+    )
+
+    if lockdown:
+        _LOGGER.warning(
+            "%s: изолированный режим включён — обмен с облаком Tuya запрещён. "
+            "Управление устройствами идёт по локальной сети как обычно.",
+            entry.title,
+        )
+    elif no_cloud:
         _LOGGER.info(f"Cloud API account not configured.")
     else:
         entry.async_create_background_task(

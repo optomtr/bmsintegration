@@ -53,6 +53,15 @@ the license text.
   some of them back for a second: optimistic values are recorded in the device
   and protocol caches, so the first partial confirmation from the device cannot
   resurrect the stale cached state of its sibling channels.
+- **Изолированный режим (lockdown).** The cloud is only a helper here - it
+  fetches keys and the device list during setup, while control is always local
+  - but on a site where nothing may leave the network, "only a helper" is not
+  good enough. The switch forbids the exchange outright, in the single place
+  the integration reaches the internet from, ahead of even the token refresh.
+  It is a process-wide latch, so the client the config flow builds for itself
+  is stopped too, and blocked attempts are counted and shown in the panel.
+  Local control is untouched. With a cloud account attached, keys stop being
+  refreshed - replace such a device from the panel instead.
 - **Replacing a device keeps its identity in Home Assistant.** Hardware breaks;
   the wiring of an installation does not. Behind a device sits a long tail:
   entity ids referenced by dozens of automations and cards, its room, history

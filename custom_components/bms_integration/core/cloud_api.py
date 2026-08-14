@@ -15,6 +15,16 @@ DEVICES_UPDATE_INTERVAL_FORCED = 10
 # config flow step or a key refresh indefinitely.
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=20)
 
+# Изолированный режим. Облако для этой интеграции - вспомогательное: оно нужно
+# только чтобы подтянуть ключи и список устройств при настройке. Управление
+# всегда идёт по локальной сети. На объектах, где выход наружу недопустим,
+# режим запрещает обмен целиком, в единственной точке, откуда интеграция
+# ходит в интернет.
+LOCKDOWN_REASON = "Изолированный режим: обмен с облаком Tuya запрещён настройками"
+LOCKDOWN_LOG_INTERVAL = 3600.0
+
+_LOGGER = logging.getLogger(__name__)
+
 TUYA_ENDPOINTS = {
     # Regions code
     "Central Europe Data Center": "eu",
@@ -105,6 +115,10 @@ class TuyaCloudApi:
         self._user_id = user_id
         self._access_token = ""
         self._token_expire_time: int = 0
+        # Изолированный режим: жёсткий запрет любого обмена с облаком.
+        self._lockdown = False
+        self._lockdown_last_log = 0.0
+        self.blocked_requests = 0
 
         if region_code == "ea":
             self._base_url = "https://openapi-ueaz.tuyaus.com"
@@ -142,8 +156,65 @@ class TuyaCloudApi:
         # self._logger.debug("PAYLOAD: %s", payload)
         return payload
 
+    # Замок общий на процесс, а не только на экземпляр: мастер настройки
+    # создаёт СВОЙ клиент облака, и позаписной флаг его бы не остановил. Если
+    # хотя бы одна запись объявила объект изолированным, наружу не ходит
+    # никто - это и есть смысл режима.
+    _global_lockdown = False
+
+    @classmethod
+    def set_global_lockdown(cls, enabled: bool) -> None:
+        """Запретить обмен с облаком всем клиентам этого процесса."""
+        if enabled != cls._global_lockdown:
+            _LOGGER.warning(
+                "Изолированный режим %s для всей интеграции",
+                "включён" if enabled else "снят",
+            )
+        cls._global_lockdown = enabled
+
+    @property
+    def lockdown(self) -> bool:
+        """Запрещён ли обмен с облаком."""
+        return self._lockdown or TuyaCloudApi._global_lockdown
+
+    def set_lockdown(self, enabled: bool) -> None:
+        """Включить или снять изолированный режим для этого клиента."""
+        if enabled != self._lockdown:
+            self._logger.warning(
+                "Изолированный режим %s: обмен с облаком Tuya %s",
+                "включён" if enabled else "снят",
+                "запрещён" if enabled else "разрешён",
+            )
+        self._lockdown = enabled
+        if not enabled:
+            self._lockdown_last_log = 0.0
+
+    def _note_blocked(self, method: str, url: str) -> None:
+        """Посчитать и, не заливая журнал, сообщить о заблокированном запросе."""
+        self.blocked_requests += 1
+        now = time.time()
+        if now - self._lockdown_last_log < LOCKDOWN_LOG_INTERVAL:
+            self._logger.debug("Изолированный режим: запрос %s %s не отправлен", method, url)
+            return
+        self._lockdown_last_log = now
+        self._logger.warning(
+            "Изолированный режим: запрос к облаку не отправлен (%s %s). "
+            "Заблокировано с момента запуска: %d",
+            method,
+            url,
+            self.blocked_requests,
+        )
+
     async def async_make_request(self, method, url, body=None, headers={}):
         """Perform requests."""
+        # Единственная точка, из которой интеграция выходит в интернет: и
+        # обновление токена, и все запросы идут через неё. Проверка стоит
+        # первой, до обновления токена - оно тоже сетевой запрос.
+        if self.lockdown:
+            self._note_blocked(method, url)
+            # Форма ответа как у ошибки Tuya: вызывающие уже умеют её разбирать.
+            return {"success": False, "code": "lockdown", "msg": LOCKDOWN_REASON}
+
         # obtain new token if expired.
         if not self.token_validate and self._token_expire_time != -1:
             if (res := await self.async_get_access_token()) and res != "ok":

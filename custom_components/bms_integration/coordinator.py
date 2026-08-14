@@ -1037,6 +1037,15 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         if self._entry.data.get(CONF_NO_CLOUD, True):
             return self.info("Ensure that localkey hasn't changed and it's correct")
 
+        cloud = self._hass_entry.cloud_data
+        if cloud is not None and cloud.lockdown:
+            # Замок стоит и в самом клиенте, но незачем гонять запрос до него:
+            # заодно в журнале будет видно причину, а не «ошибка облака».
+            return self.info(
+                "Изолированный режим: ключ из облака не запрашивается. "
+                "Если ключ действительно сменился, замените устройство в панели."
+            )
+
         # This runs after every failed connect. The cloud client's forced
         # refresh interval is shorter than any reconnect backoff, so a device
         # that is simply switched off produced a cloud request per attempt -

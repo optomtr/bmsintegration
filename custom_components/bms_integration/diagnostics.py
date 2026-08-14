@@ -31,7 +31,7 @@ async def async_get_config_entry_diagnostics(
     data = dict(entry.data)
     hass_localtuya: HassLocalTuyaData = hass.data[DOMAIN][entry.entry_id]
     tuya_api = hass_localtuya.cloud_data
-    if data.get(CONF_NO_CLOUD, True) is not True:
+    if data.get(CONF_NO_CLOUD, True) is not True and not tuya_api.lockdown:
         await hass.async_create_task(tuya_api.async_get_devices_dps_query())
     # censoring private information on integration diagnostic data
     for field in [CONF_CLIENT_ID, CONF_CLIENT_SECRET, CONF_USER_ID]:
