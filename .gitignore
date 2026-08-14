@@ -19,3 +19,6 @@ tests/ha_config/
 
 # Tooling scratch state - never part of a release
 .claude-flow/
+
+# Partner's separate integration draft - lives in this working tree, never ships from this repo
+custom_components/bms_ai_automation/
