@@ -43,7 +43,12 @@ class FakeHTMLElement extends FakeElement {}
 const registry = {};
 const sandbox = {
   HTMLElement: FakeHTMLElement,
-  customElements: { define: (name, cls) => (registry[name] = cls) },
+  // Повторяем настоящий реестр: у него есть и get - панель на него опирается,
+  // чтобы не регистрировать имя дважды.
+  customElements: {
+    define: (name, cls) => (registry[name] = cls),
+    get: (name) => registry[name],
+  },
   document: {
     createElement: (tag) => new FakeElement(tag),
     body: new FakeElement("body"),

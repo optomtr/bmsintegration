@@ -169,7 +169,24 @@ the license text.
   self-recovery, 7 072/7 072 commands delivered while garbage preceded every
   third reply, and a soak with zero task/listener/memory growth.
 
-### The panel stuck on "Загрузка…"
+### The panel stuck on "Загрузка…" (the real cause)
+
+Home Assistant assigns `el.hass` before `connectedCallback` runs, i.e. before
+the panel has built its DOM. `refresh()` painted the header first, so
+`getElementById("hactions")` returned null and the setter threw - out into
+Home Assistant's own property-assignment loop. Worse, `_inflight` had already
+been latched `true` and its `finally` sat inside a `try` the code never
+reached, so the flag stayed set forever and every later tick returned
+immediately. Nothing was ever fetched.
+
+Three fixes: the busy flag is released in a `finally` that wraps the whole
+call, the header and navigation refuse to paint before the DOM exists, and the
+setter can no longer throw into Home Assistant. Registering the element name is
+also guarded now - on an upgrade Home Assistant loads the new module into the
+same document, and the duplicate `customElements.define` threw, leaving the
+old class running until a full page reload.
+
+### Also hardened along the way
 
 Home Assistant assigns `el.hass` as soon as it creates a panel element. If the
 panel module has not finished loading, the element is not upgraded yet and

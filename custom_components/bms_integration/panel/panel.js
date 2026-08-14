@@ -10,6 +10,7 @@
 // ------------------------------------------------------------ параметры --
 // Опрос панели. Отчёт и журнал читаются с диска на каждый запрос, поэтому
 // берём короткий хвост: панель показывает недавние события, а не архив.
+const PANEL_TAG = "bms-devices-panel";
 const POLL_MS = 6000;
 const REPORT_LIMIT = 200;
 const LOG_LIMIT = 200;
@@ -178,7 +179,10 @@ class BmsControlCenter extends HTMLElement {
   set hass(hass) {
     const first = !this._hass;
     this._hass = hass;
-    if (first) this.refresh();
+    // Home Assistant присваивает свойства панели в цикле. Исключение отсюда
+    // обрывает этот цикл, и остальные свойства элемент уже не получает.
+    if (first) Promise.resolve().then(() => this.refresh()).catch((err) =>
+      console.error("BMS: первое обновление не удалось", err));
   }
   get hass() { return this._hass; }
 
@@ -230,6 +234,17 @@ class BmsControlCenter extends HTMLElement {
     // top of the previous one every 6 seconds.
     if (this._inflight) return;
     this._inflight = true;
+    try {
+      await this._refresh(silent);
+    } finally {
+      // Снимать флаг только внутри try было ошибкой: исключение до входа в
+      // него оставляло панель «занятой» навсегда, и каждый следующий тик
+      // выходил впустую - вечная «Загрузка…».
+      this._inflight = false;
+    }
+  }
+
+  async _refresh(silent) {
     if (!silent) this.s.busy = true, this.paintHeader();
     // Snapshot what was asked for. The operator can navigate or open another
     // device while these are in flight, and a late answer must not be written
@@ -288,8 +303,6 @@ class BmsControlCenter extends HTMLElement {
       // Back off rather than re-asking a failing backend every 6 seconds.
       this._fails = (this._fails || 0) + 1;
       this._retryAt = Date.now() + Math.min(60000, POLL_MS * 2 ** Math.min(this._fails, 4));
-    } finally {
-      this._inflight = false;
     }
     this.s.busy = false;
     this.paint(silent);
@@ -361,6 +374,7 @@ class BmsControlCenter extends HTMLElement {
   }
 
   paintHeader() {
+    if (!this._built) return;
     const s = this.s;
     const upd = s.updatedAt ? hhmmss(s.updatedAt) : "—";
     const ex = s.expert;
@@ -386,6 +400,7 @@ class BmsControlCenter extends HTMLElement {
   }
 
   paintNav() {
+    if (!this._built) return;
     const sum = this.d.overview?.summary;
     const problems = sum ? (sum.total || 0) - (sum.online || 0) : 0;
     this.shadowRoot.getElementById("nav").innerHTML = NAV.map((n) => {
@@ -1839,4 +1854,10 @@ main{flex:1;min-height:0}
 ::-webkit-scrollbar-thumb:hover{background:#ABB5BF}
 `;
 
-customElements.define("bms-devices-panel", BmsControlCenter);
+// Регистрация имени - один раз на документ. При обновлении интеграции Home
+// Assistant подгружает новый модуль в ту же страницу, и повторный define
+// бросает исключение, обрывая выполнение остатка модуля: до полной
+// перезагрузки страницы продолжал бы работать старый класс.
+if (!customElements.get(PANEL_TAG)) {
+  customElements.define(PANEL_TAG, BmsControlCenter);
+}

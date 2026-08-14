@@ -26,7 +26,13 @@ class FakeElement {
   removeChild(c) { this.children = this.children.filter((x) => x !== c); }
   remove() {} addEventListener() {} removeEventListener() {}
   querySelector() { return null; }
-  getElementById(id) { return (this._byId[id] ||= new FakeElement()); }
+  // Браузер возвращает null, пока элемента нет в разметке. Прежняя заглушка
+  // услужливо создавала его на лету - и именно поэтому не заметила, что
+  // панель рисует шапку до построения DOM и падает у оператора.
+  getElementById(id) {
+    if (!String(this.innerHTML).includes(`id="${id}"`)) return null;
+    return (this._byId[id] ||= new FakeElement());
+  }
   // В браузере attachShadow сам выставляет свойство shadowRoot - шим обязан
   // повторять это, иначе тест ловит собственную неточность, а не дефект.
   attachShadow() { this.shadowRoot = this; return this; }
@@ -38,7 +44,12 @@ const registry = {};
 const timers = [];
 const sandbox = {
   HTMLElement: FakeHTMLElement,
-  customElements: { define: (name, cls) => (registry[name] = cls) },
+  // Повторяем настоящий реестр: у него есть и get - панель на него опирается,
+  // чтобы не регистрировать имя дважды.
+  customElements: {
+    define: (name, cls) => (registry[name] = cls),
+    get: (name) => registry[name],
+  },
   document: {
     createElement: (tag) => new FakeElement(tag),
     body: new FakeElement("body"),
@@ -144,6 +155,23 @@ async function settle() { for (let i = 0; i < 10; i++) await Promise.resolve(); 
     check("неполный ответ не замораживает панель",
           calls.length > 0 && typeof main.innerHTML === "string" && main.innerHTML.length > 0,
           `в главной области ${main.innerHTML.length} символов`);
+  }
+
+  // 5. hass приходит ДО подключения к DOM - штатный порядок Home Assistant.
+  //    Ни исключения наружу, ни залипшего флага занятости быть не должно.
+  {
+    const calls = [];
+    const el = new Panel();
+    let threw = null;
+    try { el.hass = makeHass(calls); } catch (err) { threw = err; }
+    check("присвоение hass до построения DOM не бросает наружу", !threw,
+          threw && String(threw));
+    await settle();
+    el.connectedCallback();
+    await settle();
+    check("после подключения запросы всё-таки ушли", calls.length > 0,
+          `вызовов ${calls.length}, занято=${el._inflight}`);
+    check("флаг занятости не залип", el._inflight === false);
   }
 
   console.log(`\n===== ИТОГ: PASS ${pass} / FAIL ${fail} =====`);
