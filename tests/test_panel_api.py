@@ -203,6 +203,20 @@ class PanelFrontend(unittest.TestCase):
         self.assertIn("deviceRow(id)", self.js)
         self.assertNotIn("this.rows().find((r) => r.device_id === id)", self.js)
 
+    def test_every_screen_renders(self):
+        """Панель не открыть без входа в HA, а node --check ловит лишь синтаксис.
+
+        Здесь класс инстанцируется по-настоящему и каждый экран отрисовывается
+        на данных той же формы, что шлёт бэкенд: опечатка в шаблоне или
+        обращение к полю, которого в ответе нет, падает тут, а не у оператора.
+        """
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node не установлен")
+        script = os.path.join(REPO_ROOT, "tests", "js", "render_screens.js")
+        result = subprocess.run([node, script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_parses_as_javascript(self):
         node = shutil.which("node")
         if not node:
