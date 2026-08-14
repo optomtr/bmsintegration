@@ -53,6 +53,14 @@ the license text.
   some of them back for a second: optimistic values are recorded in the device
   and protocol caches, so the first partial confirmation from the device cannot
   resurrect the stale cached state of its sibling channels.
+- **Adding and removing devices from the panel.** A discovered device is added
+  in place: name, key, address - and optionally a template, an already
+  configured device of the same model whose entity set is copied over with the
+  names rewritten for the newcomer. The panel verifies it can actually talk to
+  the device before writing anything, refuses an address another standalone
+  device already occupies (the integration would silently never start the
+  second one), and removal also sweeps the device's entities and registry row
+  instead of leaving them permanently unavailable.
 - **Изолированный режим (lockdown).** The cloud is only a helper here - it
   fetches keys and the device list during setup, while control is always local
   - but on a site where nothing may leave the network, "only a helper" is not

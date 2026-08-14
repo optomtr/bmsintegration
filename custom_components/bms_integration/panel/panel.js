@@ -160,6 +160,7 @@ class BmsControlCenter extends HTMLElement {
       expert: false,
       incidentsOnly: false,
       mapMode: "tree",
+      addDevice: null,       // у какого найденного устройства раскрыта форма
       replaceTarget: null,   // какое устройство заменяем
       replaceWith: null,     // на какое
       search: "",
@@ -731,6 +732,8 @@ class BmsControlCenter extends HTMLElement {
             ${btn("Переподключить", { act: "dev-reconnect", data: `data-id="${esc(r.device_id)}"`, ico: "i-link" })}
             ${btn("Заменить устройство", { act: "replace-open",
               data: `data-old="${esc(r.device_id)}"`, ico: "i-refresh" })}
+            ${btn("Убрать", { act: "remove-device", data: `data-id="${esc(r.device_id)}"`,
+              danger: true, ico: "i-alert" })}
             ${btn("Перезагрузить запись", { act: "reload-entry", data: `data-entry="${esc(r.entry_id)}"`, danger: true })}
           </div>
         </div>
@@ -927,13 +930,48 @@ class BmsControlCenter extends HTMLElement {
           </div>`).join("") : empty("Настроенных устройств нет", "i-chip", C.mut)}</div>
       </div>${cardClose}`;
 
+    const addForm = (f) => {
+      if (this.s.addDevice !== f.device_id) return "";
+      const configured = (this.d.overview?.devices || []);
+      return `
+        <div style="padding:12px 14px;background:${C.bg};border-top:1px solid ${C.line};
+                    display:flex;flex-direction:column;gap:9px">
+          <div class="row14">
+            <div style="flex:1 1 240px;min-width:220px;display:flex;flex-direction:column;gap:8px">
+              <input id="add-name" placeholder="Название, например «Реле кухня»" style="width:100%">
+              <input id="add-key" placeholder="local_key устройства" style="width:100%">
+              <input id="add-host" value="${esc(f.host || "")}" placeholder="адрес" style="width:100%">
+            </div>
+            <div style="flex:1 1 240px;min-width:220px;display:flex;flex-direction:column;gap:8px">
+              <select id="add-template" style="width:100%">
+                <option value="">— без образца: сущности настроите в мастере —</option>
+                ${configured.map((c) => `<option value="${esc(c.device_id)}">
+                  по образцу: ${esc(c.name)} · ${plural(c.entity_count, "сущность", "сущности", "сущностей")}
+                </option>`).join("")}
+              </select>
+              <span class="small mut">Образец избавляет от настройки датапоинтов заново:
+                если ставите такое же изделие, возьмите соседнее. Имена сущностей
+                будут переименованы под новое устройство.</span>
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            ${btn("Добавить устройство", { act: "add-go", primary: true, ico: "i-check",
+              data: `data-id="${esc(f.device_id)}" data-proto="${esc(f.protocol || "")}"` })}
+            ${btn("Отмена", { act: "add-cancel", small: false })}
+            <span class="small mut">Перед добавлением панель проверит связь с устройством.</span>
+          </div>
+        </div>`;
+    };
+
     const rows = fresh.length ? fresh.map((f) => `
       <div class="frow">
         <span class="acell">${icon("i-wifi", 14, C.mut)}<span class="aname mono">${esc(f.device_id)}</span></span>
         <span class="mono small">${esc(f.host)}</span>
         <span class="mono small mut">протокол ${esc(f.protocol || "?")}</span>
-        ${btn("Добавить", { act: "add-device", data: `data-id="${esc(f.device_id)}"`, primary: true, small: true, ico: "i-plus" })}
-      </div>`).join("") : empty("Новых устройств в сети не обнаружено", "i-search", C.mut);
+        ${btn(this.s.addDevice === f.device_id ? "Свернуть" : "Добавить",
+          { act: "add-open", data: `data-id="${esc(f.device_id)}"`,
+            primary: this.s.addDevice !== f.device_id, small: true, ico: "i-plus" })}
+      </div>${addForm(f)}`).join("") : empty("Новых устройств в сети не обнаружено", "i-search", C.mut);
 
     return `<div class="pad col16" style="max-width:1440px">
       <div class="row16">
@@ -964,8 +1002,10 @@ class BmsControlCenter extends HTMLElement {
           </div>${cardClose}
           ${cardOpen("Ручное добавление")}
           <div style="padding:14px;display:flex;flex-direction:column;gap:9px">
-            <span class="small mut">Полный мастер с выбором платформы и датапоинтов открывается в стандартном интерфейсе интеграции.</span>
-            ${btn("Открыть мастер добавления", { act: "open-flow", primary: true, ico: "i-plus" })}
+            <span class="small mut">Устройство из списка слева добавляется прямо здесь —
+              по образцу соседнего изделия сущности переносятся сразу. Мастер интеграции
+              нужен, только если набор датапоинтов уникален и образца нет.</span>
+            ${btn("Открыть мастер интеграции", { act: "open-flow", ico: "i-plus" })}
           </div>${cardClose}
         </aside>
       </div></div>`;
@@ -1383,6 +1423,55 @@ class BmsControlCenter extends HTMLElement {
         this.toast(`Комната «${name}» создана`);
       } catch (err) { this.toast(err?.message || "Не удалось создать", true); }
       return this.refresh(true);
+    }
+    if (a === "add-open") {
+      this.s.addDevice = this.s.addDevice === id ? null : id;
+      return this.paint();
+    }
+    if (a === "add-cancel") { this.s.addDevice = null; return this.paint(); }
+    if (a === "add-go") {
+      const root = this.shadowRoot;
+      const key = (root.getElementById("add-key")?.value || "").trim();
+      if (!key) return this.toast("Нужен local_key устройства", true);
+      const entryId = (this.d.overview?.entries || [])[0]?.entry_id;
+      if (!entryId) return this.toast("Не найдена запись конфигурации", true);
+      el.disabled = true;
+      try {
+        const res = await this.ws("add_device", {
+          entry_id: entryId,
+          device_id: id,
+          local_key: key,
+          name: root.getElementById("add-name")?.value || "",
+          host: root.getElementById("add-host")?.value || "",
+          protocol_version: el.dataset.proto || null,
+          template_device_id: root.getElementById("add-template")?.value || null,
+        });
+        this.logAction(true, `Добавлено ${res.name}: сущностей ${res.entities}`);
+        this.toast(res.entities
+          ? `Добавлено, сущностей по образцу: ${res.entities}`
+          : "Добавлено. Сущности настройте в мастере интеграции.");
+        this.s.addDevice = null;
+      } catch (err) {
+        this.logAction(false, `Добавление ${id}: ${err?.message || err}`);
+        this.toast(err?.message || "Не удалось добавить", true);
+      }
+      el.disabled = false;
+      return this.refresh();
+    }
+    if (a === "remove-device") {
+      const row = this.deviceRow(id);
+      if (!confirm(`Убрать «${row?.name || id}» из интеграции?\n\nЕго сущности и запись в Home Assistant будут удалены вместе с историей привязок. Само устройство продолжит работать от выключателей.`))
+        return;
+      try {
+        const res = await this.ws("remove_device", { entry_id: row?.entry_id, device_id: id });
+        this.logAction(true, `Удалено ${res.name}: сущностей ${res.entities}`);
+        this.toast("Устройство убрано");
+        if (this.s.deviceId === id) this.s.screen = "overview";
+      } catch (err) {
+        this.logAction(false, `Удаление ${id}: ${err?.message || err}`);
+        this.toast(err?.message || "Не удалось убрать", true);
+      }
+      return this.refresh();
     }
     if (a === "replace-open") {
       this.s.replaceTarget = el.dataset.old || id;

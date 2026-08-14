@@ -51,6 +51,11 @@ class FakeEntityRegistry:
                 return entry
         raise AssertionError(f"нет такой сущности: {entity_id}")
 
+    def async_remove(self, entity_id):
+        self.removed = getattr(self, "removed", [])
+        self.removed.append(entity_id)
+        self.entries = [e for e in self.entries if e.entity_id != entity_id]
+
     def async_get_entity_id(self, domain, platform, unique_id):
         for entry in self.entries:
             if entry.unique_id == unique_id:
@@ -308,6 +313,79 @@ class Replacement(Base):
             await replace.async_replace_device(
                 self.hass, self.entry, self.OLD, {"device_id": "  "}
             )
+
+
+class Adding(Base):
+    """Добавление: по образцу, с проверкой связи и с защитой от коллизий."""
+
+    async def test_template_carries_entities_and_renames_them(self):
+        summary = await replace.async_add_device(
+            self.hass, self.entry,
+            {"device_id": self.NEW, "host": "10.0.0.9", "local_key": "k",
+             "protocol_version": "3.3"},
+            template_id=self.OLD, name="Реле спальня", verify=False,
+        )
+        self.assertEqual(summary["entities"], 2)
+        config = self.entry.data["devices"][self.NEW]
+        names = [e["friendly_name"] for e in config["entities"]]
+        self.assertEqual(names, ["Реле спальня", "Реле спальня 2"],
+                         "имена должны переехать на новое устройство")
+        self.assertEqual([e["id"] for e in config["entities"]], ["1", "2"])
+        # Железо своё, а не образца.
+        self.assertEqual(config["host"], "10.0.0.9")
+        self.assertEqual(config["local_key"], "k")
+
+    async def test_without_template_no_entities(self):
+        summary = await replace.async_add_device(
+            self.hass, self.entry,
+            {"device_id": self.NEW, "host": "10.0.0.9", "local_key": "k"},
+            verify=False,
+        )
+        self.assertEqual(summary["entities"], 0)
+
+    async def test_occupied_address_is_refused(self):
+        """Интеграция раскладывает устройства по адресу: второе на том же
+        адресе не поднимется, а его сущности повиснут без состояния."""
+        with self.assertRaises(ReplaceError):
+            await replace.async_add_device(
+                self.hass, self.entry,
+                {"device_id": self.NEW, "host": "10.0.0.5", "local_key": "k"},
+                verify=False,
+            )
+        self.assertNotIn(self.NEW, self.entry.data["devices"])
+
+    async def test_duplicate_and_missing_key_are_refused(self):
+        with self.assertRaises(ReplaceError):
+            await replace.async_add_device(
+                self.hass, self.entry,
+                {"device_id": self.OLD, "host": "10.0.0.9", "local_key": "k"},
+                verify=False,
+            )
+        with self.assertRaises(ReplaceError):
+            await replace.async_add_device(
+                self.hass, self.entry,
+                {"device_id": self.NEW, "host": "10.0.0.9", "local_key": ""},
+                verify=False,
+            )
+
+
+class Removing(Base):
+    """Удаление сметает и след устройства в реестрах."""
+
+    async def test_removes_config_entities_and_registry_row(self):
+        summary = await replace.async_remove_device(self.hass, self.entry, self.OLD)
+        self.assertEqual(summary["entities"], 2)
+        self.assertNotIn(self.OLD, self.entry.data["devices"])
+        self.assertEqual(self.ent_reg.removed, ["switch.rele", "switch.rele_2"])
+        self.assertEqual(self.dev_reg.removed, ["dev-row"])
+
+    async def test_gateway_with_children_is_refused(self):
+        self.entry.data["devices"]["child-1"] = device_config(
+            "child-1", "Свет", node_id="cid1", gateway_id=self.OLD
+        )
+        with self.assertRaises(ReplaceError):
+            await replace.async_remove_device(self.hass, self.entry, self.OLD)
+        self.assertIn(self.OLD, self.entry.data["devices"], "ничего не удалено")
 
 
 if __name__ == "__main__":

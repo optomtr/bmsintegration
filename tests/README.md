@@ -51,7 +51,11 @@ was silently never executed.
   path slipped past the latch, the suite goes red. Also asserts the check sits
   ahead of the token refresh, and that the network is reached only from the one
   place the latch guards.
-- `test_replace.py` — what a replacement must preserve and what it must refuse:
+- `test_replace.py` — the device lifecycle from the panel. Adding: a template
+  carries the entity set over with names rewritten, an occupied address and a
+  duplicate id are refused before anything is written. Removing: the entities
+  and the registry row go too, and a gateway with children is refused. And
+  what a replacement must preserve and what it must refuse:
   a credentials-only change touches no registry, a physical replacement moves
   every `unique_id` and the device-registry identifier while keeping the same
   rows, entity configuration is inherited, a replaced gateway relinks its

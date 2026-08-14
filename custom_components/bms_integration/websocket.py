@@ -362,6 +362,97 @@ def ws_update_settings(hass: HomeAssistant, connection, msg: dict) -> None:
     connection.send_result(msg["id"], {"ok": True})
 
 
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/add_device",
+        vol.Required("entry_id"): str,
+        vol.Required("device_id"): str,
+        vol.Required("local_key"): str,
+        vol.Optional("name"): vol.Any(str, None),
+        vol.Optional("host"): vol.Any(str, None),
+        vol.Optional("protocol_version"): vol.Any(str, None),
+        vol.Optional("node_id"): vol.Any(str, None),
+        vol.Optional("gateway_id"): vol.Any(str, None),
+        vol.Optional("template_device_id"): vol.Any(str, None),
+        vol.Optional("verify"): bool,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_add_device(hass: HomeAssistant, connection, msg: dict) -> None:
+    """Завести устройство, при желании повторив набор сущностей образца."""
+    entry = hass.config_entries.async_get_entry(msg["entry_id"])
+    if entry is None or entry.domain != DOMAIN:
+        connection.send_error(msg["id"], "not_found", "Запись конфигурации не найдена")
+        return
+
+    _LOGGER.warning(
+        "Добавление устройства из панели: %s (пользователь %s)",
+        msg["device_id"],
+        connection.user.name if connection.user else "?",
+    )
+    hardware = {
+        "device_id": msg["device_id"],
+        "local_key": msg["local_key"],
+        "host": msg.get("host"),
+        "protocol_version": msg.get("protocol_version"),
+        "node_id": msg.get("node_id"),
+        "gateway_id": msg.get("gateway_id"),
+    }
+    try:
+        summary = await replace_mod.async_add_device(
+            hass,
+            entry,
+            hardware,
+            template_id=msg.get("template_device_id"),
+            name=msg.get("name"),
+            verify=msg.get("verify", True),
+        )
+    except replace_mod.ReplaceError as err:
+        connection.send_error(msg["id"], "add_failed", str(err))
+        return
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.exception("Добавление устройства не удалось")
+        connection.send_error(msg["id"], "add_failed", str(err))
+        return
+
+    connection.send_result(msg["id"], summary)
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/remove_device",
+        vol.Required("entry_id"): str,
+        vol.Required("device_id"): str,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_remove_device(hass: HomeAssistant, connection, msg: dict) -> None:
+    """Убрать устройство вместе с его сущностями и записью в реестре."""
+    entry = hass.config_entries.async_get_entry(msg["entry_id"])
+    if entry is None or entry.domain != DOMAIN:
+        connection.send_error(msg["id"], "not_found", "Запись конфигурации не найдена")
+        return
+
+    _LOGGER.warning(
+        "Удаление устройства из панели: %s (пользователь %s)",
+        msg["device_id"],
+        connection.user.name if connection.user else "?",
+    )
+    try:
+        summary = await replace_mod.async_remove_device(hass, entry, msg["device_id"])
+    except replace_mod.ReplaceError as err:
+        connection.send_error(msg["id"], "remove_failed", str(err))
+        return
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.exception("Удаление устройства не удалось")
+        connection.send_error(msg["id"], "remove_failed", str(err))
+        return
+
+    connection.send_result(msg["id"], summary)
+
+
 def async_register_websocket_api(hass: HomeAssistant) -> None:
     """Register every panel command, once per Home Assistant."""
     domain_data = hass.data.setdefault(DOMAIN, {})
@@ -384,6 +475,8 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
         ws_replace_device,
         ws_settings,
         ws_update_settings,
+        ws_add_device,
+        ws_remove_device,
     ):
         websocket_api.async_register_command(hass, command)
     domain_data[DATA_WS_REGISTERED] = True

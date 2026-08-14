@@ -129,7 +129,10 @@ for (const screen of screens) {
   panel.d = JSON.parse(JSON.stringify(fixtures));
   panel.s.screen = screen;
   panel.s.deviceId = "d1";
-  if (screen === "add") panel.s.replaceTarget = "d1";   // карточка замены раскрыта
+  if (screen === "add") {
+    panel.s.replaceTarget = "d1";   // карточка замены раскрыта
+    panel.s.addDevice = "new1";     // и форма добавления тоже
+  }
   const view = {
     overview: () => panel.vOverview(), map: () => panel.vMap(), device: () => panel.vDevice(),
     add: () => panel.vAdd(), rooms: () => panel.vRooms(), events: () => panel.vEvents(),

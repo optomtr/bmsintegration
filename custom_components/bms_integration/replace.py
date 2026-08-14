@@ -1,4 +1,7 @@
-"""Замена устройства с сохранением его личности в Home Assistant.
+"""Жизненный цикл устройства в записи конфигурации: добавить, заменить, убрать.
+
+У всех трёх операций одна забота: чтобы представление Home Assistant о доме
+осталось согласованным с железом.
 
 Оборудование ломается и меняется, а разметка объекта — нет. В Home Assistant
 за устройством стоит длинный хвост: entity_id, на который ссылаются десятки
@@ -350,3 +353,181 @@ async def async_replace_device(
         summary["children_relinked"],
     )
     return summary
+
+
+def _rename_entities(entities: list[dict], old_name: str, new_name: str) -> list[dict]:
+    """Перенести имена сущностей на новое устройство.
+
+    У образца сущности названы по нему: «Реле кухня», «Реле кухня 2». Слепо
+    скопировать их - значит получить два устройства с одинаковыми именами,
+    поэтому префикс имени образца заменяется на новое имя, а всё остальное
+    (например « 2») остаётся.
+    """
+    result = []
+    for item in entities:
+        copy = dict(item)
+        title = copy.get(CONF_FRIENDLY_NAME) or ""
+        if old_name and title.startswith(old_name):
+            copy[CONF_FRIENDLY_NAME] = (new_name + title[len(old_name) :]).strip()
+        elif title:
+            copy[CONF_FRIENDLY_NAME] = f"{new_name} {title}".strip()
+        result.append(copy)
+    return result
+
+
+async def async_add_device(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    hardware: dict[str, Any],
+    template_id: str | None = None,
+    name: str | None = None,
+    verify: bool = True,
+) -> dict[str, Any]:
+    """Завести устройство, при желании повторив набор сущностей образца.
+
+    Установщик обычно ставит такое же изделие, какое уже стоит рядом, и
+    настраивать его датапоинты заново незачем: достаточно указать образец.
+    Без образца устройство заводится без сущностей - их набор дособирается
+    штатным мастером интеграции.
+    """
+    devices = dict(_devices(entry))
+    dev_id = str(hardware.get(CONF_DEVICE_ID) or "").strip()
+    if not dev_id:
+        raise ReplaceError("Не указан идентификатор устройства")
+    if dev_id in devices:
+        raise ReplaceError(f"Устройство {dev_id} уже настроено в этой записи")
+
+    template = devices.get(template_id) if template_id else None
+    if template_id and template is None:
+        raise ReplaceError(f"Образец {template_id} не найден")
+
+    friendly = (name or "").strip() or dev_id
+    config: dict[str, Any] = {
+        CONF_FRIENDLY_NAME: friendly,
+        CONF_DEVICE_ID: dev_id,
+        CONF_HOST: hardware.get(CONF_HOST) or "",
+        CONF_LOCAL_KEY: hardware.get(CONF_LOCAL_KEY) or "",
+        CONF_PROTOCOL_VERSION: hardware.get(CONF_PROTOCOL_VERSION) or "3.3",
+        "enable_debug": False,
+        CONF_ENTITIES: [],
+    }
+    if template is not None:
+        for key, value in template.items():
+            if key in (CONF_DEVICE_ID, CONF_FRIENDLY_NAME, CONF_ENTITIES,
+                       CONF_HOST, CONF_LOCAL_KEY, CONF_NODE_ID):
+                continue
+            config.setdefault(key, value)
+        config[CONF_ENTITIES] = _rename_entities(
+            template.get(CONF_ENTITIES) or [],
+            template.get(CONF_FRIENDLY_NAME) or "",
+            friendly,
+        )
+    for field in (CONF_NODE_ID, CONF_GATEWAY_ID, CONF_MODEL, "product_key"):
+        if hardware.get(field):
+            config[field] = hardware[field]
+
+    if not config[CONF_LOCAL_KEY]:
+        raise ReplaceError("Без local_key устройство не подключится")
+
+    # Два самостоятельных устройства на одном адресе интеграция не поднимает:
+    # объекты устройств разложены по хосту, и второе просто не запустится
+    # (см. _setup_devices). Отказать здесь честнее, чем завести устройство,
+    # у которого появятся сущности без состояния. Дочерние узлы адрес шлюза
+    # разделяют законно - их это не касается.
+    if not config.get(CONF_NODE_ID):
+        for other_id, other in devices.items():
+            if other.get(CONF_NODE_ID) or other.get(CONF_HOST) != config[CONF_HOST]:
+                continue
+            raise ReplaceError(
+                f"Адрес {config[CONF_HOST]} уже занят устройством "
+                f"«{other.get(CONF_FRIENDLY_NAME) or other_id}». Задайте другой адрес "
+                "или, если это замена того же прибора, воспользуйтесь заменой."
+            )
+
+    if verify:
+        # Лучше отказать сразу, чем завести устройство, которое никогда не
+        # поднимется: неверный ключ - самая частая причина.
+        await _async_verify(hass, entry, config)
+
+    devices[dev_id] = config
+    new_data = dict(entry.data)
+    new_data[CONF_DEVICES] = devices
+    hass.config_entries.async_update_entry(entry, data=new_data)
+
+    _LOGGER.warning(
+        "Добавлено устройство %s (%s), сущностей из образца %s: %d",
+        dev_id,
+        friendly,
+        template_id or "нет",
+        len(config[CONF_ENTITIES]),
+    )
+    return {
+        "device_id": dev_id,
+        "name": friendly,
+        "entities": len(config[CONF_ENTITIES]),
+        "from_template": template_id,
+    }
+
+
+async def _async_verify(hass: HomeAssistant, entry: ConfigEntry, config: dict) -> None:
+    """Проверить, что с устройством вообще получается поговорить."""
+    from .config_flow import validate_input  # тяжёлый модуль: импорт по месту
+
+    runtime = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if runtime is None:
+        return
+    probe = dict(config)
+    probe.setdefault("enable_debug", False)
+    try:
+        result = await validate_input(runtime, probe)
+    except Exception as err:  # noqa: BLE001 - причина показывается человеку
+        raise ReplaceError(f"Устройство не отвечает: {err}") from err
+    if not isinstance(result, dict):
+        raise ReplaceError(
+            "Устройство не отвечает. Проверьте адрес, local_key и версию протокола."
+        )
+
+
+async def async_remove_device(
+    hass: HomeAssistant, entry: ConfigEntry, dev_id: str
+) -> dict[str, Any]:
+    """Убрать устройство вместе с его следом в реестрах.
+
+    Просто выкинуть его из конфигурации мало: сущности и запись реестра
+    останутся висеть, а Home Assistant покажет их как недоступные навсегда.
+    """
+    devices = dict(_devices(entry))
+    if dev_id not in devices:
+        raise ReplaceError(f"Устройство {dev_id} не найдено в записи конфигурации")
+
+    children = [
+        other_id
+        for other_id, other in devices.items()
+        if other.get(CONF_GATEWAY_ID) == dev_id
+    ]
+    if children:
+        raise ReplaceError(
+            f"За этим шлюзом ещё {len(children)} устройств. Уберите сначала их."
+        )
+
+    ent_reg = er.async_get(hass)
+    removed = 0
+    for entity in _entity_entries(hass, entry, dev_id):
+        ent_reg.async_remove(entity.entity_id)
+        removed += 1
+
+    dev_reg = dr.async_get(hass)
+    registry_device = dev_reg.async_get_device(
+        identifiers={(DOMAIN, unique_id_prefix(dev_id))}
+    )
+    if registry_device is not None:
+        dev_reg.async_remove_device(registry_device.id)
+
+    name = devices[dev_id].get(CONF_FRIENDLY_NAME) or dev_id
+    devices.pop(dev_id)
+    new_data = dict(entry.data)
+    new_data[CONF_DEVICES] = devices
+    hass.config_entries.async_update_entry(entry, data=new_data)
+
+    _LOGGER.warning("Удалено устройство %s (%s), сущностей %d", dev_id, name, removed)
+    return {"device_id": dev_id, "name": name, "entities": removed}
