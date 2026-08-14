@@ -154,6 +154,30 @@ class SourceGuards(unittest.TestCase):
         self.assertIn("cloud.lockdown", self._src("coordinator.py"))
         self.assertIn("tuya_api.lockdown", self._src("diagnostics.py"))
 
+    def test_button_locks_before_persisting(self):
+        """Кнопка сначала взводит замок, потом пишет настройки.
+
+        Запись настроек перезагружает записи; если бы замок ждал перезагрузки,
+        в это окно мог бы проскочить запрос (обновление токена, подтяжка ключа
+        после неудачного подключения).
+        """
+        source = self._src("websocket.py")
+        body = source[source.index("async def ws_set_lockdown") :]
+        body = body[: body.index("connection.send_result")]
+        self.assertLess(
+            body.index("set_global_lockdown"),
+            body.index("async_update_entry"),
+            "общий замок должен взводиться до записи настроек",
+        )
+        self.assertIn("set_lockdown(enabled)", body,
+                      "клиенты уже загруженных записей запираются сразу")
+
+    def test_panel_button_confirms_and_calls_the_command(self):
+        panel = self._src("panel", "panel.js")
+        handler = panel[panel.index('if (a === "lockdown-toggle")') :][:1400]
+        self.assertIn("confirm(", handler, "включение без подтверждения опасно")
+        self.assertIn('this.ws("set_lockdown"', handler)
+
     def test_setup_applies_the_option(self):
         init = self._src("__init__.py")
         self.assertIn("set_global_lockdown", init)

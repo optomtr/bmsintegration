@@ -325,15 +325,24 @@ class BmsControlCenter extends HTMLElement {
   }
 
   lockdownBadge() {
-    /* Режим должен быть виден не только на экране настроек: инженер на объекте
-       должен сразу понимать, почему ключи не обновляются. */
-    const locked = (this.d.settings?.entries || []).some((e) => e.lockdown);
-    if (!locked) return "";
-    return `<span title="Обмен с облаком Tuya запрещён настройками"
-      style="display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 9px;
-      border-radius:5px;background:${soft(C.bad, 0.1)};color:${C.bad};
-      font-size:11.5px;font-weight:600;white-space:nowrap">
-      ${icon("i-alert", 12)}Изолированный режим</span>`;
+    /* Кнопка, а не значок: включить и выключить изолированный режим можно с
+       любого экрана одним нажатием. Красная, когда режим действует, - инженер
+       на объекте сразу видит, почему не обновляются ключи. Пока настройки не
+       загрузились, кнопка не рисуется: её состояние было бы враньём. */
+    const st = this.d.settings;
+    if (!st) return "";
+    const locked = (st.entries || []).some((e) => e.lockdown);
+    return `<button data-act="lockdown-toggle" data-on="${locked ? "1" : ""}"
+      title="${locked
+        ? "Обмен с облаком Tuya запрещён. Нажмите, чтобы снять."
+        : "Одним нажатием полностью запретить интеграции обмен с облаком Tuya."}"
+      style="display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 10px;
+      border-radius:6px;cursor:pointer;font-size:11.5px;font-weight:600;white-space:nowrap;
+      border:1px solid ${locked ? C.bad : "#D0D8DF"};
+      background:${locked ? soft(C.bad, 0.1) : "#F4F6F8"};
+      color:${locked ? C.bad : C.ink2}">
+      ${icon(locked ? "i-alert" : "i-check", 12)}
+      ${locked ? "Изолированный режим" : "Lockdown"}</button>`;
   }
 
   paintHeader() {
@@ -1413,6 +1422,26 @@ class BmsControlCenter extends HTMLElement {
     }
 
     // ---- комнаты и замена ---------------------------------------------
+    if (a === "lockdown-toggle") {
+      const on = !el.dataset.on;
+      if (!confirm(on
+        ? "Включить изолированный режим?\n\nИнтеграции будет полностью запрещён обмен с облаком Tuya и Tuya IoT. Управление устройствами локальное и не изменится. Ключи и список устройств перестанут обновляться из облака."
+        : "Снять изолированный режим и снова разрешить обмен с облаком Tuya?"))
+        return;
+      el.disabled = true;
+      try {
+        await this.ws("set_lockdown", { enabled: on });
+        this.logAction(true, on ? "Изолированный режим включён" : "Изолированный режим снят");
+        this.toast(on
+          ? "Изолированный режим включён: обмен с облаком запрещён"
+          : "Изолированный режим снят");
+      } catch (err) {
+        this.logAction(false, `Изолированный режим: ${err?.message || err}`);
+        this.toast(err?.message || "Не получилось", true);
+      }
+      el.disabled = false;
+      return this.refresh();
+    }
     if (a === "create-room") {
       const name = this.shadowRoot.getElementById("newroom")?.value?.trim();
       if (!name) return this.toast("Впишите название комнаты", true);

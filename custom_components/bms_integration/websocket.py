@@ -453,6 +453,49 @@ async def ws_remove_device(hass: HomeAssistant, connection, msg: dict) -> None:
     connection.send_result(msg["id"], summary)
 
 
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/set_lockdown",
+        vol.Required("enabled"): bool,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_set_lockdown(hass: HomeAssistant, connection, msg: dict) -> None:
+    """Кнопка изолированного режима: одно нажатие - и наружу не уходит ничего.
+
+    Порядок принципиален. Сначала взводится общий замок в клиенте облака -
+    мгновенно, для всего процесса; только потом флаг пишется в настройки
+    записей. Запись настроек перезагружает записи, и если бы замок ждал
+    перезагрузки, в это окно мог бы проскочить запрос (обновление токена,
+    подтяжка ключа после неудачного подключения).
+    """
+    from .core.cloud_api import TuyaCloudApi
+
+    enabled = bool(msg["enabled"])
+    _LOGGER.warning(
+        "Изолированный режим %s из панели (пользователь %s)",
+        "включён" if enabled else "снят",
+        connection.user.name if connection.user else "?",
+    )
+
+    TuyaCloudApi.set_global_lockdown(enabled)
+    for _entry_id, data in _entries(hass):
+        if data.cloud_data is not None:
+            data.cloud_data.set_lockdown(enabled)
+
+    # Теперь - надолго: флаг в настройках переживает перезапуск Home Assistant,
+    # а перезагрузка записей придёт к тому же состоянию, что уже действует.
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        options = dict(entry.options or {})
+        if bool(options.get(OPT_LOCKDOWN)) == enabled:
+            continue
+        options[OPT_LOCKDOWN] = enabled
+        hass.config_entries.async_update_entry(entry, options=options)
+
+    connection.send_result(msg["id"], {"ok": True, "lockdown": enabled})
+
+
 def async_register_websocket_api(hass: HomeAssistant) -> None:
     """Register every panel command, once per Home Assistant."""
     domain_data = hass.data.setdefault(DOMAIN, {})
@@ -477,6 +520,7 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
         ws_update_settings,
         ws_add_device,
         ws_remove_device,
+        ws_set_lockdown,
     ):
         websocket_api.async_register_command(hass, command)
     domain_data[DATA_WS_REGISTERED] = True

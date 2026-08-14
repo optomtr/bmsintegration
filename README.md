@@ -68,6 +68,10 @@ the license text.
   the integration reaches the internet from, ahead of even the token refresh.
   It is a process-wide latch, so the client the config flow builds for itself
   is stopped too, and blocked attempts are counted and shown in the panel.
+  A one-click button in the panel header - visible on every screen - toggles
+  the mode: the latch engages immediately, ahead of the entry reload the
+  settings write triggers, so not a single request slips through the window,
+  and the flag persists across Home Assistant restarts.
   Local control is untouched. With a cloud account attached, keys stop being
   refreshed - replace such a device from the panel instead.
 - **Replacing a device keeps its identity in Home Assistant.** Hardware breaks;
