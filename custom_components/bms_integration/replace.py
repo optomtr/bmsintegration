@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -50,6 +51,13 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# Все операции читают запись конфигурации, затем ждут (проверка связи - это
+# сетевой await) и записывают её обратно. Две одновременные операции сняли бы
+# один снимок, и вторая запись молча затёрла бы первую. Один замок на модуль:
+# добавление, замена и удаление устройств - редкие ручные действия, их
+# сериализация ничего не стоит.
+_CONFIG_LOCK = asyncio.Lock()
 
 # Хранилище выученных ИК-кодов: верхний ключ — device_id пульта.
 IR_CODES_STORAGE_KEY = "bms_integration_remotes_codes"
@@ -194,17 +202,38 @@ def _async_rewrite_registries(
 
     for entity in _entity_entries(hass, entry, old_id):
         new_unique_id = new_prefix + entity.unique_id[len(old_prefix) :]
-        if ent_reg.async_get_entity_id(
+        occupied_id = ent_reg.async_get_entity_id(
             entity.entity_id.split(".")[0], DOMAIN, new_unique_id
-        ):
-            # Такой unique_id уже занят: новое устройство уже настроено
-            # отдельно. Молча слить их нельзя - получится две сущности на один
-            # датапоинт.
-            raise ReplaceError(
-                f"Сущность с идентификатором {new_unique_id} уже существует. "
-                "Сначала удалите новое устройство из интеграции, потом "
-                "выполняйте замену."
+        )
+        if occupied_id:
+            # Вызывающий уже отказал, если новое устройство настроено в записи,
+            # так что коллизия здесь - это след прерванной замены: реестр успел
+            # переименоваться, конфигурация - нет, и после перезапуска Home
+            # Assistant завёл дубль с суффиксом. У дубля нет ни истории, ни
+            # автоматизаций - у переименованной строки есть. Распознаём дубль
+            # по его же подписи (наш entity_id = занятый + «_N») и поглощаем,
+            # делая повтор замены самоизлечивающимся. Всё прочее - по-прежнему
+            # отказ: молча сливать две живые сущности нельзя.
+            suffix = entity.entity_id[len(occupied_id) :]
+            is_crash_leftover = (
+                entity.entity_id.startswith(occupied_id)
+                and suffix.startswith("_")
+                and suffix[1:].isdigit()
             )
+            if not is_crash_leftover:
+                raise ReplaceError(
+                    f"Сущность с идентификатором {new_unique_id} уже существует. "
+                    "Сначала удалите новое устройство из интеграции, потом "
+                    "выполняйте замену."
+                )
+            _LOGGER.warning(
+                "Поглощаю дубль %s: идентичность уже у %s (след прерванной замены)",
+                entity.entity_id,
+                occupied_id,
+            )
+            ent_reg.async_remove(entity.entity_id)
+            moved_entities += 1
+            continue
         ent_reg.async_update_entity(entity.entity_id, new_unique_id=new_unique_id)
         moved_entities += 1
 
@@ -272,6 +301,7 @@ async def async_replace_device(
     entry: ConfigEntry,
     old_id: str,
     new_hardware: dict[str, Any],
+    verify: bool = True,
 ) -> dict[str, Any]:
     """Выдать новое железо за старое устройство.
 
@@ -280,79 +310,102 @@ async def async_replace_device(
     имя, набор сущностей, их датапоинты и настройки — берётся у заменяемого
     устройства, потому что менять предполагается такое же изделие.
     """
-    devices = dict(_devices(entry))
-    old_config = devices.get(old_id)
-    if not old_config:
-        raise ReplaceError(f"Устройство {old_id} не найдено в записи конфигурации")
+    async with _CONFIG_LOCK:
+        devices = dict(_devices(entry))
+        old_config = devices.get(old_id)
+        if not old_config:
+            raise ReplaceError(f"Устройство {old_id} не найдено в записи конфигурации")
 
-    new_id = str(new_hardware.get(CONF_DEVICE_ID) or "").strip()
-    if not new_id:
-        raise ReplaceError("Не указан идентификатор нового устройства")
+        new_id = str(new_hardware.get(CONF_DEVICE_ID) or "").strip()
+        if not new_id:
+            raise ReplaceError("Не указан идентификатор нового устройства")
 
-    same_device = new_id == old_id
-    if not same_device and new_id in devices:
-        raise ReplaceError(
-            f"Устройство {new_id} уже настроено в этой записи. Удалите его, "
-            "прежде чем выдавать за другое."
+        same_device = new_id == old_id
+        if not same_device and new_id in devices:
+            raise ReplaceError(
+                f"Устройство {new_id} уже настроено в этой записи. Удалите его, "
+                "прежде чем выдавать за другое."
+            )
+
+        new_config = dict(old_config)
+        for field in HARDWARE_FIELDS:
+            if field in new_hardware and new_hardware[field] not in (None, ""):
+                new_config[field] = new_hardware[field]
+        new_config[CONF_DEVICE_ID] = new_id
+
+        # Адрес, на который переезжает замена, не должен принадлежать другому
+        # самостоятельному устройству: словарь устройств ключуется по хосту, и
+        # второе на том же адресе молча не поднимется. Добавление это уже
+        # запрещает - замена обязана вести себя так же. Старое устройство из
+        # проверки исключается: оно и так уходит.
+        if not new_config.get(CONF_NODE_ID):
+            for other_id, other in devices.items():
+                if other_id == old_id or other.get(CONF_NODE_ID):
+                    continue
+                if other.get(CONF_HOST) == new_config.get(CONF_HOST):
+                    raise ReplaceError(
+                        f"Адрес {new_config.get(CONF_HOST)} уже занят устройством "
+                        f"«{other.get(CONF_FRIENDLY_NAME) or other_id}». Замена не "
+                        "выполнена."
+                    )
+
+        # Сначала убедиться, что новое железо вообще отвечает, и только потом
+        # трогать реестры. Иначе опечатка в ключе завершает замену «успешно», а
+        # устройство мертво - и в глазах Home Assistant это всё ещё тот же прибор.
+        if verify:
+            await _async_verify(hass, entry, new_config)
+
+        summary: dict[str, Any] = {
+            "mode": "credentials" if same_device else "replacement",
+            "old_device_id": old_id,
+            "new_device_id": new_id,
+            "name": new_config.get(CONF_FRIENDLY_NAME) or new_id,
+            "entities": 0,
+            "devices": 0,
+            "children_relinked": 0,
+            "ir_codes_moved": False,
+        }
+
+        if same_device:
+            # Сменился только ключ или адрес: в Home Assistant ничего не двигается.
+            devices[old_id] = new_config
+        else:
+            summary.update(_async_rewrite_registries(hass, entry, old_id, new_id))
+            summary["ir_codes_moved"] = await _async_move_ir_codes(hass, old_id, new_id)
+
+            await _async_flush_registries(hass)
+
+            devices.pop(old_id)
+            devices[new_id] = new_config
+
+            # Дети шлюза ссылаются на него по gateway_id и живут по его адресу.
+            for child_id, child in list(devices.items()):
+                if child.get(CONF_GATEWAY_ID) != old_id:
+                    continue
+                updated = dict(child)
+                updated[CONF_GATEWAY_ID] = new_id
+                if new_config.get(CONF_HOST):
+                    updated[CONF_HOST] = new_config[CONF_HOST]
+                devices[child_id] = updated
+                summary["children_relinked"] += 1
+
+        new_data = dict(entry.data)
+        new_data[CONF_DEVICES] = devices
+        # Обновление записи само вызывает её перезагрузку: устройства пересоберутся
+        # уже с новым железом, а сущности подхватят переписанные unique_id и
+        # сохранят свои entity_id.
+        hass.config_entries.async_update_entry(entry, data=new_data)
+
+        _LOGGER.warning(
+            "Замена устройства: %s -> %s (%s), сущностей перенесено %s, "
+            "дочерних перепривязано %s",
+            old_id,
+            new_id,
+            summary["mode"],
+            summary["entities"],
+            summary["children_relinked"],
         )
-
-    new_config = dict(old_config)
-    for field in HARDWARE_FIELDS:
-        if field in new_hardware and new_hardware[field] not in (None, ""):
-            new_config[field] = new_hardware[field]
-    new_config[CONF_DEVICE_ID] = new_id
-
-    summary: dict[str, Any] = {
-        "mode": "credentials" if same_device else "replacement",
-        "old_device_id": old_id,
-        "new_device_id": new_id,
-        "name": new_config.get(CONF_FRIENDLY_NAME) or new_id,
-        "entities": 0,
-        "devices": 0,
-        "children_relinked": 0,
-        "ir_codes_moved": False,
-    }
-
-    if same_device:
-        # Сменился только ключ или адрес: в Home Assistant ничего не двигается.
-        devices[old_id] = new_config
-    else:
-        summary.update(_async_rewrite_registries(hass, entry, old_id, new_id))
-        summary["ir_codes_moved"] = await _async_move_ir_codes(hass, old_id, new_id)
-
-        await _async_flush_registries(hass)
-
-        devices.pop(old_id)
-        devices[new_id] = new_config
-
-        # Дети шлюза ссылаются на него по gateway_id и живут по его адресу.
-        for child_id, child in list(devices.items()):
-            if child.get(CONF_GATEWAY_ID) != old_id:
-                continue
-            updated = dict(child)
-            updated[CONF_GATEWAY_ID] = new_id
-            if new_config.get(CONF_HOST):
-                updated[CONF_HOST] = new_config[CONF_HOST]
-            devices[child_id] = updated
-            summary["children_relinked"] += 1
-
-    new_data = dict(entry.data)
-    new_data[CONF_DEVICES] = devices
-    # Обновление записи само вызывает её перезагрузку: устройства пересоберутся
-    # уже с новым железом, а сущности подхватят переписанные unique_id и
-    # сохранят свои entity_id.
-    hass.config_entries.async_update_entry(entry, data=new_data)
-
-    _LOGGER.warning(
-        "Замена устройства: %s -> %s (%s), сущностей перенесено %s, "
-        "дочерних перепривязано %s",
-        old_id,
-        new_id,
-        summary["mode"],
-        summary["entities"],
-        summary["children_relinked"],
-    )
-    return summary
+        return summary
 
 
 def _rename_entities(entities: list[dict], old_name: str, new_name: str) -> list[dict]:
@@ -390,88 +443,93 @@ async def async_add_device(
     Без образца устройство заводится без сущностей - их набор дособирается
     штатным мастером интеграции.
     """
-    devices = dict(_devices(entry))
-    dev_id = str(hardware.get(CONF_DEVICE_ID) or "").strip()
-    if not dev_id:
-        raise ReplaceError("Не указан идентификатор устройства")
-    if dev_id in devices:
-        raise ReplaceError(f"Устройство {dev_id} уже настроено в этой записи")
+    async with _CONFIG_LOCK:
+        devices = dict(_devices(entry))
+        dev_id = str(hardware.get(CONF_DEVICE_ID) or "").strip()
+        if not dev_id:
+            raise ReplaceError("Не указан идентификатор устройства")
+        if dev_id in devices:
+            raise ReplaceError(f"Устройство {dev_id} уже настроено в этой записи")
 
-    template = devices.get(template_id) if template_id else None
-    if template_id and template is None:
-        raise ReplaceError(f"Образец {template_id} не найден")
+        template = devices.get(template_id) if template_id else None
+        if template_id and template is None:
+            raise ReplaceError(f"Образец {template_id} не найден")
 
-    friendly = (name or "").strip() or dev_id
-    config: dict[str, Any] = {
-        CONF_FRIENDLY_NAME: friendly,
-        CONF_DEVICE_ID: dev_id,
-        CONF_HOST: hardware.get(CONF_HOST) or "",
-        CONF_LOCAL_KEY: hardware.get(CONF_LOCAL_KEY) or "",
-        CONF_PROTOCOL_VERSION: hardware.get(CONF_PROTOCOL_VERSION) or "3.3",
-        "enable_debug": False,
-        CONF_ENTITIES: [],
-    }
-    if template is not None:
-        for key, value in template.items():
-            if key in (CONF_DEVICE_ID, CONF_FRIENDLY_NAME, CONF_ENTITIES,
-                       CONF_HOST, CONF_LOCAL_KEY, CONF_NODE_ID):
-                continue
-            config.setdefault(key, value)
-        config[CONF_ENTITIES] = _rename_entities(
-            template.get(CONF_ENTITIES) or [],
-            template.get(CONF_FRIENDLY_NAME) or "",
-            friendly,
-        )
-    for field in (CONF_NODE_ID, CONF_GATEWAY_ID, CONF_MODEL, "product_key"):
-        if hardware.get(field):
-            config[field] = hardware[field]
-
-    if not config[CONF_LOCAL_KEY]:
-        raise ReplaceError("Без local_key устройство не подключится")
-
-    # Два самостоятельных устройства на одном адресе интеграция не поднимает:
-    # объекты устройств разложены по хосту, и второе просто не запустится
-    # (см. _setup_devices). Отказать здесь честнее, чем завести устройство,
-    # у которого появятся сущности без состояния. Дочерние узлы адрес шлюза
-    # разделяют законно - их это не касается.
-    if not config.get(CONF_NODE_ID):
-        for other_id, other in devices.items():
-            if other.get(CONF_NODE_ID) or other.get(CONF_HOST) != config[CONF_HOST]:
-                continue
-            raise ReplaceError(
-                f"Адрес {config[CONF_HOST]} уже занят устройством "
-                f"«{other.get(CONF_FRIENDLY_NAME) or other_id}». Задайте другой адрес "
-                "или, если это замена того же прибора, воспользуйтесь заменой."
+        friendly = (name or "").strip() or dev_id
+        config: dict[str, Any] = {
+            CONF_FRIENDLY_NAME: friendly,
+            CONF_DEVICE_ID: dev_id,
+            CONF_HOST: hardware.get(CONF_HOST) or "",
+            CONF_LOCAL_KEY: hardware.get(CONF_LOCAL_KEY) or "",
+            CONF_PROTOCOL_VERSION: hardware.get(CONF_PROTOCOL_VERSION) or "3.3",
+            "enable_debug": False,
+            CONF_ENTITIES: [],
+        }
+        if template is not None:
+            for key, value in template.items():
+                if key in (CONF_DEVICE_ID, CONF_FRIENDLY_NAME, CONF_ENTITIES,
+                           CONF_HOST, CONF_LOCAL_KEY, CONF_NODE_ID):
+                    continue
+                config.setdefault(key, value)
+            config[CONF_ENTITIES] = _rename_entities(
+                template.get(CONF_ENTITIES) or [],
+                template.get(CONF_FRIENDLY_NAME) or "",
+                friendly,
             )
+        for field in (CONF_NODE_ID, CONF_GATEWAY_ID, CONF_MODEL, "product_key"):
+            if hardware.get(field):
+                config[field] = hardware[field]
 
-    if verify:
-        # Лучше отказать сразу, чем завести устройство, которое никогда не
-        # поднимется: неверный ключ - самая частая причина.
-        await _async_verify(hass, entry, config)
+        if not config[CONF_LOCAL_KEY]:
+            raise ReplaceError("Без local_key устройство не подключится")
 
-    devices[dev_id] = config
-    new_data = dict(entry.data)
-    new_data[CONF_DEVICES] = devices
-    hass.config_entries.async_update_entry(entry, data=new_data)
+        # Два самостоятельных устройства на одном адресе интеграция не поднимает:
+        # объекты устройств разложены по хосту, и второе просто не запустится
+        # (см. _setup_devices). Отказать здесь честнее, чем завести устройство,
+        # у которого появятся сущности без состояния. Дочерние узлы адрес шлюза
+        # разделяют законно - их это не касается.
+        if not config.get(CONF_NODE_ID):
+            for other_id, other in devices.items():
+                if other.get(CONF_NODE_ID) or other.get(CONF_HOST) != config[CONF_HOST]:
+                    continue
+                raise ReplaceError(
+                    f"Адрес {config[CONF_HOST]} уже занят устройством "
+                    f"«{other.get(CONF_FRIENDLY_NAME) or other_id}». Задайте другой адрес "
+                    "или, если это замена того же прибора, воспользуйтесь заменой."
+                )
 
-    _LOGGER.warning(
-        "Добавлено устройство %s (%s), сущностей из образца %s: %d",
-        dev_id,
-        friendly,
-        template_id or "нет",
-        len(config[CONF_ENTITIES]),
-    )
-    return {
-        "device_id": dev_id,
-        "name": friendly,
-        "entities": len(config[CONF_ENTITIES]),
-        "from_template": template_id,
-    }
+        if verify:
+            # Лучше отказать сразу, чем завести устройство, которое никогда не
+            # поднимется: неверный ключ - самая частая причина.
+            await _async_verify(hass, entry, config)
+
+        devices[dev_id] = config
+        new_data = dict(entry.data)
+        new_data[CONF_DEVICES] = devices
+        hass.config_entries.async_update_entry(entry, data=new_data)
+
+        _LOGGER.warning(
+            "Добавлено устройство %s (%s), сущностей из образца %s: %d",
+            dev_id,
+            friendly,
+            template_id or "нет",
+            len(config[CONF_ENTITIES]),
+        )
+        return {
+            "device_id": dev_id,
+            "name": friendly,
+            "entities": len(config[CONF_ENTITIES]),
+            "from_template": template_id,
+        }
 
 
 async def _async_verify(hass: HomeAssistant, entry: ConfigEntry, config: dict) -> None:
     """Проверить, что с устройством вообще получается поговорить."""
-    from .config_flow import validate_input  # тяжёлый модуль: импорт по месту
+    try:
+        from .config_flow import validate_input  # тяжёлый модуль: импорт по месту
+    except ImportError:  # pragma: no cover - урезанное окружение тестов
+        _LOGGER.debug("config_flow недоступен: проверка связи пропущена")
+        return
 
     runtime = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     if runtime is None:
@@ -496,38 +554,39 @@ async def async_remove_device(
     Просто выкинуть его из конфигурации мало: сущности и запись реестра
     останутся висеть, а Home Assistant покажет их как недоступные навсегда.
     """
-    devices = dict(_devices(entry))
-    if dev_id not in devices:
-        raise ReplaceError(f"Устройство {dev_id} не найдено в записи конфигурации")
+    async with _CONFIG_LOCK:
+        devices = dict(_devices(entry))
+        if dev_id not in devices:
+            raise ReplaceError(f"Устройство {dev_id} не найдено в записи конфигурации")
 
-    children = [
-        other_id
-        for other_id, other in devices.items()
-        if other.get(CONF_GATEWAY_ID) == dev_id
-    ]
-    if children:
-        raise ReplaceError(
-            f"За этим шлюзом ещё {len(children)} устройств. Уберите сначала их."
+        children = [
+            other_id
+            for other_id, other in devices.items()
+            if other.get(CONF_GATEWAY_ID) == dev_id
+        ]
+        if children:
+            raise ReplaceError(
+                f"За этим шлюзом ещё {len(children)} устройств. Уберите сначала их."
+            )
+
+        ent_reg = er.async_get(hass)
+        removed = 0
+        for entity in _entity_entries(hass, entry, dev_id):
+            ent_reg.async_remove(entity.entity_id)
+            removed += 1
+
+        dev_reg = dr.async_get(hass)
+        registry_device = dev_reg.async_get_device(
+            identifiers={(DOMAIN, unique_id_prefix(dev_id))}
         )
+        if registry_device is not None:
+            dev_reg.async_remove_device(registry_device.id)
 
-    ent_reg = er.async_get(hass)
-    removed = 0
-    for entity in _entity_entries(hass, entry, dev_id):
-        ent_reg.async_remove(entity.entity_id)
-        removed += 1
+        name = devices[dev_id].get(CONF_FRIENDLY_NAME) or dev_id
+        devices.pop(dev_id)
+        new_data = dict(entry.data)
+        new_data[CONF_DEVICES] = devices
+        hass.config_entries.async_update_entry(entry, data=new_data)
 
-    dev_reg = dr.async_get(hass)
-    registry_device = dev_reg.async_get_device(
-        identifiers={(DOMAIN, unique_id_prefix(dev_id))}
-    )
-    if registry_device is not None:
-        dev_reg.async_remove_device(registry_device.id)
-
-    name = devices[dev_id].get(CONF_FRIENDLY_NAME) or dev_id
-    devices.pop(dev_id)
-    new_data = dict(entry.data)
-    new_data[CONF_DEVICES] = devices
-    hass.config_entries.async_update_entry(entry, data=new_data)
-
-    _LOGGER.warning("Удалено устройство %s (%s), сущностей %d", dev_id, name, removed)
-    return {"device_id": dev_id, "name": name, "entities": removed}
+        _LOGGER.warning("Удалено устройство %s (%s), сущностей %d", dev_id, name, removed)
+        return {"device_id": dev_id, "name": name, "entities": removed}

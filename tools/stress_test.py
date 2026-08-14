@@ -592,6 +592,114 @@ class Stress:
         else:
             self.ok("задачи после бури возвращаются к норме")
 
+    async def blackout(self):
+        """Полный блэкаут: гаснут ВСЕ шлюзы разом, несколько раз подряд.
+
+        Это сценарий «выбило автомат на щитке» или «перезагрузили коммутатор»:
+        не треть парка, а весь. И самое опасное - повторный удар, когда парк
+        ещё не досходился после первого.
+        """
+        rounds = self.args.blackouts
+        if not rounds:
+            return
+        print(f"\n[6] Блэкаут: весь парк гаснет разом, {rounds} раз(а)")
+        for round_no in range(1, rounds + 1):
+            for hub in self.hubs:
+                hub.sim.offline = {hub.gw_id}
+                await hub.stop()
+            for hub in self.hubs:
+                gateway = self.devices.get(hub.host)
+                if gateway is not None and gateway._interface is not None:
+                    gateway._interface.transport.close()
+            # Второй удар прилетает до полного восстановления: ждём немного.
+            await asyncio.sleep(3 if round_no < rounds else 6)
+            for hub in self.hubs:
+                hub.sim.offline = set()
+                await hub.restart()
+            if round_no < rounds:
+                # Не даём досходиться - следующий удар по полуживому парку.
+                await asyncio.sleep(5)
+                print(f"    удар {round_no}: следующий - по недовосстановленному парку "
+                      f"(на связи {self.connected_count()}/{len(self.devices)})")
+
+        recovered = await self.wait_until(
+            lambda: self.connected_count() == len(self.devices),
+            self.args.recover_timeout,
+        )
+        print(f"    после {rounds} ударов на связи "
+              f"{self.connected_count()}/{len(self.devices)}")
+        if recovered:
+            self.ok("парк пережил повторные блэкауты и восстановился сам")
+        else:
+            offline = [d.friendly_name for d in self.devices.values() if not d.connected]
+            self.fail(f"после блэкаутов не вернулись {len(offline)}: {offline[:3]}")
+
+        stranded = await self.stranded_devices(20)
+        if stranded:
+            self.fail(f"после блэкаутов без задачи восстановления: "
+                      f"{list(stranded.items())[:2]}")
+        else:
+            self.ok("никто не остался без задачи восстановления")
+
+    async def dirty_wire(self):
+        """Грязный провод: каждый третий ответ предваряется мусорным кадром.
+
+        Инварианты 2-4 обещают, что битый кадр не убивает общий сокет, а
+        следующий настоящий ответ доходит. Проверяем это не в юните, а на
+        всём парке под командной нагрузкой.
+        """
+        seconds = self.args.dirty
+        if not seconds:
+            return
+        print(f"\n[7] Грязный провод: мусор перед каждым 3-м ответом, {seconds} с команд")
+        for hub in self.hubs:
+            hub.sim.corrupt_every = 3
+
+        sent = ok_count = refused = 0
+        unexpected: dict[str, int] = {}
+        deadline = time.monotonic() + seconds
+        value = True
+        while time.monotonic() < deadline:
+            batch = [d for i, d in enumerate(self.children()) if i % 5 == 0]
+            results = await asyncio.gather(
+                *[d.set_dp(value, "1") for d in batch], return_exceptions=True
+            )
+            sent += len(results)
+            for r in results:
+                if r is None:
+                    ok_count += 1
+                elif isinstance(r, (TimeoutError, ConnectionError)) or type(
+                    r
+                ).__name__ == "HomeAssistantError":
+                    refused += 1
+                else:
+                    unexpected[type(r).__name__] = unexpected.get(type(r).__name__, 0) + 1
+            value = not value
+            await asyncio.sleep(0.4)
+
+        for hub in self.hubs:
+            hub.sim.corrupt_every = 0
+
+        print(f"    команд {sent}, прошло {ok_count}, отклонено штатно {refused}")
+        if unexpected:
+            self.fail(f"мусор на проводе дал неожиданные исключения: {unexpected}")
+        else:
+            self.ok("ни одного неожиданного исключения")
+        share = ok_count / sent if sent else 0
+        if share < 0.9:
+            self.fail(f"под мусором прошло только {share:.0%} команд")
+        else:
+            self.ok(f"{share:.0%} команд прошло, мусор не разрушил сессии")
+
+        settled = await self.wait_until(
+            lambda: self.connected_count() == len(self.devices), 60
+        )
+        if settled:
+            self.ok("после грязного провода весь парк на связи")
+        else:
+            self.fail(f"после грязного провода на связи "
+                      f"{self.connected_count()}/{len(self.devices)}")
+
     async def soak(self):
         seconds = self.args.soak
         if not seconds:
@@ -645,6 +753,8 @@ class Stress:
         await self.hub_outage()
         await self.address_change()
         await self.chaos()
+        await self.blackout()
+        await self.dirty_wire()
         await self.soak()
         await self.teardown()
 
@@ -663,6 +773,10 @@ def main():
     ap.add_argument("--hubs", type=int, default=30)
     ap.add_argument("--per-hub", type=int, default=23)
     ap.add_argument("--protocol", default="3.5", choices=["3.3", "3.4", "3.5"])
+    ap.add_argument("--blackouts", type=int, default=3, metavar="N",
+                    help="полных блэкаутов всего парка подряд (0 — пропустить)")
+    ap.add_argument("--dirty", type=int, default=30, metavar="SEC",
+                    help="секунд команд при мусоре на проводе (0 — пропустить)")
     ap.add_argument("--chaos", type=int, default=4, metavar="N",
                     help="раундов деградации под нагрузкой (0 — пропустить)")
     ap.add_argument("--soak", type=int, default=45, help="секунд выдержки (0 — пропустить)")

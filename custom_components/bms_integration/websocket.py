@@ -232,6 +232,7 @@ def ws_replace_preview(hass: HomeAssistant, connection, msg: dict) -> None:
 @websocket_api.websocket_command(
     {
         vol.Required("type"): f"{DOMAIN}/replace_device",
+        vol.Optional("verify"): bool,
         vol.Required("entry_id"): str,
         vol.Required("old_device_id"): str,
         vol.Required("new_device_id"): str,
@@ -267,7 +268,8 @@ async def ws_replace_device(hass: HomeAssistant, connection, msg: dict) -> None:
     )
     try:
         summary = await replace_mod.async_replace_device(
-            hass, entry, msg["old_device_id"], hardware
+            hass, entry, msg["old_device_id"], hardware,
+            verify=msg.get("verify", True),
         )
     except replace_mod.ReplaceError as err:
         connection.send_error(msg["id"], "replace_failed", str(err))

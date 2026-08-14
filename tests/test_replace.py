@@ -388,5 +388,65 @@ class Removing(Base):
         self.assertIn(self.OLD, self.entry.data["devices"], "ничего не удалено")
 
 
+class ReplaceHardening(Base):
+    """Три пробела, найденных критическим разбором обновлений."""
+
+    async def test_occupied_address_is_refused(self):
+        """Замена на адрес другого устройства не должна создавать двойника."""
+        self.entry.data["devices"]["other-dev"] = device_config("other-dev")
+        self.entry.data["devices"]["other-dev"]["host"] = "10.0.0.9"
+        with self.assertRaises(replace.ReplaceError) as ctx:
+            await replace.async_replace_device(
+                self.hass, self.entry, self.OLD,
+                {"device_id": self.NEW, "host": "10.0.0.9",
+                 "local_key": "key-new-111111111"},
+            )
+        self.assertIn("занят", str(ctx.exception))
+        self.assertIn(self.OLD, self.entry.data["devices"],
+                      "конфигурация тронута при отказе")
+
+    async def test_own_address_is_not_a_collision(self):
+        """Новое железо на адресе старого - штатный случай замены."""
+        host = self.entry.data["devices"][self.OLD]["host"]
+        summary = await replace.async_replace_device(
+            self.hass, self.entry, self.OLD,
+            {"device_id": self.NEW, "host": host, "local_key": "key-new-111111111"},
+        )
+        self.assertEqual(summary["new_device_id"], self.NEW)
+
+    async def test_crash_leftover_duplicate_is_absorbed(self):
+        """Повтор замены после прерванной должен сходиться сам.
+
+        След аварийного окна: строка с историей уже держит новый unique_id и
+        короткий entity_id, а перезапуск завёл дубль со старым unique_id и
+        суффиксом _2. Повторная замена обязана поглотить дубль, а не
+        упереться в коллизию.
+        """
+        self.ent_reg.entries = [
+            FakeEntityEntry("switch.rele", f"local_{self.NEW}_1", "Реле"),
+            FakeEntityEntry("switch.rele_2", f"local_{self.OLD}_1", "Реле"),
+        ]
+        summary = await replace.async_replace_device(
+            self.hass, self.entry, self.OLD,
+            {"device_id": self.NEW, "local_key": "key-new-111111111"},
+        )
+        self.assertEqual(summary["entities"], 1)
+        ids = [e.entity_id for e in self.ent_reg.entries]
+        self.assertNotIn("switch.rele_2", ids, "дубль не поглощён")
+        self.assertEqual(self.ent_reg.entries[0].unique_id, f"local_{self.NEW}_1")
+
+    async def test_live_collision_still_refuses(self):
+        """Настоящая чужая сущность (не дубль по подписи) - по-прежнему отказ."""
+        self.ent_reg.entries = [
+            FakeEntityEntry("switch.drugoi", f"local_{self.NEW}_1", "Другой"),
+            FakeEntityEntry("switch.rele", f"local_{self.OLD}_1", "Реле"),
+        ]
+        with self.assertRaises(replace.ReplaceError):
+            await replace.async_replace_device(
+                self.hass, self.entry, self.OLD,
+                {"device_id": self.NEW, "local_key": "key-new-111111111"},
+            )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

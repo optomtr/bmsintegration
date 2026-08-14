@@ -153,6 +153,22 @@ the license text.
   notice an address change for the rest of the run.
 - Dispatcher signals and remote storage/service domain use the BMS Integration domain.
 
+### Hardened after the brutal stress pass
+
+- Replacing a device now verifies the new hardware answers before any registry
+  is touched, refuses an address another standalone device already occupies,
+  and absorbs the duplicate row a crash inside the replace window leaves
+  behind - re-running the replace converges instead of colliding.
+- Add, replace and remove serialize on one lock: each of them awaits a network
+  probe between reading and writing the config entry, so two concurrent calls
+  used to overwrite each other's device silently.
+- The simulator can now poison the wire (`--corrupt-every N`) and the stress
+  harness gained full-fleet blackout and dirty-wire phases. Measured on 40
+  hubs / 720 devices: 28 224 commands through 5 rounds of flapping hubs with
+  zero unexpected exceptions, 3 back-to-back full blackouts with full
+  self-recovery, 7 072/7 072 commands delivered while garbage preceded every
+  third reply, and a soak with zero task/listener/memory growth.
+
 ## Install
 
 ### Manual

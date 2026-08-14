@@ -121,6 +121,12 @@ def build_scenario() -> dict:
         "kind": "device",
         "dps": {"20": False, "22": 700, "23": 500, "21": "white"},
     }
+    # Второе запасное - для проб добавления/удаления, пока первое занято заменой.
+    devices["sim-spare-light-02"] = {
+        "name": "Торшер (замена 2)",
+        "kind": "device",
+        "dps": {"20": False, "22": 700, "23": 500, "21": "white"},
+    }
     return devices
 
 
@@ -368,6 +374,7 @@ class Simulator:
         subdev_chunk: int = 0,
         protocol: str = PROTOCOL,
         reply_delay: float = 0.0,
+        corrupt_every: int = 0,
     ):
         self.devices = devices
         self.offline = offline
@@ -382,6 +389,11 @@ class Simulator:
         # instantly and no amount of load ever reproduces a reply timeout.
         self.reply_delay = reply_delay
         self._relay_lock = asyncio.Lock()
+        # Каждый N-й ответ предваряется мусорным кадром: битый заголовок,
+        # обрезанное тело, чужой префикс. Клиент обязан ресинкнуться и
+        # разобрать настоящий ответ следом - ровно инварианты 2-4.
+        self.corrupt_every = corrupt_every
+        self._reply_counter = 0
         self.push_seqno = 1000
 
     def _state_for(self, dev_id: str | None, cid: str | None) -> dict | None:
@@ -437,7 +449,21 @@ class Simulator:
             _LOGGER.info("disconnect %s (%s)", peer, seen or "unknown device")
             writer.close()
 
+    _GARBAGE = (
+        # битый заголовок: префикс 55AA и безумная длина
+        bytes.fromhex("000055aa00000001000000070fffffff") + b"\x00" * 16,
+        # обрывок настоящего кадра без хвоста
+        bytes.fromhex("000055aa000000020000000a00000010deadbeef"),
+        # просто шум, в котором встречается префикс
+        b"\x17\x03\x03\x00\x2a" + bytes.fromhex("000055aa") + b"\x99" * 11,
+    )
+
     async def _respond(self, writer, msg, codec: "Codec") -> str | None:
+        if self.corrupt_every:
+            self._reply_counter += 1
+            if self._reply_counter % self.corrupt_every == 0:
+                writer.write(self._GARBAGE[self._reply_counter % len(self._GARBAGE)])
+                await writer.drain()
         if msg.cmd in (
             CMDType.SESS_KEY_NEG_START,
             CMDType.SESS_KEY_NEG_FINISH,
@@ -673,6 +699,7 @@ async def main_async(args):
         subdev_chunk=args.subdev_chunk,
         protocol=args.protocol,
         reply_delay=args.reply_delay,
+        corrupt_every=args.corrupt_every,
     )
     server = await asyncio.start_server(sim.handle, args.host, args.port)
     stop = asyncio.Event()
@@ -699,6 +726,8 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=6668)
     ap.add_argument("--offline", nargs="*", help="device ids that must not answer")
+    ap.add_argument("--corrupt-every", type=int, default=0, metavar="N",
+                    help="перед каждым N-м ответом слать мусорный кадр (проверка ресинка)")
     ap.add_argument("--reply-delay", type=float, default=0.0, metavar="SEC",
                     help="seconds the hub spends relaying each command, "
                          "serialised - reproduces a burst overloading a hub")
