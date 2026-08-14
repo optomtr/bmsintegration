@@ -49,6 +49,7 @@ const NAV = [
   { id: "map", label: "Карта связей", icon: "i-network" },
   { id: "device", label: "Устройство", icon: "i-chip" },
   { id: "add", label: "Добавить устройство", icon: "i-plus" },
+  { id: "rooms", label: "Комнаты", icon: "i-home" },
   { id: "events", label: "События", icon: "i-list" },
   { id: "settings", label: "Настройки", icon: "i-sliders" },
 ];
@@ -159,6 +160,8 @@ class BmsControlCenter extends HTMLElement {
       expert: false,
       incidentsOnly: false,
       mapMode: "tree",
+      replaceTarget: null,   // какое устройство заменяем
+      replaceWith: null,     // на какое
       search: "",
       eventSearch: "",
       entryFilter: "all",
@@ -166,7 +169,8 @@ class BmsControlCenter extends HTMLElement {
       updatedAt: null,
       busy: false,
     };
-    this.d = { overview: null, topology: null, device: null, logs: null, report: null, discovered: null };
+    this.d = { overview: null, topology: null, device: null, logs: null, report: null,
+               discovered: null, areas: null, settings: null, replace: null };
     this._err = null;
   }
 
@@ -237,8 +241,17 @@ class BmsControlCenter extends HTMLElement {
         jobs.push(this.ws("device", { device_id: devId })
           .then((r) => { if (this.s.deviceId === devId) this.d.device = r; })
           .catch(() => { if (this.s.deviceId === devId) this.d.device = null; }));
-      if (sc === "add")
+      if (sc === "add") {
         jobs.push(this.ws("discovered").then((r) => { if (onScreen()) this.d.discovered = r; }));
+        jobs.push(this.ws("replace_preview").then((r) => { if (onScreen()) this.d.replace = r; }));
+      }
+      if (sc === "rooms")
+        jobs.push(this.ws("areas").then((r) => { if (onScreen()) this.d.areas = r; }));
+      if (sc === "settings")
+        jobs.push(this.ws("settings").then((r) => { if (onScreen()) this.d.settings = r; }));
+      if (sc === "device" && devId)
+        jobs.push(this.ws("replace_preview", { device_id: devId })
+          .then((r) => { if (this.s.deviceId === devId) this.d.replace = r; }));
       if (sc === "events") {
         jobs.push(this.ws("report", { limit: REPORT_LIMIT }).then((r) => { if (onScreen()) this.d.report = r; }));
         jobs.push(this.ws("logs", { limit: LOG_LIMIT }).then((r) => { if (onScreen()) this.d.logs = r; }));
@@ -362,6 +375,7 @@ class BmsControlCenter extends HTMLElement {
     const view = {
       overview: () => this.vOverview(), map: () => this.vMap(), device: () => this.vDevice(),
       add: () => this.vAdd(), events: () => this.vEvents(), settings: () => this.vSettings(),
+      rooms: () => this.vRooms(),
     }[this.s.screen];
     try {
       main.innerHTML = view ? view() : "";
@@ -701,12 +715,17 @@ class BmsControlCenter extends HTMLElement {
             ${btn("Обновить DPS", { act: "dev-refresh", data: `data-id="${esc(r.device_id)}"`, ico: "i-refresh" })}
             ${btn("Тест статуса", { act: "dev-test", data: `data-id="${esc(r.device_id)}"`, ico: "i-play" })}
             ${btn("Переподключить", { act: "dev-reconnect", data: `data-id="${esc(r.device_id)}"`, ico: "i-link" })}
+            ${btn("Заменить устройство", { act: "replace-open",
+              data: `data-old="${esc(r.device_id)}"`, ico: "i-refresh" })}
             ${btn("Перезагрузить запись", { act: "reload-entry", data: `data-entry="${esc(r.entry_id)}"`, danger: true })}
           </div>
         </div>
         <nav class="subnav">${tabs}</nav>
       </div>
-      <div class="pad col14" style="max-width:1560px;padding-top:16px">${body}</div>
+      <div class="pad col14" style="max-width:1560px;padding-top:16px">
+        ${this.s.replaceTarget === r.device_id ? this.replaceBox() : ""}
+        ${body}
+      </div>
     </div>`;
   }
 
@@ -851,6 +870,49 @@ class BmsControlCenter extends HTMLElement {
     const fresh = found.filter((f) => !f.configured);
     const known = found.filter((f) => f.configured);
 
+    const suspects = this.d.replace?.credentials_suspects || [];
+    const targets = this.d.replace?.targets || [];
+    const suspectBox = suspects.length ? `
+      ${cardOpen("Похоже, сменился ключ", `<span class="small" style="color:${C.stale}">${
+        plural(suspects.length, "устройство", "устройства", "устройств")}</span>`)}
+      <div style="padding:14px;display:flex;flex-direction:column;gap:10px">
+        <span class="small mut">Эти устройства отвечают в сети, но интеграция к ним не
+          подключается. Обычно так бывает после замены шлюза или повторной привязки:
+          device_id прежний, сменился только local_key. Замена «сама на себя» ничего не
+          двигает в Home Assistant — только обновляет учётные данные.</span>
+        ${suspects.map((sid) => {
+          const t = targets.find((x) => x.device_id === sid);
+          return `<div class="frow">
+            <span class="acell">${icon("i-alert", 14, C.stale)}
+              <span class="aname">${esc(t?.name || sid)}</span></span>
+            <span class="mono small mut">${esc(sid)}</span>
+            <span class="small mut">${esc(t?.area_name || "без комнаты")}</span>
+            ${btn("Обновить ключ", { act: "replace-open", small: true,
+              data: `data-old="${esc(sid)}" data-with="${esc(sid)}"`, ico: "i-refresh" })}
+          </div>`;
+        }).join("")}
+      </div>${cardClose}` : "";
+
+    const replaceBox = this.s.replaceTarget ? this.replaceBox() : "";
+
+    const replaceList = `
+      ${cardOpen("Заменить существующее устройство",
+        `<span class="small mut">поломка, замена изделия</span>`)}
+      <div style="padding:14px;display:flex;flex-direction:column;gap:10px">
+        <span class="small mut">Выберите, ЧТО заменяем. Новое изделие унаследует его
+          личность: те же entity_id, комната, автоматизации и история.</span>
+        <div>${targets.length ? targets.map((t) => `
+          <div class="frow">
+            <span class="acell">${icon(t.is_subdevice ? "i-zigbee" : "i-wifi", 14, C.mut)}
+              <span class="aname">${esc(t.name)}</span></span>
+            <span class="small mut">${esc(t.area_name || "без комнаты")}</span>
+            <span class="small mut">${plural(t.entity_count, "сущность", "сущности", "сущностей")}</span>
+            <span class="mono small mut">${esc(t.host || "")}</span>
+            ${btn("Заменить", { act: "replace-open", small: true,
+              data: `data-old="${esc(t.device_id)}"`, ico: "i-refresh" })}
+          </div>`).join("") : empty("Настроенных устройств нет", "i-chip", C.mut)}</div>
+      </div>${cardClose}`;
+
     const rows = fresh.length ? fresh.map((f) => `
       <div class="frow">
         <span class="acell">${icon("i-wifi", 14, C.mut)}<span class="aname mono">${esc(f.device_id)}</span></span>
@@ -862,6 +924,9 @@ class BmsControlCenter extends HTMLElement {
     return `<div class="pad col16" style="max-width:1440px">
       <div class="row16">
         <div style="flex:2 1 520px;min-width:320px" class="col16">
+          ${suspectBox}
+          ${replaceBox}
+          ${replaceList}
           ${cardOpen(`Найденные устройства · ${fresh.length}`,
             btn("Сканировать снова", { act: "refresh", small: true, ico: "i-refresh" }))}
             <div>${rows}</div>
@@ -952,6 +1017,170 @@ class BmsControlCenter extends HTMLElement {
   }
 
   // ================================================== 06 Настройки ========
+  // ==================================================== 06 Комнаты ========
+  vRooms() {
+    const d = this.d.areas;
+    if (!d) return `<div class="pad muted">Загрузка комнат…</div>`;
+    const areas = d.areas || [];
+    const free = d.unassigned || [];
+
+    const options = (selected) =>
+      `<option value="">— без комнаты —</option>` +
+      areas.map((a) => `<option value="${esc(a.area_id)}" ${a.area_id === selected ? "selected" : ""}>
+         ${esc(a.name)}</option>`).join("");
+
+    const deviceRow = (dev, areaId) => `
+      <div class="frow">
+        <span class="acell">${icon(dev.is_gateway ? "i-network" : "i-chip", 14,
+          (ST[dev.state] || ST.config).color)}
+          <span class="aname">${esc(dev.name)}</span></span>
+        <span class="small mut">${plural(dev.entity_count, "сущность", "сущности", "сущностей")}</span>
+        <span>${pill(dev.state)}</span>
+        <select data-act="set-area" data-id="${esc(dev.device_id)}"
+                ${dev.registry_id ? "" : "disabled title='У устройства нет сущностей'"}>
+          ${options(areaId)}
+        </select>
+      </div>`;
+
+    const cards = areas.map((a) => `
+      ${cardOpen(esc(a.name), `<span class="small mut">${
+        plural(a.devices.length, "устройство", "устройства", "устройств")}</span>`)}
+      <div>${a.devices.length
+        ? a.devices.map((dev) => deviceRow(dev, a.area_id)).join("")
+        : empty("В этой комнате пока нет устройств интеграции", "i-home", C.mut)}</div>
+      ${cardClose}`).join("");
+
+    return `<div class="pad col16" style="max-width:1280px">
+      ${cardOpen("Новая комната")}
+      <div style="padding:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input id="newroom" placeholder="Например: Гостиная" style="flex:1;min-width:220px">
+        ${btn("Создать", { act: "create-room", primary: true, ico: "i-plus" })}
+        <span class="small mut">Комната создаётся в Home Assistant и сразу берёт первое
+          устройство без комнаты — дальше распределите остальные списками ниже.</span>
+      </div>${cardClose}
+
+      ${free.length ? `
+        ${cardOpen("Без комнаты", `<span class="small" style="color:${C.stale}">${
+          plural(free.length, "устройство", "устройства", "устройств")}</span>`)}
+        <div>${free.map((dev) => deviceRow(dev, null)).join("")}</div>
+        ${cardClose}` : ""}
+
+      ${cards || empty("Комнаты ещё не заведены", "i-home", C.mut)}
+    </div>`;
+  }
+
+  // ============================================ Замена устройства =========
+  replaceBox(target) {
+    /* Карточка замены: слева что заменяем, справа чем. */
+    const r = this.d.replace;
+    if (!r) return "";
+    const targets = r.targets || [];
+    const chosen = target || targets.find((t) => t.device_id === this.s.replaceTarget);
+    const candidates = (r.candidates || []).filter((c) => !c.configured);
+    const withId = this.s.replaceWith;
+    const cand = candidates.find((c) => c.device_id === withId);
+
+    if (!chosen) return "";
+    const mismatch = cand && chosen.datapoints.length
+      ? `<div class="warnbox">${icon("i-alert", 14, C.stale)}<span>Сверьте датапоинты:
+          у заменяемого устройства сущности на DP ${esc(chosen.datapoints.join(", "))}.
+          Если новое изделие другой модели, часть сущностей работать не будет.</span></div>`
+      : "";
+
+    return `
+      ${cardOpen(`Замена: ${esc(chosen.name)}`,
+        `<span class="small mut">${esc(chosen.device_id)}</span>`)}
+      <div style="padding:14px;display:flex;flex-direction:column;gap:12px">
+        <div class="row14">
+          <div style="flex:1 1 300px;min-width:260px">
+            <div class="cap" style="margin-bottom:6px">Что заменяем</div>
+            ${kv([
+              ["Комната", chosen.area_name || "не назначена"],
+              ["Сущностей", chosen.entity_count],
+              ["Адрес", chosen.host || "—"],
+              ["Тип", chosen.is_subdevice ? "узел за шлюзом" : "прямое подключение"],
+              ...(chosen.children.length ? [["Дочерних", chosen.children.length]] : []),
+            ])}
+            <div class="small mut" style="margin-top:8px">Сохранятся: ${
+              chosen.entities.map((e) => esc(e.entity_id)).join(", ") || "—"}</div>
+          </div>
+          <div style="flex:1 1 300px;min-width:260px">
+            <div class="cap" style="margin-bottom:6px">Чем заменяем</div>
+            <select data-act="replace-pick" style="width:100%;margin-bottom:8px">
+              <option value="">— выберите устройство из сети —</option>
+              ${candidates.map((c) => `<option value="${esc(c.device_id)}" ${
+                c.device_id === withId ? "selected" : ""}>${esc(c.device_id)} · ${esc(c.host)}</option>`).join("")}
+            </select>
+            <input id="rep-id" placeholder="или впишите device_id вручную"
+                   value="${esc(withId || "")}" style="width:100%;margin-bottom:8px">
+            <input id="rep-key" placeholder="local_key нового устройства"
+                   value="" style="width:100%;margin-bottom:8px">
+            <input id="rep-host" placeholder="адрес" value="${esc(cand?.host || chosen.host || "")}"
+                   style="width:100%">
+          </div>
+        </div>
+        ${mismatch}
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          ${btn("Заменить устройство", { act: "replace-go", data:
+            `data-entry="${esc(chosen.entry_id)}" data-old="${esc(chosen.device_id)}"`,
+            primary: true, ico: "i-refresh" })}
+          ${btn("Отмена", { act: "replace-cancel" })}
+          <span class="small mut">Home Assistant продолжит считать это тем же устройством:
+            entity_id, комната, автоматизации и история сохранятся.</span>
+        </div>
+      </div>${cardClose}`;
+  }
+
+  homeSettings() {
+    /* Настройки установки: пока не заданы, действуют значения по умолчанию. */
+    const st = this.d.settings;
+    if (!st) return "";
+    const field = (id, label, value, hint, suffix = "с") => `
+      <div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid ${C.div}">
+        <span style="flex:1;min-width:0">
+          <span style="display:block;font-size:12.5px;color:${C.ink2}">${label}</span>
+          <span class="small mut">${hint}</span>
+        </span>
+        <input id="${id}" type="number" value="${esc(value)}"
+               style="width:96px;text-align:right">
+        <span class="small mut" style="width:16px">${suffix}</span>
+      </div>`;
+
+    return (st.entries || []).map((e) => `
+      ${cardOpen(`Настройки дома · ${esc(e.title)}`,
+        `<span class="small mut">по умолчанию ${st.defaults.grace_period}/${
+          st.defaults.startup_grace}/${st.defaults.watchdog_interval} с</span>`)}
+      <div style="padding:14px;display:flex;flex-direction:column;gap:4px">
+        <div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid ${C.div}">
+          <span style="flex:1">
+            <span style="display:block;font-size:12.5px;color:${C.ink2}">Название дома</span>
+            <span class="small mut">Показывается в панели; на работу не влияет.</span>
+          </span>
+          <input id="set-name-${esc(e.entry_id)}" value="${esc(e.home_name || "")}"
+                 placeholder="${esc(e.title)}" style="width:200px">
+        </div>
+        ${field(`set-grace-${e.entry_id}`, "Окно недоступности", e.grace_period,
+          "Сколько держать сущности доступными во время переподключения. Больше — меньше мусора в истории при микро-обрывах Wi-Fi.")}
+        ${field(`set-start-${e.entry_id}`, "Окно при старте", e.startup_grace,
+          "То же самое, но сразу после запуска Home Assistant, когда парк ещё поднимается.")}
+        ${field(`set-dog-${e.entry_id}`, "Проверка шлюзов", e.watchdog_interval,
+          "Как часто опрашивать шлюзы настоящим запросом: сокет остаётся открытым и после смерти сервиса за ним.")}
+        <div style="display:flex;align-items:center;gap:10px;padding:9px 0">
+          <span style="flex:1">
+            <span style="display:block;font-size:12.5px;color:${C.ink2}">Подробный журнал</span>
+            <span class="small mut">Включает отладку всей интеграции без правки configuration.yaml.</span>
+          </span>
+          <input id="set-debug-${esc(e.entry_id)}" type="checkbox" ${e.debug ? "checked" : ""}
+                 style="width:18px;height:18px">
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
+          ${btn("Сохранить", { act: "save-settings", data: `data-entry="${esc(e.entry_id)}"`,
+            primary: true, ico: "i-check" })}
+          <span class="small mut">Запись перезагрузится — соединения пересоберутся.</span>
+        </div>
+      </div>${cardClose}`).join("");
+  }
+
   vSettings() {
     const entries = this.d.overview?.entries || [];
     const s = this.sum();
@@ -975,7 +1204,10 @@ class BmsControlCenter extends HTMLElement {
 
     return `<div class="pad col16" style="max-width:1440px">
       <div class="row16">
-        <div style="flex:2 1 520px;min-width:320px" class="col16">${cards}</div>
+        <div style="flex:2 1 520px;min-width:320px" class="col16">
+          ${this.homeSettings()}
+          ${cards}
+        </div>
         <aside style="flex:1 1 320px;min-width:290px" class="col16">
           ${cardOpen("Параметры восстановления")}
           <div style="padding:14px">${kv([
@@ -1006,6 +1238,21 @@ class BmsControlCenter extends HTMLElement {
     if (t.dataset.act === "search") { this.s.search = t.value.toLowerCase(); this.paint(); this.focus("search"); }
     if (t.dataset.act === "esearch") { this.s.eventSearch = t.value.toLowerCase(); this.paint(); this.focus("esearch"); }
     if (t.dataset.act === "entry") { this.s.entryFilter = t.value; this.paint(); }
+    if (t.dataset.act === "replace-pick") {
+      this.s.replaceWith = t.value || null;
+      this.paint();
+    }
+    if (t.dataset.act === "set-area") this.assignArea(t.dataset.id, t.value);
+  }
+
+  async assignArea(deviceId, areaId) {
+    try {
+      await this.ws("assign_area", { device_id: deviceId, area_id: areaId || null });
+      this.toast(areaId ? "Комната назначена" : "Устройство убрано из комнаты");
+    } catch (err) {
+      this.toast(err?.message || "Не удалось назначить комнату", true);
+    }
+    return this.refresh(true);
   }
 
   focus(act) {
@@ -1091,6 +1338,80 @@ class BmsControlCenter extends HTMLElement {
       link.remove();
       setTimeout(() => URL.revokeObjectURL(url), 10000);
       return this.toast("Файл событий сохранён");
+    }
+
+    // ---- комнаты и замена ---------------------------------------------
+    if (a === "create-room") {
+      const name = this.shadowRoot.getElementById("newroom")?.value?.trim();
+      if (!name) return this.toast("Впишите название комнаты", true);
+      const first = (this.d.areas?.unassigned || [])[0];
+      if (!first) return this.toast("Нет устройства без комнаты, к которому её привязать", true);
+      try {
+        await this.ws("assign_area", { device_id: first.device_id, new_area: name });
+        this.toast(`Комната «${name}» создана`);
+      } catch (err) { this.toast(err?.message || "Не удалось создать", true); }
+      return this.refresh(true);
+    }
+    if (a === "replace-open") {
+      this.s.replaceTarget = el.dataset.old || id;
+      this.s.replaceWith = el.dataset.with || null;
+      return this.paint();
+    }
+    if (a === "replace-cancel") {
+      this.s.replaceTarget = null; this.s.replaceWith = null;
+      return this.paint();
+    }
+    if (a === "replace-go") {
+      const root = this.shadowRoot;
+      const newId = (root.getElementById("rep-id")?.value || this.s.replaceWith || "").trim();
+      const key = (root.getElementById("rep-key")?.value || "").trim();
+      const host = (root.getElementById("rep-host")?.value || "").trim();
+      const oldId = el.dataset.old;
+      if (!newId) return this.toast("Укажите device_id нового устройства", true);
+      const same = newId === oldId;
+      if (!same && !key)
+        return this.toast("Для нового устройства нужен его local_key", true);
+      if (!confirm(same
+        ? `Обновить учётные данные устройства ${oldId}?`
+        : `Выдать устройство ${newId} за ${oldId}?\n\nHome Assistant продолжит считать это тем же устройством: entity_id, комната, автоматизации и история сохранятся.`))
+        return;
+      el.disabled = true;
+      try {
+        const res = await this.ws("replace_device", {
+          entry_id: el.dataset.entry, old_device_id: oldId, new_device_id: newId,
+          local_key: key || null, host: host || null,
+        });
+        this.logAction(true, `Замена ${oldId} -> ${newId}: сущностей ${res.entities}`);
+        this.toast(res.mode === "credentials"
+          ? "Учётные данные обновлены"
+          : `Заменено, перенесено сущностей: ${res.entities}`);
+        this.s.replaceTarget = null; this.s.replaceWith = null;
+      } catch (err) {
+        this.logAction(false, `Замена ${oldId}: ${err?.message || err}`);
+        this.toast(err?.message || "Замена не удалась", true);
+      }
+      el.disabled = false;
+      return this.refresh();
+    }
+    if (a === "save-settings") {
+      const root = this.shadowRoot;
+      const num = (id2, fallback) => {
+        const v = parseInt(root.getElementById(id2)?.value, 10);
+        return Number.isFinite(v) ? v : fallback;
+      };
+      const entryId = el.dataset.entry;
+      try {
+        await this.ws("update_settings", {
+          entry_id: entryId,
+          home_name: root.getElementById(`set-name-${entryId}`)?.value || "",
+          grace_period: num(`set-grace-${entryId}`, 120),
+          startup_grace: num(`set-start-${entryId}`, 300),
+          watchdog_interval: num(`set-dog-${entryId}`, 30),
+          debug: !!root.getElementById(`set-debug-${entryId}`)?.checked,
+        });
+        this.toast("Настройки сохранены, запись перезагружается");
+      } catch (err) { this.toast(err?.message || "Не удалось сохранить", true); }
+      return this.refresh();
     }
 
     // ---- действия, меняющие состояние --------------------------------

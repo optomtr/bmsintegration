@@ -154,6 +154,44 @@ def install() -> None:
         dispatcher_send=dispatcher_send,
         async_dispatcher_connect=async_dispatcher_connect,
     )
+    # ---- реестры и хранилище (нужны replace.py) ----
+    # Заглушки намеренно пустые: тесты подменяют async_get своими двойниками,
+    # здесь важно лишь чтобы импорт прошёл и имена существовали.
+    def _not_stubbed(*a, **kw):
+        raise AssertionError(
+            "реестр не подменён в тесте: подставьте свой двойник вместо async_get"
+        )
+
+    helpers.entity_registry = _mk(
+        "homeassistant.helpers.entity_registry",
+        async_get=_not_stubbed,
+        async_entries_for_config_entry=_not_stubbed,
+        async_entries_for_device=_not_stubbed,
+    )
+    helpers.device_registry = _mk(
+        "homeassistant.helpers.device_registry",
+        async_get=_not_stubbed,
+        DeviceInfo=dict,
+    )
+    helpers.area_registry = _mk(
+        "homeassistant.helpers.area_registry", async_get=_not_stubbed
+    )
+
+    class Store:
+        """Хранилище: тесты подменяют его, если проверяют перенос ИК-кодов."""
+
+        def __init__(self, hass, version, key):
+            self.hass, self.version, self.key = hass, version, key
+            self.data = None
+
+        async def async_load(self):
+            return self.data
+
+        async def async_save(self, data):
+            self.data = data
+
+    helpers.storage = _mk("homeassistant.helpers.storage", Store=Store)
+
     ha.helpers = helpers
 
     # ---- aiohttp (needed by core.cloud_api, imported by coordinator) ----

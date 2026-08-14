@@ -72,6 +72,8 @@ class FakeEntry:
     def __init__(self):
         # CONF_NO_CLOUD=True so that _update_local_key never needs cloud API.
         self.data = {"no_cloud": True}
+        # У настоящей ConfigEntry options есть всегда.
+        self.options = {}
 
 
 class FakeInterface:

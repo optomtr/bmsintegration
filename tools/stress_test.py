@@ -105,6 +105,8 @@ class FakeEntry:
 
     def __init__(self):
         self.data = {"no_cloud": True, "devices": {}}
+        # У настоящей ConfigEntry options есть всегда.
+        self.options = {}
 
 
 # --------------------------------------------------------------------------- #

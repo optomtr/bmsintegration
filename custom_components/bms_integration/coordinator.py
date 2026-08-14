@@ -35,6 +35,10 @@ from .core.pytuya.parser import DecodeError
 
 from .const import (
     ATTR_UPDATED_AT,
+    DEFAULT_GRACE_PERIOD,
+    DEFAULT_STARTUP_GRACE,
+    OPT_GRACE_PERIOD,
+    OPT_STARTUP_GRACE,
     CONF_GATEWAY_ID,
     CONF_LOCAL_KEY,
     CONF_NODE_ID,
@@ -50,8 +54,10 @@ _LOGGER = logging.getLogger(__name__)
 RECONNECT_INTERVAL = timedelta(seconds=5)
 # Keep entities available while a device is in a short reconnect window. This
 # filters Wi-Fi micro-outages from HA history without hiding longer outages.
-AVAILABILITY_GRACE_PERIOD = 120
-STARTUP_AVAILABILITY_GRACE_PERIOD = 300
+# Значения по умолчанию; на установку переопределяются в настройках записи
+# (см. OPT_GRACE_PERIOD / OPT_STARTUP_GRACE), поэтому читаются через свойства.
+AVAILABILITY_GRACE_PERIOD = DEFAULT_GRACE_PERIOD
+STARTUP_AVAILABILITY_GRACE_PERIOD = DEFAULT_STARTUP_GRACE
 RECONNECT_BACKOFF_SECONDS = (1, 2, 5, 10, 20, 30, 60)
 # How many commands in a row must fail before the shared transport is judged
 # broken. A gateway socket carries every sub-device behind it, so a single
@@ -171,22 +177,32 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         return self._interface and self._interface.is_connected
 
     @property
+    def _grace_period(self) -> float:
+        """Окно недоступности; настраивается на установку, по умолчанию 120 с."""
+        return float(
+            (self._entry.options or {}).get(OPT_GRACE_PERIOD, DEFAULT_GRACE_PERIOD)
+        )
+
+    @property
+    def _startup_grace(self) -> float:
+        """Окно при старте; настраивается на установку, по умолчанию 300 с."""
+        return float(
+            (self._entry.options or {}).get(OPT_STARTUP_GRACE, DEFAULT_STARTUP_GRACE)
+        )
+
+    @property
     def reconnecting(self):
         """Return if the device is inside the availability grace period."""
         if self.connected or self.is_closing or self._disconnect_started_at is None:
             return False
-        return (
-            time.monotonic() - self._disconnect_started_at
-        ) < AVAILABILITY_GRACE_PERIOD
+        return (time.monotonic() - self._disconnect_started_at) < self._grace_period
 
     @property
     def starting(self):
         """Return if the device is still inside the initial startup grace period."""
         if self.connected or self.is_closing or self._status:
             return False
-        return (
-            time.monotonic() - self._startup_started_at
-        ) < STARTUP_AVAILABILITY_GRACE_PERIOD
+        return (time.monotonic() - self._startup_started_at) < self._startup_grace
 
     @property
     def available(self):

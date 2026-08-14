@@ -1,0 +1,9 @@
+sync_devices:
+  name: "Sync Devices & Rooms"
+  description: >
+    Discover devices added in the Smart Life/Tuya app since the last sync
+    (via BMS Integration), add them to Home Assistant with auto-detected
+    entities, and assign them to the matching HA Area when confident.
+    Devices with an uncertain room match are still created but flagged via
+    a Repairs issue for manual confirmation. Safe to run repeatedly -
+    already-configured devices are skipped.

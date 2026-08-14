@@ -28,7 +28,21 @@ from homeassistant.helpers import (
     entity_registry as er,
 )
 
-from .const import CONF_GATEWAY_ID, CONF_NODE_ID, DATA_DISCOVERY, DOMAIN
+from . import replace as replace_mod
+from .const import (
+    CONF_GATEWAY_ID,
+    CONF_NODE_ID,
+    DATA_DISCOVERY,
+    DEFAULT_GRACE_PERIOD,
+    DEFAULT_STARTUP_GRACE,
+    DEFAULT_WATCHDOG_INTERVAL,
+    DOMAIN,
+    OPT_DEBUG,
+    OPT_GRACE_PERIOD,
+    OPT_HOME_NAME,
+    OPT_STARTUP_GRACE,
+    OPT_WATCHDOG_INTERVAL,
+)
 from .coordinator import (
     AVAILABILITY_GRACE_PERIOD,
     AVAILABILITY_REPORT_FILE,
@@ -57,6 +71,289 @@ SECRET_KEYS = frozenset(
 
 
 @callback
+# --------------------------------------------------------------------------- #
+# Комнаты
+# --------------------------------------------------------------------------- #
+@websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/areas"})
+@websocket_api.require_admin
+@callback
+def ws_areas(hass: HomeAssistant, connection, msg: dict) -> None:
+    """Комнаты Home Assistant и устройства интеграции в них."""
+    from homeassistant.helpers import area_registry as ar
+
+    area_reg = ar.async_get(hass)
+    rows = _device_rows(hass, with_entities=False)
+
+    by_area: dict[str | None, list[dict]] = {}
+    for row in rows:
+        by_area.setdefault(row["area_id"], []).append(
+            {
+                "device_id": row["device_id"],
+                "name": row["name"],
+                "state": row["state"],
+                "entity_count": row["entity_count"],
+                "registry_id": row["registry_id"],
+                "is_gateway": row["is_gateway"],
+            }
+        )
+
+    areas = [
+        {
+            "area_id": area.id,
+            "name": area.name,
+            "icon": getattr(area, "icon", None),
+            "devices": sorted(by_area.get(area.id, []), key=lambda d: d["name"].lower()),
+        }
+        for area in area_reg.async_list_areas()
+    ]
+    areas.sort(key=lambda a: a["name"].lower())
+
+    connection.send_result(
+        msg["id"],
+        {
+            "areas": areas,
+            "unassigned": sorted(by_area.get(None, []), key=lambda d: d["name"].lower()),
+            "total_devices": len(rows),
+        },
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/assign_area",
+        vol.Required("device_id"): str,
+        vol.Optional("area_id"): vol.Any(str, None),
+        vol.Optional("new_area"): vol.Any(str, None),
+    }
+)
+@websocket_api.require_admin
+@callback
+def ws_assign_area(hass: HomeAssistant, connection, msg: dict) -> None:
+    """Положить устройство в комнату, при необходимости создав её."""
+    from homeassistant.helpers import area_registry as ar
+
+    dev_reg = dr.async_get(hass)
+    registry_device = dev_reg.async_get_device(
+        identifiers={(DOMAIN, f"local_{msg['device_id']}")}
+    )
+    if registry_device is None:
+        connection.send_error(
+            msg["id"],
+            "not_found",
+            "Устройство ещё не появилось в реестре Home Assistant: "
+            "у него нет ни одной сущности",
+        )
+        return
+
+    area_id = msg.get("area_id")
+    if name := (msg.get("new_area") or "").strip():
+        area_reg = ar.async_get(hass)
+        existing = area_reg.async_get_area_by_name(name)
+        area_id = (existing or area_reg.async_create(name)).id
+
+    dev_reg.async_update_device(registry_device.id, area_id=area_id)
+    connection.send_result(msg["id"], {"ok": True, "area_id": area_id})
+
+
+# --------------------------------------------------------------------------- #
+# Замена устройства
+# --------------------------------------------------------------------------- #
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/replace_preview",
+        vol.Optional("device_id"): vol.Any(str, None),
+    }
+)
+@websocket_api.require_admin
+@callback
+def ws_replace_preview(hass: HomeAssistant, connection, msg: dict) -> None:
+    """Что можно заменить и чем.
+
+    Кандидаты - устройства, услышанные в сети. Совпадение device_id у
+    настроенного, но не отвечающего устройства выносится отдельно: это тот же
+    прибор со сменившимся ключом, и его замена ничего не двигает в Home
+    Assistant.
+    """
+    discovery = (hass.data.get(DOMAIN) or {}).get(DATA_DISCOVERY)
+    configured: set[str] = set()
+    targets = []
+    for entry_id, _data in _entries(hass):
+        entry = hass.config_entries.async_get_entry(entry_id)
+        if entry is None:
+            continue
+        for dev_id in entry.data.get("devices") or {}:
+            configured.add(dev_id)
+            if msg.get("device_id") and dev_id != msg["device_id"]:
+                continue
+            try:
+                described = replace_mod.describe_device(hass, entry, dev_id)
+            except replace_mod.ReplaceError:
+                continue
+            described["entry_id"] = entry_id
+            targets.append(described)
+
+    candidates = []
+    for dev_id, info in (getattr(discovery, "devices", {}) or {}).items():
+        if not isinstance(info, dict):
+            continue
+        dev_id = str(dev_id)[:64]
+        candidates.append(
+            {
+                "device_id": dev_id,
+                "host": str(info.get("ip") or "")[:64],
+                "protocol": str(info.get("version") or "")[:16],
+                "product_key": str(info.get("productKey") or "")[:64],
+                "configured": dev_id in configured,
+            }
+        )
+    candidates.sort(key=lambda c: (c["configured"], c["device_id"]))
+
+    running: dict[str, Any] = {}
+    for _entry_id, data in _entries(hass):
+        running.update(_running_index(data))
+    suspects = [
+        c["device_id"]
+        for c in candidates
+        if c["configured"]
+        and not (running.get(c["device_id"]) and running[c["device_id"]].connected)
+    ]
+
+    connection.send_result(
+        msg["id"],
+        {
+            "targets": sorted(targets, key=lambda t: t["name"].lower()),
+            "candidates": candidates,
+            "credentials_suspects": suspects,
+        },
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/replace_device",
+        vol.Required("entry_id"): str,
+        vol.Required("old_device_id"): str,
+        vol.Required("new_device_id"): str,
+        vol.Optional("host"): vol.Any(str, None),
+        vol.Optional("local_key"): vol.Any(str, None),
+        vol.Optional("protocol_version"): vol.Any(str, None),
+        vol.Optional("node_id"): vol.Any(str, None),
+        vol.Optional("gateway_id"): vol.Any(str, None),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_replace_device(hass: HomeAssistant, connection, msg: dict) -> None:
+    """Выдать новое железо за уже настроенное устройство."""
+    entry = hass.config_entries.async_get_entry(msg["entry_id"])
+    if entry is None or entry.domain != DOMAIN:
+        connection.send_error(msg["id"], "not_found", "Запись конфигурации не найдена")
+        return
+
+    hardware = {
+        "device_id": msg["new_device_id"],
+        "host": msg.get("host"),
+        "local_key": msg.get("local_key"),
+        "protocol_version": msg.get("protocol_version"),
+        "node_id": msg.get("node_id"),
+        "gateway_id": msg.get("gateway_id"),
+    }
+    _LOGGER.warning(
+        "Замена устройства из панели: %s -> %s (пользователь %s)",
+        msg["old_device_id"],
+        msg["new_device_id"],
+        connection.user.name if connection.user else "?",
+    )
+    try:
+        summary = await replace_mod.async_replace_device(
+            hass, entry, msg["old_device_id"], hardware
+        )
+    except replace_mod.ReplaceError as err:
+        connection.send_error(msg["id"], "replace_failed", str(err))
+        return
+    except Exception as err:  # noqa: BLE001 - показать причину, а не молчать
+        _LOGGER.exception("Замена устройства не удалась")
+        connection.send_error(msg["id"], "replace_failed", str(err))
+        return
+
+    connection.send_result(msg["id"], summary)
+
+
+# --------------------------------------------------------------------------- #
+# Настройки этого дома
+# --------------------------------------------------------------------------- #
+@websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/settings"})
+@websocket_api.require_admin
+@callback
+def ws_settings(hass: HomeAssistant, connection, msg: dict) -> None:
+    """Настройки установки; пока не заданы - действуют значения по умолчанию."""
+    entries = []
+    for entry_id, _data in _entries(hass):
+        entry = hass.config_entries.async_get_entry(entry_id)
+        if entry is None:
+            continue
+        options = dict(entry.options or {})
+        entries.append(
+            {
+                "entry_id": entry_id,
+                "title": entry.title,
+                "home_name": options.get(OPT_HOME_NAME, ""),
+                "grace_period": options.get(OPT_GRACE_PERIOD, DEFAULT_GRACE_PERIOD),
+                "startup_grace": options.get(OPT_STARTUP_GRACE, DEFAULT_STARTUP_GRACE),
+                "watchdog_interval": options.get(
+                    OPT_WATCHDOG_INTERVAL, DEFAULT_WATCHDOG_INTERVAL
+                ),
+                "debug": bool(options.get(OPT_DEBUG, False)),
+            }
+        )
+    connection.send_result(
+        msg["id"],
+        {
+            "entries": entries,
+            "defaults": {
+                "grace_period": DEFAULT_GRACE_PERIOD,
+                "startup_grace": DEFAULT_STARTUP_GRACE,
+                "watchdog_interval": DEFAULT_WATCHDOG_INTERVAL,
+            },
+        },
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/update_settings",
+        vol.Required("entry_id"): str,
+        vol.Optional("home_name"): vol.Any(str, None),
+        vol.Optional("grace_period"): vol.All(int, vol.Range(min=0, max=3600)),
+        vol.Optional("startup_grace"): vol.All(int, vol.Range(min=0, max=7200)),
+        vol.Optional("watchdog_interval"): vol.All(int, vol.Range(min=10, max=600)),
+        vol.Optional("debug"): bool,
+    }
+)
+@websocket_api.require_admin
+@callback
+def ws_update_settings(hass: HomeAssistant, connection, msg: dict) -> None:
+    """Записать настройки установки; запись перезагрузится сама."""
+    entry = hass.config_entries.async_get_entry(msg["entry_id"])
+    if entry is None or entry.domain != DOMAIN:
+        connection.send_error(msg["id"], "not_found", "Запись конфигурации не найдена")
+        return
+
+    options = dict(entry.options or {})
+    for key, option in (
+        ("home_name", OPT_HOME_NAME),
+        ("grace_period", OPT_GRACE_PERIOD),
+        ("startup_grace", OPT_STARTUP_GRACE),
+        ("watchdog_interval", OPT_WATCHDOG_INTERVAL),
+        ("debug", OPT_DEBUG),
+    ):
+        if key in msg:
+            options[option] = msg[key]
+
+    hass.config_entries.async_update_entry(entry, options=options)
+    connection.send_result(msg["id"], {"ok": True})
+
+
 def async_register_websocket_api(hass: HomeAssistant) -> None:
     """Register every panel command, once per Home Assistant."""
     domain_data = hass.data.setdefault(DOMAIN, {})
@@ -73,6 +370,12 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
         ws_action,
         ws_reload,
         ws_set_dp,
+        ws_areas,
+        ws_assign_area,
+        ws_replace_preview,
+        ws_replace_device,
+        ws_settings,
+        ws_update_settings,
     ):
         websocket_api.async_register_command(hass, command)
     domain_data[DATA_WS_REGISTERED] = True

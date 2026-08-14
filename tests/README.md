@@ -19,6 +19,7 @@ python3 tests/test_platform_logic.py  # entity and platform level behaviour
 python3 tests/test_panel_api.py       # panel + websocket privileged surface
 python3 tests/test_discovery.py       # UDP input handling and socket recovery
 python3 tests/test_end_to_end.py      # the protocol against a real socket
+python3 tests/test_replace.py         # replacing a device without losing it
 ```
 
 `run_all.py` discovers `test_*.py` rather than listing the suites, so a new
@@ -44,6 +45,11 @@ was silently never executed.
   command rollback, and the platform defects found by the audit (lock
   direction, alarm feature flags, water heater and vacuum crashes, base64
   sensor decoding, and others).
+- `test_replace.py` — what a replacement must preserve and what it must refuse:
+  a credentials-only change touches no registry, a physical replacement moves
+  every `unique_id` and the device-registry identifier while keeping the same
+  rows, entity configuration is inherited, a replaced gateway relinks its
+  children, and shadowing a device that is already configured is refused.
 - `test_end_to_end.py` — the repository's protocol client against the
   repository's device simulator over a loopback socket, run three times: 3.3,
   3.4 (a session key negotiated over the 55AA frame) and 3.5 (6699/GCM, what

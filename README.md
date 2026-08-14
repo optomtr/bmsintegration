@@ -53,6 +53,23 @@ the license text.
   some of them back for a second: optimistic values are recorded in the device
   and protocol caches, so the first partial confirmation from the device cannot
   resurrect the stale cached state of its sibling channels.
+- **Replacing a device keeps its identity in Home Assistant.** Hardware breaks;
+  the wiring of an installation does not. Behind a device sits a long tail:
+  entity ids referenced by dozens of automations and cards, its room, history
+  and long-term statistics, learned IR codes. Two cases are handled from the
+  panel. Same device id but a new key - after a hub is swapped or a device is
+  re-paired - only updates the credentials and touches no registry at all. A
+  physical replacement gives the new hardware the old device's identity: the
+  entity configuration is carried over, `unique_id`s and the device-registry
+  identifier are rewritten, learned IR codes move with it, and a replaced
+  gateway relinks its children. Home Assistant keeps treating it as the same
+  device.
+- New **Комнаты** screen: every area with the integration's devices in it,
+  assignment from the panel, and creating an area without leaving it.
+- **Настройки дома**: the availability window, the startup window and the
+  gateway watchdog interval are tunable per installation, and integration-wide
+  debug logging is a switch rather than an edit to configuration.yaml.
+  Unset values keep the previous behaviour exactly.
 - New sidebar panel **BMS Control Center** (admin only): overview with health
   tiles, the full connection map from config entry down to each datapoint, a device
   card with status/entities/DPS/diagnostics/configuration, discovered devices,

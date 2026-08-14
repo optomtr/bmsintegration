@@ -4,6 +4,7 @@ import asyncio
 import copy
 import logging
 import time
+from datetime import timedelta
 
 import homeassistant.helpers.config_validation as cv
 import homeassistant.helpers.device_registry as dr
@@ -40,6 +41,9 @@ from .websocket import async_register_websocket_api
 from .const import (
     ATTR_UPDATED_AT,
     CONF_FRIENDLY_NAME,
+    DEFAULT_WATCHDOG_INTERVAL,
+    OPT_DEBUG,
+    OPT_WATCHDOG_INTERVAL,
     CONF_GATEWAY_ID,
     CONF_NODE_ID,
     CONF_NO_CLOUD,
@@ -484,6 +488,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     hass_localtuya = HassLocalTuyaData(tuya_api, {})
     hass.data[DOMAIN][entry.entry_id] = hass_localtuya
 
+    # Отладка всей интеграции одним переключателем из панели: иначе её
+    # приходится включать правкой configuration.yaml и перезапуском.
+    if (entry.options or {}).get(OPT_DEBUG):
+        logging.getLogger(f"custom_components.{DOMAIN}").setLevel(logging.DEBUG)
+
     # The device panel and its API belong to the integration, not to one entry.
     async_register_websocket_api(hass)
     await async_setup_panel(hass)
@@ -694,7 +703,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             watchdog_task.cancel()
 
     entry.async_on_unload(
-        async_track_time_interval(hass, _schedule_gateway_watchdog, GATEWAY_WATCHDOG_INTERVAL)
+        # Интервал сторожа настраивается на установку: на объекте со слабым
+        # шлюзом опрос раз в 30 с сам по себе создаёт нагрузку.
+        async_track_time_interval(
+            hass,
+            _schedule_gateway_watchdog,
+            timedelta(
+                seconds=int(
+                    (entry.options or {}).get(
+                        OPT_WATCHDOG_INTERVAL, DEFAULT_WATCHDOG_INTERVAL
+                    )
+                )
+            ),
+        )
     )
     entry.async_on_unload(_stop_gateway_watchdog)
 

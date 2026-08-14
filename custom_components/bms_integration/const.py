@@ -315,3 +315,18 @@ class DeviceConfig:
 
     def as_dict(self):
         return self.device_config
+
+# --------------------------------------------------------------------------- #
+# Настройки установки (options записи конфигурации)
+# --------------------------------------------------------------------------- #
+# Значения по умолчанию повторяют константы coordinator.py: пока настройка не
+# задана, поведение ровно то же, что было до появления этих переключателей.
+OPT_HOME_NAME = "home_name"
+OPT_GRACE_PERIOD = "availability_grace_period"
+OPT_STARTUP_GRACE = "startup_grace_period"
+OPT_WATCHDOG_INTERVAL = "gateway_watchdog_interval"
+OPT_DEBUG = "integration_debug"
+
+DEFAULT_GRACE_PERIOD = 120
+DEFAULT_STARTUP_GRACE = 300
+DEFAULT_WATCHDOG_INTERVAL = 30
