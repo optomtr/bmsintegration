@@ -447,7 +447,15 @@ class MessageDispatcher(ContextualLogger):
                 # Wrong CRC/HMAC, or an undecryptable 6699 payload (most
                 # likely a wrong local_key): the content cannot be trusted
                 # and must not reach the listeners.
-                self.warning(f"Dropping message with bad CRC/HMAC (cmd {msg.cmd})")
+                if msg.cmd == CMDType.SESS_KEY_NEG_RESP:
+                    # Подпись ответа согласования считается тем же local_key,
+                    # поэтому «не сошлась подпись» здесь означает ровно одно.
+                    self.warning(
+                        "Ответ согласования сессии не прошёл проверку подписи: "
+                        "local_key не подходит этому устройству."
+                    )
+                else:
+                    self.warning(f"Dropping message with bad CRC/HMAC (cmd {msg.cmd})")
                 continue
 
             try:
@@ -962,7 +970,18 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
                 if self.real_local_key == self.local_key:
                     self.debug("3.4 or 3.5 device: negotiating a new session key")
                     if not await self._negotiate_session_key():
-                        return self.clean_up_session()
+                        self.clean_up_session()
+                        # Молчаливый возврат оставлял вызывающего в неведении:
+                        # статус приходил пустым, устройство считалось живым, и
+                        # объект вставал в бесконечный цикл переподключений с
+                        # пустой причиной в карточке. Слово local_key в тексте
+                        # не случайно: по нему координатор понимает, что стоит
+                        # запросить свежий ключ из облака.
+                        raise ConnectionError(
+                            "Сессия не согласована: устройство не приняло "
+                            "local_key. Проверьте ключ (для узла за шлюзом это "
+                            "ключ ШЛЮЗА) и версию протокола."
+                        )
 
         self.debug(
             "Sending command %s (device type: %s) DPS: %s", command, self.dev_type, dps
@@ -1260,8 +1279,15 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
 
         if not rkey or not isinstance(rkey, TuyaMessage) or len(rkey.payload) < 48:
             # error
-            self.debug("session key negotiation failed on step 1")
-
+            # Самая частая причина - неподходящий local_key: устройство либо
+            # молчит, либо отвечает так, что подпись не сходится, и ответ
+            # отбрасывается ещё в разборе. Раньше это оставалось на уровне
+            # отладки, наружу шло пустое сообщение, и установщик видел лишь
+            # бесконечные переподключения без единой внятной причины.
+            self.warning(
+                "Не удалось согласовать сессионный ключ: устройство не приняло "
+                "local_key или не ответило. Проверьте ключ и версию протокола."
+            )
             return False
 
         if rkey.cmd != CMDType.SESS_KEY_NEG_RESP:
@@ -1301,8 +1327,12 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
 
         if hmac_check != payload[16:48]:
             # Only that it failed - the expected HMAC is derived from the
-            # local key and must not be written anywhere.
-            self.debug("session key negotiation step 2 failed the HMAC check")
+            # local key and must not be written anywhere. Но сам факт - это
+            # доказанное несовпадение ключа, и молчать о нём нельзя.
+            self.warning(
+                "Устройство не подтвердило local_key (несовпадение подписи "
+                "при согласовании сессии): ключ не подходит."
+            )
             # The peer failed to prove knowledge of the local key: negotiating
             # further would silently derive a garbage session key.
             return False

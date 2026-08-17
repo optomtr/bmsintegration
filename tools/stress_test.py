@@ -131,13 +131,13 @@ def hub_scenario(hub_index: int, children: int) -> dict:
     }
 
 
-def device_config(dev_id, name, host, node_id=None, gateway_id=None):
+def device_config(dev_id, name, host, node_id=None, gateway_id=None, local_key=None):
     """Конфигурация устройства в том же виде, в каком её держит запись HA."""
     return {
         "friendly_name": name,
         "host": host,
         "device_id": dev_id,
-        "local_key": LOCAL_KEY,
+        "local_key": local_key or LOCAL_KEY,
         "protocol_version": "3.5",
         "enable_debug": False,
         "entities": [{"id": "1", "platform": "switch", "friendly_name": name}],
@@ -274,7 +274,14 @@ class Stress:
             if not node_id:
                 self.devices[host] = TuyaDevice(self.hass, self.entry, config)
                 continue
-            gateway = self.devices[host]
+            gateway = self.devices.get(host)
+            if gateway is None:
+                # Шлюз не заведён как устройство - продукт назначает подставным
+                # шлюзом первого дочернего: он владеет сокетом и своего
+                # состояния не несёт. Это боевая топология объекта, и до сих
+                # пор стенд её не воспроизводил.
+                gateway = TuyaDevice(self.hass, self.entry, config, True)
+                self.devices[host] = gateway
             sub = TuyaDevice(self.hass, self.entry, config)
             sub.gateway = gateway
             gateway.sub_devices[node_id] = sub
@@ -347,14 +354,23 @@ class Stress:
 
         entry_devices = {}
         for hub in self.hubs:
-            entry_devices[hub.gw_id] = device_config(
-                hub.gw_id, f"Шлюз {hub.index}", hub.host
-            )
+            if not self.args.fake_gateways:
+                entry_devices[hub.gw_id] = device_config(
+                    hub.gw_id, f"Шлюз {hub.index}", hub.host
+                )
             for order, cid in enumerate(hub.cids, 1):
                 child_id = f"{hub.gw_id[:8]}c{hub.index:03d}{order:07d}"
+                # Дочерний узел ДОЛЖЕН нести ключ шлюза: сессия открывается с
+                # шлюзом, а не с узлом. Свой ключ у каждого узла - типичный
+                # результат импорта из облака не того поля, и именно эту
+                # поломку воспроизводит --wrong-child-keys.
+                child_key = (
+                    f"badkey{hub.index:03d}{order:07d}"[:16]
+                    if self.args.wrong_child_keys else None
+                )
                 entry_devices[child_id] = device_config(
                     child_id, f"Устройство {hub.index}.{order}", hub.host,
-                    node_id=cid, gateway_id=hub.gw_id,
+                    node_id=cid, gateway_id=hub.gw_id, local_key=child_key,
                 )
         self.entry.data["devices"] = entry_devices
 
@@ -773,6 +789,13 @@ def main():
     ap.add_argument("--hubs", type=int, default=30)
     ap.add_argument("--per-hub", type=int, default=23)
     ap.add_argument("--protocol", default="3.5", choices=["3.3", "3.4", "3.5"])
+    ap.add_argument("--wrong-child-keys", action="store_true",
+                    help="дать каждому узлу СВОЙ ключ вместо ключа шлюза - "
+                         "воспроизведение поломки объекта")
+    ap.add_argument("--fake-gateways", action="store_true",
+                    help="шлюзы НЕ заводить как устройства - боевая топология "
+                         "объекта: только дочерние узлы, один из них становится "
+                         "подставным шлюзом и владеет сокетом")
     ap.add_argument("--blackouts", type=int, default=3, metavar="N",
                     help="полных блэкаутов всего парка подряд (0 — пропустить)")
     ap.add_argument("--dirty", type=int, default=30, metavar="SEC",
@@ -790,9 +813,11 @@ def main():
         level=logging.DEBUG if args.debug else logging.WARNING,
         format="%(levelname)s %(name)s %(message)s",
     )
-    total = args.hubs * (args.per_hub + 1)
+    total = args.hubs * (args.per_hub + (0 if args.fake_gateways else 1))
     print("=" * 62, flush=True)
-    print(f"НАГРУЗОЧНЫЙ СТЕНД: {args.hubs} шлюзов, {total} устройств, протокол {args.protocol}")
+    print(f"НАГРУЗОЧНЫЙ СТЕНД: {args.hubs} шлюзов, {total} устройств, "
+          f"протокол {args.protocol}"
+          + (", шлюзы НЕ заведены (подставные)" if args.fake_gateways else ""))
     print("=" * 62, flush=True)
     return asyncio.run(Stress(args).run())
 

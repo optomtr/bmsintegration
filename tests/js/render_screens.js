@@ -100,8 +100,14 @@ const fixtures = {
   logs: { entries: [{ time: Date.now() / 1000, level: "INFO", logger: "x", message: "привет" }] },
   report: { entries: [{ ts: new Date().toISOString(), event: "disconnect_detected", name: "Реле",
                         device_id: "d1", reason: "socket closed" }] },
-  discovered: { devices: [{ device_id: "new1", host: "10.0.0.9", protocol: "3.5",
-                            product_key: "", configured: false }], listening: true },
+  discovered: { devices: [
+    { device_id: "new1", host: "10.0.0.9", protocol: "3.5",
+      product_key: "", configured: false, serves: 0, is_known_gateway: false },
+    // Шлюз, за которым уже настроены узлы: не «новое устройство».
+    { device_id: "gw1", host: "10.0.0.5", protocol: "3.5", product_key: "",
+      configured: false, serves: 26, is_known_gateway: true,
+      serves_example: "1 этаж кухня" },
+  ], listening: true },
   areas: { areas: [{ area_id: "a1", name: "Гостиная", icon: null,
                      devices: [{ device_id: "d1", name: "Реле", state: "online",
                                  entity_count: 2, registry_id: "r1", is_gateway: false }] }],
@@ -170,6 +176,33 @@ try {
   console.log("  ✓ экраны переживают отсутствие данных");
 } catch (err) {
   console.error(`  ✗ пустые данные: ${err}`); failed++;
+}
+
+// Экран «Добавить» обязан отделять шлюз от нового устройства и объяснять,
+// почему узлов за шлюзом в списке нет: без этого установщик считает панель
+// сломанной, а на шлюзе жмёт «Добавить».
+try {
+  // Тесты выше зовут отрисовку экрана напрямую - без построения DOM,
+  // так что и здесь берём разметку из самого представления.
+  const p2 = new Panel();
+  p2.d = JSON.parse(JSON.stringify(fixtures));
+  p2.s.screen = "add";
+  p2.s.addDevice = null;
+  const html = p2.vAdd();
+  const cases = [
+    ["шлюз не попал в «Найденные устройства»", /Найденные устройства · 1/.test(html)],
+    ["шлюз показан отдельным блоком", html.includes("уже обслуживающие устройства")],
+    ["сказано, сколько за ним настроено", html.includes("26")],
+    ["объяснено, что узлы за шлюзом не вещают",
+     html.includes("не вещают") || html.includes("не появятся")],
+    ["на шлюзе нет кнопки «Добавить»", !html.includes('data-id="gw1"')],
+  ];
+  for (const [name, ok] of cases) {
+    if (ok) console.log(`  ✓ ${name}`);
+    else { console.error(`  ✗ ${name}`); failed++; }
+  }
+} catch (err) {
+  console.error(`  ✗ экран «Добавить»: ${err}`); failed++;
 }
 
 process.exit(failed ? 1 : 0);

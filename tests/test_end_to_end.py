@@ -310,9 +310,14 @@ class SessionNegotiation(unittest.IsolatedAsyncioTestCase):
             self.port,
         )
         try:
-            # The HMAC check fails, so no session key is derived and no status
-            # comes back - rather than a garbage key producing garbage state.
-            self.assertEqual(await proto.status(), {})
+            # Раньше сюда возвращался пустой словарь: сессия молча не
+            # согласовывалась, устройство считалось живым, и объект вставал в
+            # бесконечный цикл переподключений с пустой причиной в карточке.
+            # Теперь несовпадение ключа - это внятная ошибка, по которой
+            # координатор ещё и запрашивает свежий ключ из облака.
+            with self.assertRaises(ConnectionError) as ctx:
+                await proto.status()
+            self.assertIn("local_key", str(ctx.exception))
         finally:
             await asyncio.wait_for(proto.close(), 5)
 

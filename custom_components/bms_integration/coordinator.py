@@ -467,6 +467,12 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 if not (self._fake_gateway and "Not found" in str(e)):
                     e = "Sub device is not connected" if self.is_subdevice else e
                     self.warning(f"Handshake with {host} failed due to: {e}")
+                    # Запомнить причину. Без этого устройство, которое ни разу
+                    # не поднялось, показывало в панели пустую строку ошибки -
+                    # на объекте так и было: 72 недоступных без единого слова о
+                    # том, почему. Причина видна в карточке и попадает в отчёт.
+                    self._last_disconnect_reason = str(e)
+                    self._availability_report("handshake_failed", str(e))
                     await self.abort_connect()
                     if self.is_subdevice or "key" in str(e):
                         # TODO: Add exceptions for pytuya.

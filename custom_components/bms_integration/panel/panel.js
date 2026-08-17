@@ -502,6 +502,10 @@ class BmsControlCenter extends HTMLElement {
     const tiles = [
       { label: "Всего устройств", value: s.total, icon: "i-chip", color: "#98A2AC", vColor: C.ink },
       { label: "Онлайн", value: s.online, icon: "i-check", color: C.ok, vColor: C.ok },
+      // Без этой плитки устройства в состоянии «Подключение» не попадали
+      // никуда: на объекте было «Всего 72» при нулях во всех остальных
+      // счётчиках, и обзор выглядел сломанным.
+      { label: "Подключение", value: s.connecting, icon: "i-link", color: C.blue, note: "идёт связь", vColor: s.connecting ? C.blue : C.ink },
       { label: "Переподключение", value: s.reconnecting, icon: "i-refresh", color: C.warn, note: "ретраи", vColor: s.reconnecting ? C.warn : C.ink },
       { label: "Grace-период", value: s.grace, icon: "i-clock", color: C.grace, note: "ожидание", vColor: s.grace ? C.grace : C.ink },
       { label: "Недоступно", value: s.unavailable, icon: "i-octagon", color: C.bad, note: "подтв. сбой", vColor: s.unavailable ? C.bad : C.ink },
@@ -512,7 +516,7 @@ class BmsControlCenter extends HTMLElement {
         <div class="tv"><span style="color:${t.vColor}">${t.value}</span><span class="tn">${t.note || ""}</span></div>
       </div>`).join("");
 
-    const order = ["online", "reconnecting", "grace", "unavailable", "config"];
+    const order = ["online", "connecting", "reconnecting", "grace", "unavailable", "config"];
     const health = order.map((k) => ({ k, n: s[k] || 0, c: ST[k].color, l: ST[k].label }));
     const bar = health.filter((h) => h.n).map((h) =>
       `<span style="width:${(h.n / Math.max(1, s.total)) * 100}%;background:${h.c}"></span>`).join("");
@@ -606,7 +610,7 @@ class BmsControlCenter extends HTMLElement {
   vMap() {
     if (!this.d.topology) return `<div class="pad muted">Загрузка карты…</div>`;
     const s = this.sum();
-    const chips = ["online", "reconnecting", "grace", "unavailable", "config"].map((k) => {
+    const chips = ["online", "connecting", "reconnecting", "grace", "unavailable", "config"].map((k) => {
       const on = this.s.mapState === k;
       return `<button data-act="chip" data-state="${k}" class="chip" style="border-color:${on ? ST[k].color : "#DDE3E9"};
         background:${on ? soft(ST[k].color, 0.1) : C.card};color:${on ? ST[k].color : C.ink3};font-weight:${on ? 600 : 500}">
@@ -932,7 +936,12 @@ class BmsControlCenter extends HTMLElement {
     const d = this.d.discovered;
     if (!d) return `<div class="pad muted">Поиск устройств…</div>`;
     const found = d.devices || [];
-    const fresh = found.filter((f) => !f.configured);
+    // «Новое» - это то, про что мы ничего не знаем. Шлюз, за которым уже
+    // настроены узлы, новым не является, даже если сам он как устройство не
+    // заведён: предложить «Добавить» на нём - значит завести второе
+    // устройство на занятый адрес, которое интеграция не поднимет.
+    const fresh = found.filter((f) => !f.configured && !f.is_known_gateway);
+    const gateways = found.filter((f) => !f.configured && f.is_known_gateway);
     const known = found.filter((f) => f.configured);
 
     const suspects = this.d.replace?.credentials_suspects || [];
@@ -1021,11 +1030,46 @@ class BmsControlCenter extends HTMLElement {
             primary: this.s.addDevice !== f.device_id, small: true, ico: "i-plus" })}
       </div>${addForm(f)}`).join("") : empty("Новых устройств в сети не обнаружено", "i-search", C.mut);
 
+    // Шлюзы, за которыми уже работают настроенные узлы: показываем как факт,
+    // а не как предложение добавить.
+    const gwRows = gateways.map((f) => `
+      <div class="frow">
+        <span class="acell">${icon("i-zigbee", 14, C.blue)}
+          <span class="aname mono">${esc(f.device_id)}</span></span>
+        <span class="mono small">${esc(f.host)}</span>
+        <span class="small">${f.serves
+          ? `за ним ${plural(f.serves, "настроенное устройство", "настроенных устройства", "настроенных устройств")}`
+          : "упомянут как шлюз"}</span>
+        <span class="small mut">${esc(f.serves_example || "")}</span>
+      </div>`).join("");
+    const gwBox = gateways.length ? `
+      ${cardOpen(`Шлюзы, уже обслуживающие устройства · ${gateways.length}`)}
+      <div style="padding:10px 14px 4px"><span class="small mut">
+        Это не новые устройства: за ними уже работают настроенные узлы. Заводить
+        их как отдельное устройство не нужно — на занятом адресе второе
+        устройство не поднимется.</span></div>
+      <div>${gwRows}</div>${cardClose}` : "";
+
+    // Главное объяснение, из-за отсутствия которого список кажется неполным.
+    const whyBox = `
+      ${cardOpen("Почему в списке не все устройства")}
+      <div style="padding:12px 14px;display:flex;flex-direction:column;gap:7px">
+        <span class="small">Здесь только то, что <b>само объявляет себя в сети</b>
+          по UDP. Так делают Wi-Fi-устройства и шлюзы.</span>
+        <span class="small"><b>Узлы Zigbee за шлюзом не вещают никогда</b> — ни один
+          из них тут не появится, сколько ни обновляй. Их список знает только
+          шлюз и облачный аккаунт, поэтому добавляются они мастером интеграции
+          с привязанным аккаунтом Tuya.</span>
+        <span class="small mut">Настроенные устройства целиком видны на вкладках
+          «Обзор» и «Карта связей», а не здесь.</span>
+      </div>${cardClose}`;
+
     return `<div class="pad col16" style="max-width:1440px">
       <div class="row16">
         <div style="flex:2 1 520px;min-width:320px" class="col16">
           ${suspectBox}
           ${replaceBox}
+          ${gwBox}
           ${replaceList}
           ${cardOpen(`Найденные устройства · ${fresh.length}`,
             btn("Сканировать снова", { act: "refresh", small: true, ico: "i-refresh" }))}
@@ -1040,9 +1084,11 @@ class BmsControlCenter extends HTMLElement {
           ${cardClose}
         </div>
         <aside style="flex:1 1 300px;min-width:280px" class="col16">
+          ${whyBox}
           ${cardOpen("Как это работает")}
           <div style="padding:14px;display:flex;flex-direction:column;gap:10px">
-            ${[["Устройства сами объявляют себя", "Tuya-устройства раз в несколько секунд шлют широковещательный пакет в локальную сеть. Панель показывает всё, что услышала."],
+            ${[["Узлы за шлюзом здесь не появятся", "Широковещание шлёт только само устройство. Zigbee-узел за шлюзом этого не делает никогда — его знает шлюз, а не сеть."],
+               ["Устройства сами объявляют себя", "Tuya-устройства раз в несколько секунд шлют широковещательный пакет в локальную сеть. Панель показывает всё, что услышала."],
                ["Широковещание не проходит между подсетями", "Устройство в другом VLAN придётся добавить вручную и задать статический адрес."],
                ["Ключ берётся из облака", "Локальный ключ подставляется из привязанного облачного аккаунта Tuya и никогда не показывается в панели."]]
               .map(([t, b]) => `<div><div style="font-size:12.5px;font-weight:600;margin-bottom:3px">${t}</div>

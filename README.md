@@ -201,6 +201,26 @@ aborted `paint()` before the main area was written, which looks identical to
 the same freeze. Those two are now painted inside their own guard, and the
 navigation no longer assumes the overview reply carries a summary.
 
+### A wrong key now says so
+
+The one failure a Zigbee installation hits most - a `local_key` that does not
+match, typically because the child carries its own key instead of the
+gateway's - used to be invisible. The 3.4/3.5 session negotiation failed, the
+reply was dropped in the parser as "bad CRC/HMAC", `status()` returned an
+empty dict, and the device sat in an endless reconnect loop with an **empty**
+error in the panel. Seen on a live site: 72 devices unavailable, not one word
+about why.
+
+Now the negotiation failure is named at every level - the dropped negotiation
+reply, the HMAC mismatch and the failed handshake all say the key does not
+fit - the failure is raised instead of swallowed, the reason is stored so the
+panel's device card shows it, and because the text names `local_key` the
+coordinator also asks the cloud for a fresh one.
+
+`tools/stress_test.py --wrong-child-keys` reproduces exactly that fault, and
+`--fake-gateways` reproduces the topology it happens on: gateways that are not
+configured as devices, so a child is promoted to carry the socket.
+
 ## Install
 
 ### Manual

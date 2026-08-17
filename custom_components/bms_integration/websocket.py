@@ -1021,10 +1021,27 @@ def ws_discovered(hass: HomeAssistant, connection, msg: dict) -> None:
     """Devices heard on the network but not configured yet."""
     discovery = (hass.data.get(DOMAIN) or {}).get(DATA_DISCOVERY)
     known: set[str] = set()
+    # Что мы уже знаем про сеть, помимо списка настроенных идентификаторов:
+    # сколько устройств живёт на каждом адресе и какие идентификаторы
+    # упомянуты как шлюзы. Без этого шлюз, за которым уже настроены десятки
+    # узлов, показывался как «новое устройство» - на объекте таких оказалось
+    # пять из девяти, и установщику предлагалось завести их заново.
+    behind_host: dict[str, int] = {}
+    gateway_ids: set[str] = set()
+    names_by_host: dict[str, str] = {}
     for entry_id, _data in _entries(hass):
         entry = hass.config_entries.async_get_entry(entry_id)
-        if entry:
-            known.update((entry.data.get("devices") or {}).keys())
+        if not entry:
+            continue
+        devices = entry.data.get("devices") or {}
+        known.update(devices.keys())
+        for cfg in devices.values():
+            host = str(cfg.get("host") or "")
+            if host:
+                behind_host[host] = behind_host.get(host, 0) + 1
+                names_by_host.setdefault(host, str(cfg.get("friendly_name") or ""))
+            if gw := cfg.get(CONF_GATEWAY_ID):
+                gateway_ids.add(str(gw))
 
     found = []
     for dev_id, info in (getattr(discovery, "devices", {}) or {}).items():
@@ -1034,16 +1051,24 @@ def ws_discovered(hass: HomeAssistant, connection, msg: dict) -> None:
         if not isinstance(info, dict):
             continue
         dev_id = str(dev_id)[:64]
+        host = str(info.get("ip") or "")[:64]
         found.append(
             {
                 "device_id": dev_id,
-                "host": str(info.get("ip") or "")[:64],
+                "host": host,
                 "protocol": str(info.get("version") or "")[:16],
                 "product_key": str(info.get("productKey") or "")[:64],
                 "configured": dev_id in known,
+                # Шлюз узнаётся двумя путями: его идентификатор упомянут как
+                # gateway_id у настроенных узлов, либо на его адресе уже живут
+                # настроенные устройства. Второй путь важнее: на объекте шлюзы
+                # как устройства не заведены вовсе.
+                "serves": behind_host.get(host, 0),
+                "is_known_gateway": dev_id in gateway_ids or behind_host.get(host, 0) > 0,
+                "serves_example": names_by_host.get(host, ""),
             }
         )
-    found.sort(key=lambda d: (d["configured"], d["device_id"]))
+    found.sort(key=lambda d: (d["configured"], d["is_known_gateway"], d["device_id"]))
     connection.send_result(msg["id"], {"devices": found, "listening": discovery is not None})
 
 
