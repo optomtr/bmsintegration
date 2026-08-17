@@ -9,6 +9,7 @@
 import asyncio
 import os
 import sys
+import types
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -446,6 +447,102 @@ class ReplaceHardening(Base):
                 self.hass, self.entry, self.OLD,
                 {"device_id": self.NEW, "local_key": "key-new-111111111"},
             )
+
+
+class FakeCloud:
+    """Облачный клиент: отдаёт ключи по device_id, как настоящий."""
+
+    def __init__(self, devices, lockdown=False, result="ok"):
+        self.device_list = devices
+        self.lockdown = lockdown
+        self._result = result
+        self.forced = 0
+
+    async def async_get_devices_list(self, force_update=False):
+        self.forced += int(bool(force_update))
+        return self._result
+
+
+class RefreshKeys(Base):
+    """Перепривязали устройства - ключи сменились у всех разом."""
+
+    GOOD = "kluch-novyj-00001"
+
+    def arm(self, cloud_devices, no_cloud=False, lockdown=False, result="ok"):
+        self.entry.data["no_cloud"] = no_cloud
+        runtime = types.SimpleNamespace(
+            cloud_data=FakeCloud(cloud_devices, lockdown=lockdown, result=result),
+            devices={},
+        )
+        self.hass.data.setdefault("bms_integration", {})[self.entry.entry_id] = runtime
+        return runtime.cloud_data
+
+    async def test_preview_changes_nothing(self):
+        self.arm({self.OLD: {"id": self.OLD, "local_key": self.GOOD}})
+        summary = await replace.async_refresh_keys(self.hass, self.entry)
+        self.assertEqual(summary["will_change"], 1)
+        self.assertFalse(summary["applied"])
+        self.assertEqual(
+            self.entry.data["devices"][self.OLD]["local_key"],
+            "key-old-000000000",
+            "предпросмотр не имеет права писать",
+        )
+
+    async def test_apply_writes_the_new_key(self):
+        self.arm({self.OLD: {"id": self.OLD, "local_key": self.GOOD}})
+        summary = await replace.async_refresh_keys(self.hass, self.entry, apply=True)
+        self.assertTrue(summary["applied"])
+        self.assertEqual(self.entry.data["devices"][self.OLD]["local_key"], self.GOOD)
+
+    async def test_keys_never_leave_the_backend(self):
+        self.arm({self.OLD: {"id": self.OLD, "local_key": self.GOOD}})
+        summary = await replace.async_refresh_keys(self.hass, self.entry)
+        self.assertNotIn(self.GOOD, repr(summary), "ключ утёк в ответ панели")
+
+    async def test_second_run_has_nothing_to_do(self):
+        self.arm({self.OLD: {"id": self.OLD, "local_key": self.GOOD}})
+        await replace.async_refresh_keys(self.hass, self.entry, apply=True)
+        again = await replace.async_refresh_keys(self.hass, self.entry)
+        self.assertEqual(again["will_change"], 0)
+        self.assertEqual(again["same"], 1)
+
+    async def test_device_missing_from_cloud_is_reported_not_broken(self):
+        self.arm({})
+        with self.assertRaises(replace.ReplaceError) as ctx:
+            await replace.async_refresh_keys(self.hass, self.entry)
+        self.assertIn("аккаунт", str(ctx.exception).lower())
+
+    async def test_partial_cloud_leaves_the_rest_alone(self):
+        self.entry.data["devices"]["other"] = device_config("other")
+        self.arm({self.OLD: {"id": self.OLD, "local_key": self.GOOD}})
+        summary = await replace.async_refresh_keys(self.hass, self.entry, apply=True)
+        self.assertEqual(summary["will_change"], 1)
+        self.assertEqual(summary["not_in_cloud"], 1)
+        self.assertEqual(
+            self.entry.data["devices"]["other"]["local_key"],
+            "key-old-000000000",
+            "устройство, которого нет в облаке, трогать нельзя",
+        )
+
+    async def test_moved_node_is_flagged_but_key_still_updated(self):
+        """Узел перепривязали к другому шлюзу - об этом надо сказать вслух."""
+        self.arm({self.OLD: {"id": self.OLD, "local_key": self.GOOD,
+                             "node_id": "drugoj-uzel"}})
+        summary = await replace.async_refresh_keys(self.hass, self.entry, apply=True)
+        self.assertEqual(summary["node_moved"], 1)
+        self.assertEqual(self.entry.data["devices"][self.OLD]["local_key"], self.GOOD)
+
+    async def test_lockdown_refuses_loudly(self):
+        self.arm({self.OLD: {"id": self.OLD, "local_key": self.GOOD}}, lockdown=True)
+        with self.assertRaises(replace.ReplaceError) as ctx:
+            await replace.async_refresh_keys(self.hass, self.entry)
+        self.assertIn("изолированный", str(ctx.exception).lower())
+
+    async def test_without_cloud_account_says_so(self):
+        self.arm({self.OLD: {"id": self.OLD, "local_key": self.GOOD}}, no_cloud=True)
+        with self.assertRaises(replace.ReplaceError) as ctx:
+            await replace.async_refresh_keys(self.hass, self.entry)
+        self.assertIn("облачный аккаунт", str(ctx.exception).lower())
 
 
 if __name__ == "__main__":

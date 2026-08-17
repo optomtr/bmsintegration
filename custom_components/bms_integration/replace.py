@@ -46,6 +46,7 @@ from .const import (
     CONF_LOCAL_KEY,
     CONF_MODEL,
     CONF_NODE_ID,
+    CONF_NO_CLOUD,
     CONF_PROTOCOL_VERSION,
     DOMAIN,
 )
@@ -590,3 +591,105 @@ async def async_remove_device(
 
         _LOGGER.warning("Удалено устройство %s (%s), сущностей %d", dev_id, name, removed)
         return {"device_id": dev_id, "name": name, "entities": removed}
+
+
+async def async_refresh_keys(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    apply: bool = False,
+) -> dict[str, Any]:
+    """Перенести ключи из облака на настроенные устройства, сверяя по device_id.
+
+    Штатный случай после перепривязки: идентификаторы устройств те же, а
+    local_key сменился у всех разом. Заводить их заново - значит потерять
+    entity_id, автоматизации и историю; поэтому ключ обновляется на месте.
+
+    apply=False только показывает, что изменится: ключи никогда не
+    возвращаются наружу, только имена и признак «сменится».
+    """
+    async with _CONFIG_LOCK:
+        runtime = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+        cloud = getattr(runtime, "cloud_data", None)
+        if cloud is None or entry.data.get(CONF_NO_CLOUD, True):
+            raise ReplaceError(
+                "Облачный аккаунт не привязан к этой записи, брать ключи неоткуда."
+            )
+        if getattr(cloud, "lockdown", False):
+            raise ReplaceError(
+                "Включён изолированный режим: обращение к облаку запрещено. "
+                "Снимите его кнопкой в шапке панели и повторите."
+            )
+
+        result = await cloud.async_get_devices_list(force_update=True)
+        cloud_devices = getattr(cloud, "device_list", None) or {}
+        if not cloud_devices:
+            raise ReplaceError(
+                f"Облако не вернуло список устройств{': ' + str(result) if result else ''}. "
+                "Проверьте, что аккаунт в настройках интеграции - тот же, к которому "
+                "сейчас привязаны устройства."
+            )
+
+        devices = dict(_devices(entry))
+        rows: list[dict[str, Any]] = []
+        updated: dict[str, dict] = {}
+
+        for dev_id, config in devices.items():
+            name = config.get(CONF_FRIENDLY_NAME) or dev_id
+            cloud_dev = cloud_devices.get(dev_id)
+            if cloud_dev is None:
+                rows.append({"device_id": dev_id, "name": name, "status": "not_in_cloud"})
+                continue
+
+            new_key = cloud_dev.get(CONF_LOCAL_KEY) or ""
+            if not new_key:
+                rows.append({"device_id": dev_id, "name": name, "status": "no_key"})
+                continue
+
+            # node_id меняется, если узел перепривязали к другому шлюзу. Сами мы
+            # его не трогаем - это уже смена топологии, а не ключа, - но сказать
+            # обязаны: иначе ключ обновится, а устройство всё равно не поднимется.
+            cloud_node = str(cloud_dev.get(CONF_NODE_ID) or "")
+            node_moved = bool(cloud_node) and cloud_node != str(config.get(CONF_NODE_ID) or "")
+
+            if new_key == config.get(CONF_LOCAL_KEY):
+                rows.append({
+                    "device_id": dev_id, "name": name,
+                    "status": "same", "node_moved": node_moved,
+                })
+                continue
+
+            rows.append({
+                "device_id": dev_id, "name": name,
+                "status": "will_change", "node_moved": node_moved,
+            })
+            changed = dict(config)
+            changed[CONF_LOCAL_KEY] = new_key
+            updated[dev_id] = changed
+
+        summary = {
+            "total": len(devices),
+            "will_change": sum(1 for r in rows if r["status"] == "will_change"),
+            "same": sum(1 for r in rows if r["status"] == "same"),
+            "not_in_cloud": sum(1 for r in rows if r["status"] == "not_in_cloud"),
+            "no_key": sum(1 for r in rows if r["status"] == "no_key"),
+            "node_moved": sum(1 for r in rows if r.get("node_moved")),
+            "applied": False,
+            "devices": rows,
+        }
+
+        if not apply or not updated:
+            return summary
+
+        devices.update(updated)
+        new_data = dict(entry.data)
+        new_data[CONF_DEVICES] = devices
+        hass.config_entries.async_update_entry(entry, data=new_data)
+        summary["applied"] = True
+
+        _LOGGER.warning(
+            "Ключи обновлены из облака: сменилось %d из %d устройств "
+            "(совпадали %d, нет в облаке %d)",
+            summary["will_change"], summary["total"],
+            summary["same"], summary["not_in_cloud"],
+        )
+        return summary

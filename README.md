@@ -221,6 +221,23 @@ coordinator also asks the cloud for a fresh one.
 `--fake-gateways` reproduces the topology it happens on: gateways that are not
 configured as devices, so a child is promoted to carry the socket.
 
+### One button to re-key a site after re-pairing
+
+Re-pairing devices rotates every `local_key` at once while the device ids stay
+the same. Adding them again would mean losing entity ids, automations, areas
+and history for the whole site. **Обновить ключи из облака** matches the
+configured devices against the cloud account by device id and updates the keys
+in place: the devices in Home Assistant remain the same devices.
+
+It previews first - how many will change, how many already match, how many are
+missing from the cloud - and only writes on confirmation. Keys are never sent
+to the frontend, in either direction. If a device now sits behind a different
+gateway (its `node_id` changed in the cloud) that is called out separately: the
+key alone will not bring it back, it needs a replacement.
+
+The button appears on the overview whenever a cloud account is configured and
+something is off, and always in home settings.
+
 ## Install
 
 ### Manual

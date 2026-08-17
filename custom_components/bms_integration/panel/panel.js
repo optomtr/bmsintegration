@@ -552,6 +552,12 @@ class BmsControlCenter extends HTMLElement {
     }).join("") : empty("Инцидентов не зафиксировано");
 
     const attention = rows.filter((r) => r.state !== "online");
+    // Кнопка предлагается, когда есть куда сходить за ключами и есть что
+    // чинить. Без порогов «от трёх устройств»: предпросмотр всё равно скажет
+    // «менять нечего», если ключи совпадают, - а вот не подсказать человеку,
+    // у которого лежит весь объект, куда дороже.
+    const hasCloud = (this.d.overview?.entries || []).some((e) => !e.no_cloud);
+    const keyTrouble = hasCloud && attention.length > 0;
     const attRows = attention.length ? attention.map((r) => `
       <div class="arow">
         <span class="acell">${icon(r.is_subdevice ? "i-zigbee" : "i-wifi", 14, C.mut)}
@@ -591,6 +597,8 @@ class BmsControlCenter extends HTMLElement {
       </div>
       ${cardOpen("Требуют внимания",
         `${attention.length ? `<span class="badge-w">${attention.length}</span>` : ""}
+         ${keyTrouble ? btn("Обновить ключи из облака",
+             { act: "refresh-keys", primary: true, small: true, ico: "i-refresh" }) : ""}
          <span class="small mut">${esc(attention.length ? "нажмите «Открыть» для карточки устройства" : "все узлы в норме")}</span>`)}
         <div style="overflow-x:auto"><div style="min-width:880px">
           <div class="ahead"><span>Устройство</span><span>Зона / связь</span><span>Состояние</span><span>Причина</span><span>Ответ</span><span></span></div>
@@ -1365,6 +1373,14 @@ class BmsControlCenter extends HTMLElement {
             plural(e.problems, "проблема", "проблемы", "проблем").replace(/^\d+\s/, "")}</span></div>
         </div>
         ${kv([["Идентификатор", e.entry_id], ["Облачный аккаунт", e.no_cloud ? "не привязан" : "привязан"]])}
+        ${e.no_cloud ? "" : `
+        <div style="display:flex;flex-direction:column;gap:6px">
+          ${btn("Обновить ключи из облака", { act: "refresh-keys", ico: "i-refresh" })}
+          <span class="small mut">После перепривязки устройств local_key меняется у всех
+            разом, а идентификаторы остаются прежними. Кнопка сверяет устройства по
+            идентификатору и переносит ключи из облака на месте: сущности, комнаты,
+            автоматизации и история сохраняются. Сначала покажет, что изменится.</span>
+        </div>`}
         <div style="display:flex;gap:7px;flex-wrap:wrap">
           ${btn("Показать на карте", { act: "nav", data: 'data-nav="map"', ico: "i-network" })}
           ${btn("Перезагрузить запись", { act: "reload-entry", data: `data-entry="${esc(e.entry_id)}"`, danger: true, ico: "i-refresh" })}
@@ -1510,6 +1526,40 @@ class BmsControlCenter extends HTMLElement {
     }
 
     // ---- комнаты и замена ---------------------------------------------
+    if (a === "refresh-keys") {
+      const entryId = (this.d.overview?.entries || [])[0]?.entry_id;
+      if (!entryId) return this.toast("Не найдена запись конфигурации", true);
+      el.disabled = true;
+      try {
+        // Сначала предпросмотр: показать, что изменится, и только потом писать.
+        const p = await this.ws("refresh_keys", { entry_id: entryId });
+        const moved = p.node_moved
+          ? `\n\nВНИМАНИЕ: у ${p.node_moved} устройств в облаке другой узел (node_id) — их, похоже, перепривязали к другому шлюзу. Ключ им обновится, но может понадобиться замена устройства.`
+          : "";
+        if (!p.will_change) {
+          this.toast(p.total && p.same === p.total
+            ? "Ключи уже совпадают с облаком — дело не в них"
+            : `Менять нечего: в облаке нет ${p.not_in_cloud} из ${p.total} устройств`, true);
+          this.logAction(false, `Обновление ключей: менять нечего (совпадает ${p.same}, нет в облаке ${p.not_in_cloud})`);
+          el.disabled = false;
+          return;
+        }
+        if (!confirm(
+          `Обновить local_key из облака у ${p.will_change} из ${p.total} устройств?\n\n` +
+          `Совпадает и не тронем: ${p.same}\nНет в облаке: ${p.not_in_cloud}\n\n` +
+          `Устройства в Home Assistant останутся теми же — сохранятся entity_id, комнаты, автоматизации и история. Интеграция перезагрузится.${moved}`
+        )) { el.disabled = false; return; }
+
+        const res = await this.ws("refresh_keys", { entry_id: entryId, apply: true });
+        this.logAction(true, `Ключи обновлены у ${res.will_change} из ${res.total} устройств`);
+        this.toast(`Ключи обновлены: ${res.will_change} устройств. Переподключение…`);
+      } catch (err) {
+        this.logAction(false, `Обновление ключей: ${err?.message || err}`);
+        this.toast(err?.message || "Не получилось", true);
+      }
+      el.disabled = false;
+      return this.refresh();
+    }
     if (a === "lockdown-toggle") {
       const on = !el.dataset.on;
       if (!confirm(on

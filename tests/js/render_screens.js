@@ -197,6 +197,23 @@ try {
      html.includes("не вещают") || html.includes("не появятся")],
     ["на шлюзе нет кнопки «Добавить»", !html.includes('data-id="gw1"')],
   ];
+  // Объект после перепривязки: лежит весь - кнопка обновления ключей обязана
+  // предлагаться сама, без хождения по настройкам.
+  const p3 = new Panel();
+  p3.d = JSON.parse(JSON.stringify(fixtures));
+  p3.d.overview.devices.forEach((d) => { d.state = "unavailable"; d.connected = false; });
+  p3.d.overview.entries[0].no_cloud = false;   // ключи есть откуда взять
+  p3.s.screen = "overview";
+  const over = p3.vOverview();
+  cases.push(["когда лежит весь объект — предложено обновить ключи",
+              over.includes("Обновить ключи из облака")]);
+  // Без облака брать ключи неоткуда - кнопку показывать нечестно.
+  const p4 = new Panel();
+  p4.d = JSON.parse(JSON.stringify(fixtures));
+  p4.d.overview.devices.forEach((d) => { d.state = "unavailable"; d.connected = false; });
+  p4.s.screen = "overview";
+  cases.push(["без облака кнопка не предлагается",
+              !p4.vOverview().includes("Обновить ключи из облака")]);
   for (const [name, ok] of cases) {
     if (ok) console.log(`  ✓ ${name}`);
     else { console.error(`  ✗ ${name}`); failed++; }

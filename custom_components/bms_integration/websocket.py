@@ -498,6 +498,45 @@ async def ws_set_lockdown(hass: HomeAssistant, connection, msg: dict) -> None:
     connection.send_result(msg["id"], {"ok": True, "lockdown": enabled})
 
 
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/refresh_keys",
+        vol.Required("entry_id"): str,
+        vol.Optional("apply"): bool,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_refresh_keys(hass: HomeAssistant, connection, msg: dict) -> None:
+    """Перенести ключи из облака на настроенные устройства по device_id.
+
+    Без apply - только предпросмотр. Ключи наружу не отдаются ни в каком
+    случае: только имена устройств и признак «сменится».
+    """
+    entry = hass.config_entries.async_get_entry(msg["entry_id"])
+    if entry is None or entry.domain != DOMAIN:
+        connection.send_error(msg["id"], "not_found", "Запись конфигурации не найдена")
+        return
+
+    apply = bool(msg.get("apply"))
+    if apply:
+        _LOGGER.warning(
+            "Обновление ключей из облака запущено из панели (пользователь %s)",
+            connection.user.name if connection.user else "?",
+        )
+    try:
+        summary = await replace_mod.async_refresh_keys(hass, entry, apply=apply)
+    except replace_mod.ReplaceError as err:
+        connection.send_error(msg["id"], "refresh_failed", str(err))
+        return
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.exception("Обновление ключей не удалось")
+        connection.send_error(msg["id"], "refresh_failed", str(err))
+        return
+
+    connection.send_result(msg["id"], summary)
+
+
 def async_register_websocket_api(hass: HomeAssistant) -> None:
     """Register every panel command, once per Home Assistant."""
     domain_data = hass.data.setdefault(DOMAIN, {})
@@ -523,6 +562,7 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
         ws_add_device,
         ws_remove_device,
         ws_set_lockdown,
+        ws_refresh_keys,
     ):
         websocket_api.async_register_command(hass, command)
     domain_data[DATA_WS_REGISTERED] = True
