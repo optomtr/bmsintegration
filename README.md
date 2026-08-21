@@ -238,6 +238,20 @@ key alone will not bring it back, it needs a replacement.
 The button appears on the overview whenever a cloud account is configured and
 something is off, and always in home settings.
 
+### Sensors stop forgetting what they know
+
+A battery sensor sends its temperature often and its charge once a day, and the
+gateway only caches what it was given. A report about ONE datapoint wakes every
+entity of that device - so the entity whose datapoint was not in the report used
+to overwrite its own value with "unknown". Silence is not a new reading: an
+absent datapoint now leaves the value alone.
+
+The same sensors also came up "unknown" after a restart and stayed that way
+until the device felt like reporting, even though the value had been known a
+minute earlier and the Tuya app shows it always (the cloud keeps the last one).
+The last known measurement is now shown immediately and is replaced by the
+device's first real report.
+
 ## Install
 
 ### Manual

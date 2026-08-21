@@ -238,3 +238,147 @@ def install() -> None:
 def load_coordinator():
     install()
     return importlib.import_module("custom_components.bms_integration.coordinator")
+
+
+def load_sensor():
+    """Загрузить платформу датчиков поверх заглушек.
+
+    sensor.py тянет за собой части Home Assistant, которых нет в базовом
+    наборе (компонент sensor, restore_state, entity_platform) и voluptuous.
+    Всё это - обвязка: описание формы конфигуратора и базовые классы. Логика
+    расчёта значений остаётся настоящей, из продукта, поэтому тест проверяет
+    именно её, а не свою копию.
+    """
+    install()
+
+    if "voluptuous" not in sys.modules:
+        class _Marker:
+            def __init__(self, key, **kwargs):
+                self.schema = key
+
+            def __hash__(self):
+                return hash(self.schema)
+
+        class _Invalid(Exception):
+            pass
+
+        _mk(
+            "voluptuous",
+            Optional=_Marker,
+            Required=_Marker,
+            Schema=lambda *a, **kw: None,
+            All=lambda *a, **kw: None,
+            Range=lambda *a, **kw: None,
+            In=lambda *a, **kw: None,
+            Any=lambda *a, **kw: None,
+            Coerce=lambda *a, **kw: None,
+            Invalid=_Invalid,
+        )
+
+    ha_const = sys.modules["homeassistant.const"]
+    for name, value in {
+        "CONF_DEVICE_CLASS": "device_class",
+        "CONF_UNIT_OF_MEASUREMENT": "unit_of_measurement",
+        "CONF_ENTITY_CATEGORY": "entity_category",
+        "CONF_ICON": "icon",
+        "STATE_UNKNOWN": "unknown",
+        "STATE_UNAVAILABLE": "unavailable",
+        "ATTR_VIA_DEVICE": "via_device",
+    }.items():
+        setattr(ha_const, name, value)
+
+    class _Units:
+        """Единицы измерения: интеграции важны только их значения."""
+
+        AMPERE = "A"
+        MILLIAMPERE = "mA"
+        VOLT = "V"
+        MILLIVOLT = "mV"
+        WATT = "W"
+        KILO_WATT = "kW"
+
+    for unit in ("UnitOfElectricCurrent", "UnitOfElectricPotential", "UnitOfPower"):
+        setattr(ha_const, unit, _Units)
+
+    components = sys.modules.get("homeassistant.components") or _mk(
+        "homeassistant.components"
+    )
+    sys.modules["homeassistant"].components = components
+
+    class SensorEntity:
+        _attr_device_class = None
+        _attr_has_entity_name = True
+        _attr_should_poll = False
+
+    class _Enum(str):
+        pass
+
+    class SensorDeviceClass:
+        TEMPERATURE = _Enum("temperature")
+        HUMIDITY = _Enum("humidity")
+        BATTERY = _Enum("battery")
+        CURRENT = _Enum("current")
+        VOLTAGE = _Enum("voltage")
+        POWER = _Enum("power")
+
+        def __call__(self, value):
+            return _Enum(value)
+
+    class SensorStateClass:
+        MEASUREMENT = _Enum("measurement")
+
+    components.sensor = _mk(
+        "homeassistant.components.sensor",
+        DOMAIN="sensor",
+        DEVICE_CLASSES_SCHEMA=lambda value: value,
+        STATE_CLASSES_SCHEMA=lambda value: value,
+        SensorEntity=SensorEntity,
+        SensorDeviceClass=SensorDeviceClass(),
+        SensorStateClass=SensorStateClass,
+    )
+
+    helpers = sys.modules["homeassistant.helpers"]
+
+    # entity.py шлёт сигнал о появлении сущности - в базовом наборе есть
+    # только приём.
+    dispatcher = sys.modules["homeassistant.helpers.dispatcher"]
+    if not hasattr(dispatcher, "async_dispatcher_send"):
+        dispatcher.async_dispatcher_send = lambda hass, signal, *args: None
+
+    if "homeassistant.helpers.restore_state" not in sys.modules:
+        class RestoreEntity:
+            async def async_added_to_hass(self):
+                return None
+
+            async def async_get_last_state(self):
+                return None
+
+        helpers.restore_state = _mk(
+            "homeassistant.helpers.restore_state", RestoreEntity=RestoreEntity
+        )
+
+    if "homeassistant.helpers.entity_platform" not in sys.modules:
+        helpers.entity_platform = _mk(
+            "homeassistant.helpers.entity_platform", AddEntitiesCallback=object
+        )
+
+    if "homeassistant.helpers.selector" not in sys.modules:
+        helpers.selector = _mk(
+            "homeassistant.helpers.selector",
+            NumberSelector=lambda *a, **kw: None,
+            NumberSelectorConfig=lambda *a, **kw: None,
+            SelectSelector=lambda *a, **kw: None,
+            SelectSelectorConfig=lambda *a, **kw: None,
+            SelectOptionDict=lambda *a, **kw: None,
+            TextSelector=lambda *a, **kw: None,
+            ObjectSelector=lambda *a, **kw: None,
+            BooleanSelector=lambda *a, **kw: None,
+        )
+
+    # config_flow нужен датчику ради одного помощника для формы; настоящий
+    # тянет пол-Home Assistant и к расчёту значений отношения не имеет.
+    flow_name = "custom_components.bms_integration.config_flow"
+    if flow_name not in sys.modules:
+        _mk(flow_name, col_to_select=lambda *a, **kw: None)
+
+    return importlib.import_module("custom_components.bms_integration.sensor")

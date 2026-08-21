@@ -19,6 +19,7 @@ from homeassistant.const import (
     CONF_DEVICE_CLASS,
     CONF_UNIT_OF_MEASUREMENT,
     Platform,
+    STATE_UNAVAILABLE,
     STATE_UNKNOWN,
     UnitOfElectricCurrent,
     UnitOfElectricPotential,
@@ -30,6 +31,19 @@ from .entity import LocalTuyaEntity, async_setup_entry
 from .const import CONF_OFFSET, CONF_SCALING, CONF_STATE_CLASS
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _restored_value(state: str):
+    """Вернуть сохранённое состояние в том виде, в каком его ждёт датчик.
+
+    В истории Home Assistant состояние лежит строкой; числовому датчику нужно
+    число, иначе график и статистика его не примут.
+    """
+    try:
+        number = float(state)
+    except (TypeError, ValueError):
+        return state
+    return int(number) if number.is_integer() and "." not in str(state) else number
 
 DEFAULT_PRECISION = 2
 
@@ -101,6 +115,15 @@ class LocalTuyaSensor(LocalTuyaEntity, SensorEntity):
 
         state = self.dp_value(self._dp_id)
 
+        if state is None:
+            # Отчёт от устройства пришёл, но нашего датапоинта в нём нет.
+            # Так ведут себя батарейные датчики: температуру шлют часто, а
+            # заряд - раз в сутки, и шлюз держит в кэше только то, что от них
+            # получил. Отчёт по СОСЕДНЕМУ датапоинту будит все сущности
+            # устройства, и раньше каждый такой отчёт затирал известное
+            # значение на «неизвестно». Молчание - это не новое показание.
+            return
+
         if self.is_base64(state):
             if not self._has_sub_entities:
                 self.hass.loop.call_soon_threadsafe(
@@ -121,6 +144,21 @@ class LocalTuyaSensor(LocalTuyaEntity, SensorEntity):
 
         if (last_state := self._last_state) and self.is_base64(last_state):
             self._status.update({self._dp_id: last_state})
+
+        # Показать последнее известное измерение сразу после перезапуска.
+        # Датчик за шлюзом присылает значение, когда сочтёт нужным, - до тех
+        # пор сущность стояла «неизвестно», хотя минуту назад значение было
+        # известно, и в приложении Tuya оно видно всегда (облако хранит
+        # последнее). Первый же отчёт устройства это перепишет.
+        if self._state is None and stored_state.state not in (
+            STATE_UNAVAILABLE,
+            STATE_UNKNOWN,
+        ):
+            self._state = _restored_value(stored_state.state)
+            self.debug(
+                "Восстановлено последнее значение %s до первого отчёта устройства",
+                self._state,
+            )
 
     # No need to restore state for a sensor
     async def restore_state_when_connected(self):
