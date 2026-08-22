@@ -252,6 +252,36 @@ minute earlier and the Tuya app shows it always (the cloud keeps the last one).
 The last known measurement is now shown immediately and is replaced by the
 device's first real report.
 
+### Silence is never a reading, on any platform
+
+The sensor fix above turned out to be one case of a general rule, so the rule
+now lives in the base entity: a report about ONE datapoint wakes every entity
+of that device, and an entity whose datapoint is absent from that report keeps
+what it had instead of writing None over it.
+
+The worst instance was the binary sensor: an absent datapoint read as the
+string "none", matched no "on" value, and the entity reported off. A leak
+sensor that had actually tripped therefore cleared itself the moment the device
+sent its next battery or temperature report. Fan, light, cover, climate and
+water heater carried the same pattern and are guarded too.
+
+### A device added from a template no longer inherits someone else's parent
+
+Adding "по образцу" copied the template's `gateway_id`, so a standalone device
+became a false child of a gateway it does not sit behind. Replacing that
+gateway then silently rewrote the impostor's address to the gateway's, taking a
+working device down. Parentage now comes only from the hardware being added,
+and a record claiming a gateway without a node id is rejected as malformed.
+
+### Panel writes no longer revert someone else's change
+
+Replace and add read the configured devices, then go to the network to verify
+the hardware, then write. The config entry is written by others too - the UDP
+address change and the cloud key refresh both write it directly - so a write
+landing inside that window used to be silently reverted by the stale snapshot.
+Both now re-read the entry after the network round trip and re-validate before
+writing.
+
 ## Install
 
 ### Manual

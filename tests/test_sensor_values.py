@@ -143,5 +143,51 @@ class RestoreAfterRestart(unittest.TestCase):
         )
 
 
+class LeakAlarmDoesNotClearItself(unittest.TestCase):
+    """Сработку датчика нельзя гасить чужим отчётом.
+
+    Пропавший датапоинт раньше читался как «none», не совпадал ни с одним
+    значением «включено» - и датчик протечки сам показывал «протечки нет»,
+    стоило устройству прислать отчёт по соседнему датапоинту.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = ha_stubs.load_platform("binary_sensor")
+
+    def make(self, dp="1", on_values="true,1"):
+        entity = self.mod.LocalTuyaBinarySensor.__new__(self.mod.LocalTuyaBinarySensor)
+        entity._dp_id = dp
+        entity._status = {}
+        entity._state = None
+        entity._last_state = None
+        entity._is_on = False
+        entity._reset_timer = 0
+        entity._reset_timer_interval = None
+        entity._config = {"state_on": on_values}
+        entity._device = type("D", (), {"is_connecting": False})()
+        entity.debug = lambda *a, **kw: None
+        return entity
+
+    def test_alarm_survives_a_report_about_another_datapoint(self):
+        leak = self.make(dp="1")
+        leak._status = {"1": "true"}
+        leak.status_updated()
+        self.assertTrue(leak.is_on, "сработка не поднялась")
+
+        # Устройство прислало заряд батареи: датапоинта протечки в отчёте нет.
+        leak._status = {"4": 80}
+        leak.status_updated()
+        self.assertTrue(leak.is_on, "тревога погасла сама - датчик соврал «сухо»")
+
+    def test_a_real_clear_still_clears(self):
+        leak = self.make(dp="1")
+        leak._status = {"1": "true"}
+        leak.status_updated()
+        leak._status = {"1": "false"}
+        leak.status_updated()
+        self.assertFalse(leak.is_on, "настоящий отбой не сработал")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

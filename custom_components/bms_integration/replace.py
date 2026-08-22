@@ -367,6 +367,18 @@ async def async_replace_device(
             "ir_codes_moved": False,
         }
 
+        # Между чтением выше и записью ниже мы уходили в сеть, а запись
+        # конфигурации меняем не только мы: смена адреса по UDP-обнаружению и
+        # автоподтяжка ключа из облака пишут её сами. Записав свой старый
+        # снимок, мы бы молча откатили их правку - и наоборот. Поэтому берём
+        # запись заново и накладываем изменение на неё.
+        devices = dict(_devices(entry))
+        if old_id not in devices:
+            raise ReplaceError(
+                f"Устройство {old_id} исчезло из записи, пока шла проверка связи. "
+                "Повторите замену."
+            )
+
         if same_device:
             # Сменился только ключ или адрес: в Home Assistant ничего не двигается.
             devices[old_id] = new_config
@@ -468,8 +480,13 @@ async def async_add_device(
         }
         if template is not None:
             for key, value in template.items():
+                # Родство и адрес - свойства ЖЕЛЕЗА, а не образца. Унаследовав
+                # gateway_id соседнего узла, новое устройство притворялось бы
+                # его роднёй: при замене того шлюза ему молча переписали бы
+                # адрес на шлюзовой, и рабочее устройство встало бы.
                 if key in (CONF_DEVICE_ID, CONF_FRIENDLY_NAME, CONF_ENTITIES,
-                           CONF_HOST, CONF_LOCAL_KEY, CONF_NODE_ID):
+                           CONF_HOST, CONF_LOCAL_KEY, CONF_NODE_ID,
+                           CONF_GATEWAY_ID):
                     continue
                 config.setdefault(key, value)
             config[CONF_ENTITIES] = _rename_entities(
@@ -480,6 +497,12 @@ async def async_add_device(
         for field in (CONF_NODE_ID, CONF_GATEWAY_ID, CONF_MODEL, "product_key"):
             if hardware.get(field):
                 config[field] = hardware[field]
+
+        # Шлюз бывает только у узла. Запись «за шлюзом, но без node_id» для
+        # запуска ничего не значит, зато делает устройство ложной роднёй: при
+        # замене шлюза ему перепишут адрес.
+        if not config.get(CONF_NODE_ID):
+            config.pop(CONF_GATEWAY_ID, None)
 
         if not config[CONF_LOCAL_KEY]:
             raise ReplaceError("Без local_key устройство не подключится")
@@ -503,6 +526,23 @@ async def async_add_device(
             # Лучше отказать сразу, чем завести устройство, которое никогда не
             # поднимется: неверный ключ - самая частая причина.
             await _async_verify(hass, entry, config)
+
+        # См. пояснение в async_replace_device: пока шла проверка связи,
+        # запись мог изменить кто-то ещё. Перечитываем и проверяем заново -
+        # за это время идентификатор или адрес могли занять.
+        devices = dict(_devices(entry))
+        if dev_id in devices:
+            raise ReplaceError(
+                f"Устройство {dev_id} успели настроить, пока шла проверка связи."
+            )
+        if not config.get(CONF_NODE_ID):
+            for other_id, other in devices.items():
+                if other.get(CONF_NODE_ID) or other.get(CONF_HOST) != config[CONF_HOST]:
+                    continue
+                raise ReplaceError(
+                    f"Адрес {config[CONF_HOST]} успели занять устройством "
+                    f"«{other.get(CONF_FRIENDLY_NAME) or other_id}»."
+                )
 
         devices[dev_id] = config
         new_data = dict(entry.data)

@@ -543,7 +543,9 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
 
     def status_updated(self):
         """Device status was updated."""
-        self._state = self.dp_value(self._dp_id)
+        if (reported := self.dp_value(self._dp_id)) is not None or self._state is None:
+            # Молчание по датапоинту - не новое значение (см. entity.py).
+            self._state = reported
 
         # Update target temperature. `is not None`, not truthiness: a real
         # reading of 0 degrees used to be discarded as "no data".

@@ -78,7 +78,15 @@ class LocalTuyaBinarySensor(LocalTuyaEntity, BinarySensorEntity):
         """Device status was updated."""
         super().status_updated()
 
-        state = str(self.dp_value(self._dp_id)).lower()
+        raw = self.dp_value(self._dp_id)
+        if raw is None and self._is_on is not None:
+            # Пропавший датапоинт раньше читался как «none» и не совпадал ни с
+            # одним значением «включено» - то есть тревога датчика протечки
+            # гасла сама, стоило устройству прислать отчёт по соседнему
+            # датапоинту. Молчание не отменяет сработку.
+            return
+
+        state = str(raw).lower()
         # users may set wrong on states, But we assume that must devices use this on states.
         if state in self._config[CONF_STATE_ON].lower().split(","):
             self._is_on = True

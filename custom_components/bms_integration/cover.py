@@ -401,7 +401,9 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
     def status_updated(self):
         """Device status was updated."""
         self._previous_state = self._state
-        self._state = self.dp_value(self._dp_id)
+        if (reported := self.dp_value(self._dp_id)) is not None or self._state is None:
+            # Молчание по датапоинту - не новое значение (см. entity.py).
+            self._state = reported
 
         if self._has_gate_state_sensor:
             gate_sensor_state = self._gate_sensor_state

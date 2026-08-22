@@ -334,6 +334,13 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
         Override in subclasses and update entity specific state.
         """
         state = self.dp_value(self._dp_id)
+        if state is None and self._state is not None:
+            # Отчёт по СОСЕДНЕМУ датапоинту будит все сущности устройства.
+            # Если нашего в отчёте нет - это молчание, а не новое значение:
+            # затирать известное состояние нельзя. Батарейные приборы шлют
+            # часть своих датапоинтов раз в сутки, а шлюз держит в кэше
+            # только то, что от них получил.
+            return
         self._state = state
 
         # Keep record in last_state as long as not during connection/re-connection,

@@ -223,7 +223,9 @@ class LocalTuyaFan(LocalTuyaEntity, FanEntity):
 
     def status_updated(self):
         """Get state of Tuya fan."""
-        self._is_on = self.dp_value(self._dp_id)
+        if (reported := self.dp_value(self._dp_id)) is not None or self._is_on is None:
+            # Молчание по датапоинту - не новое значение (см. entity.py).
+            self._is_on = reported
 
         current_speed = self.dp_value(CONF_FAN_SPEED_CONTROL)
         if self._use_ordered_list:

@@ -382,3 +382,36 @@ def load_sensor():
         _mk(flow_name, col_to_select=lambda *a, **kw: None)
 
     return importlib.import_module("custom_components.bms_integration.sensor")
+
+
+def load_platform(name: str):
+    """Загрузить платформу поверх заглушек (см. load_sensor).
+
+    Компонент Home Assistant для неё подставляется generic-заглушкой: тесту
+    нужен расчёт состояния, а не базовый класс сущности.
+    """
+    load_sensor()  # общая обвязка: voluptuous, селекторы, restore_state и т.д.
+
+    components = sys.modules["homeassistant.components"]
+    mod_name = f"homeassistant.components.{name}"
+    if mod_name not in sys.modules:
+        class _Entity:
+            _attr_device_class = None
+            _attr_has_entity_name = True
+            _attr_should_poll = False
+
+        class _Classes:
+            def __getattr__(self, item):
+                return item.lower()
+
+        entity_cls = f"{''.join(p.title() for p in name.split('_'))}Entity"
+        stub = _mk(
+            mod_name,
+            DOMAIN=name,
+            DEVICE_CLASSES_SCHEMA=lambda value: value,
+            STATE_CLASSES_SCHEMA=lambda value: value,
+            **{entity_cls: _Entity},
+        )
+        setattr(components, name, stub)
+
+    return importlib.import_module(f"custom_components.bms_integration.{name}")
