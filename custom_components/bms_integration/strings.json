@@ -235,6 +235,7 @@
           "eco_dp": "(Optional) Eco DP",
           "eco_value": "(Optional) Eco value",
           "heuristic_action": "(Optional) Enable heuristic action",
+          "nudge_target_on_command": "(Optional) Problem AC: nudge the setpoint on every command",
           "dps_default_value": "(Optional) Default value when un-initialised",
           "restore_on_reconnect": "Restore the last value set in Home Assistant after lost connection?",
           "optimistic": "Optimistic command state",

@@ -35,6 +35,10 @@ def make_climate(dps, forced_celsius=None, min_temp=16, max_temp=30):
     entity._precision = 1.0
     entity._precision_target = 1.0
     entity._target_temp_forced_to_celsius = forced_celsius
+    entity._nudge_in_progress = False
+    entity._nudge_on_command = False
+    entity._nudge_desired = None
+    entity._nudge_task = None
     entity._has_presets = False
     entity._preset_mode = None
     entity._swing_v_mode_dp = None

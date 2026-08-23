@@ -38,6 +38,7 @@ from .const import (
     CONF_ECO_DP,
     CONF_ECO_VALUE,
     CONF_HEURISTIC_ACTION,
+    CONF_NUDGE_TARGET,
     CONF_HVAC_ACTION_DP,
     CONF_HVAC_ACTION_SET,
     CONF_HVAC_MODE_DP,
@@ -59,6 +60,12 @@ from .const import (
     CONF_SWING_HORIZONTAL_MODES,
     DictSelector,
 )
+
+# Кондиционер, который не трогается с места, пока не изменится уставка:
+# сколько ждать между толчком и возвратом, и сколько после этого не верить
+# отчётам устройства об уставке, чтобы на термостате не мигнуло чужое число.
+NUDGE_SETTLE_SECONDS = 1.0
+NUDGE_QUIET_SECONDS = 2.0
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -175,6 +182,7 @@ def flow_schema(dps):
         vol.Optional(CONF_FAN_SPEED_LIST, default=FAN_SPEEDS_DEFAULT): ObjectSelector(),
         vol.Optional(CONF_TEMPERATURE_UNIT): col_to_select(SUPPORTED_TEMPERATURES),
         vol.Optional(CONF_HEURISTIC_ACTION): bool,
+        vol.Optional(CONF_NUDGE_TARGET, default=False): bool,
     }
 
 
@@ -213,6 +221,11 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
         self._state_on, self._state_off = True, False
         self._target_temperature = None
         self._target_temp_forced_to_celsius = None
+        self._nudge_on_command = bool(self._config.get(CONF_NUDGE_TARGET, False))
+        self._nudge_lock = asyncio.Lock()
+        self._nudge_task: asyncio.Task | None = None
+        self._nudge_desired = None
+        self._nudge_in_progress = False
         self._current_temperature = None
         self._hvac_mode: HVACMode | None = None
         self._hvac_action: HVACAction | None = None
@@ -469,26 +482,99 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
         await self._device.set_dp(
             self._swing_v_modes.to_tuya(swing_mode), self._swing_v_mode_dp
         )
+        self._nudge_after_command()
 
     async def async_set_swing_horizontal_mode(self, swing_mode):
         """Set new target horizontal swing operation."""
         await self._device.set_dp(
             self._swing_h_modes.to_tuya(swing_mode), self._swing_h_mode_dp
         )
+        self._nudge_after_command()
+
+    async def _async_send_target(self, temperature):
+        """Отправить уставку в единицах и шаге самого устройства."""
+        if self._target_temp_forced_to_celsius:
+            # Revert Temperature to Fahrenheit it was forced to celsius
+            temperature = round(c_to_f(temperature))
+
+        await self._device.set_dp(
+            round(temperature / self._precision_target),
+            self._config[CONF_TARGET_TEMPERATURE_DP],
+        )
+
+    def _nudge_after_command(self, desired=None) -> None:
+        """Толкнуть уставку вслед за командой, не задерживая саму команду.
+
+        Некоторые кондиционеры не трогаются с места, пока не изменится целевая
+        температура: включаешь - и он стоит, пока уставку не подвинуть рукой.
+        Галочка «толкать уставку» в настройках сущности заставляет интеграцию
+        делать это самой: уставка уходит на шаг вверх и тут же возвращается на
+        ту, которую выставил человек.
+
+        Толчок живёт на уровне команд. На термостате в Home Assistant всё это
+        время стоит число человека - промежуточное значение туда не попадает.
+        """
+        if not self._nudge_on_command or not self.has_config(
+            CONF_TARGET_TEMPERATURE_DP
+        ):
+            return
+        if desired is None:
+            desired = self._target_temperature
+        if desired is None:
+            # Уставку ещё ни разу не сообщали: возвращать было бы некуда.
+            return
+
+        # Более свежая команда важнее: к её цели вернётся и уже запущенный толчок.
+        self._nudge_desired = desired
+        if self._nudge_task is not None and not self._nudge_task.done():
+            return
+        self._nudge_task = self.hass.async_create_task(self._async_nudge_target())
+
+    async def _async_nudge_target(self) -> None:
+        async with self._nudge_lock:
+            desired = self._nudge_desired
+            # Шаг берём у самого устройства, а не у отображения: при точности
+            # 1 °C сдвиг на пол-градуса после округления даёт то же самое
+            # число, и кондиционер изменения не увидит.
+            step = self._precision_target or 1
+            nudged = desired + step
+            if nudged > self.max_temp:
+                # Уставка на верхней границе - толкаем вниз.
+                nudged = desired - step
+            if not self.min_temp <= nudged <= self.max_temp:
+                self.debug(
+                    "Толкать уставку некуда: диапазон %s-%s", self.min_temp, self.max_temp
+                )
+                return
+
+            self._nudge_in_progress = True
+            self._target_temperature = desired
+            self.schedule_update_ha_state()
+            try:
+                await self._async_send_target(nudged)
+                await asyncio.sleep(NUDGE_SETTLE_SECONDS)
+                # Перечитываем: пока мы ждали, человек мог выставить другую.
+                desired = self._nudge_desired
+                await self._async_send_target(desired)
+                # Отчёт с промежуточным числом приходит уже после возврата -
+                # поэтому не верим отчётам об уставке ещё немного.
+                await asyncio.sleep(NUDGE_QUIET_SECONDS)
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:  # pylint: disable=broad-except
+                self.warning(f"Не удалось толкнуть уставку: {ex}")
+            finally:
+                self._nudge_in_progress = False
+                self._target_temperature = self._nudge_desired
+            self.schedule_update_ha_state()
 
     async def async_set_temperature(self, **kwargs):
         """Set new target temperature."""
         if ATTR_TEMPERATURE in kwargs and self.has_config(CONF_TARGET_TEMPERATURE_DP):
             temperature = kwargs[ATTR_TEMPERATURE]
-
-            if self._target_temp_forced_to_celsius:
-                # Revert Temperature to Fahrenheit it was forced to celsius
-                temperature = round(c_to_f(temperature))
-
-            temperature = round(temperature / self._precision_target)
-            await self._device.set_dp(
-                temperature, self._config[CONF_TARGET_TEMPERATURE_DP]
-            )
+            await self._async_send_target(temperature)
+            # Цель берём из команды: устройство о ней ещё не отчиталось.
+            self._nudge_after_command(temperature)
 
     async def async_set_fan_mode(self, fan_mode):
         """Set new target fan mode."""
@@ -498,6 +584,7 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
         await self._device.set_dp(
             self._fan_speeds.to_tuya(fan_mode), self._fan_speed_dp
         )
+        self._nudge_after_command()
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode):
         """Set new target operation mode."""
@@ -511,10 +598,13 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
             new_states[self._dp_id] = self._state_off
 
         await self._device.set_dps(new_states)
+        if hvac_mode != HVACMode.OFF:
+            self._nudge_after_command()
 
     async def async_turn_on(self) -> None:
         """Turn the entity on."""
         await self._device.set_dp(self._state_on, self._dp_id)
+        self._nudge_after_command()
 
     async def async_turn_off(self) -> None:
         """Turn the entity off."""
@@ -528,6 +618,7 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
 
         preset_value = self._preset_set.to_tuya(preset_mode)
         await self._device.set_dp(preset_value, self._preset_dp)
+        self._nudge_after_command()
 
     def connection_made(self):
         """The connection has made with the device and status retrieved. configure entity based on it."""
@@ -552,6 +643,10 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
         Проверка идёт по диапазону самого устройства, а не по «нулю»: у тёплого
         пола нижняя граница своя, и заглушка там будет другой.
         """
+        if self._nudge_in_progress:
+            # Идёт толчок: устройство отчитывается промежуточной уставкой, на
+            # термостате мигнуло бы чужое число.
+            return
         if not self.min_temp <= value <= self.max_temp:
             self.debug(
                 "Уставка %s вне диапазона %s-%s - оставляем прежнюю %s",

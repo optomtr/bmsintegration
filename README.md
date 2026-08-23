@@ -282,6 +282,44 @@ landing inside that window used to be silently reverted by the stale snapshot.
 Both now re-read the entry after the network round trip and re-validate before
 writing.
 
+### A curtain can no longer be "closing" forever
+
+The control datapoint holds the last command, not the state. The entity left
+the moving state only when the reported position hit exactly 0 or exactly 100,
+so one lost position report stranded it there - and Home Assistant hides the
+direction arrow while a cover is moving. A movement is now bounded by the
+motor's own travel time in every positioning mode; no stop command is sent,
+because it is our belief that is stale, not the hardware.
+
+### A silent sub-device is asked again
+
+A child that answers the initial status query with nothing is deliberately let
+through the handshake, or one sleeping sensor would tear down the shared
+gateway session for every sibling. But the real status query ran exactly once,
+at connect, so whoever came up empty stayed empty for good - the periodic
+refresh cannot help, since its interval is off by default and update_dps
+requires no answer. Such devices are now re-queried on a backoff, from one
+minute up to ten, and only while they hold no datapoints at all.
+
+### A setpoint outside the device's own range is refused
+
+An air conditioner reported a target of 0 against its own range of 16-30. Zero
+there is a placeholder, not a reading, but it was accepted as real - and Home
+Assistant hides the setpoint control when the target falls outside min/max. The
+last good setpoint is now kept instead. The unit conversion also ran on every
+status update, including ones carrying no temperature, so an already-converted
+value drifted toward -40; it now applies only to a fresh reading.
+
+### Problem AC: nudge the setpoint on every command
+
+Some air conditioners will not start until the target temperature changes: you
+turn them on and they sit there until the setpoint is moved by hand. A per
+entity checkbox makes the integration do it - the setpoint goes one device step
+up and immediately back to what the user set, after any command. The push lives
+at the command level and never reaches the thermostat card, and it is sized by
+the device's own precision, not by the display step, so the hardware actually
+notices it.
+
 ## Install
 
 ### Manual
