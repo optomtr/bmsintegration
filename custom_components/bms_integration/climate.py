@@ -541,6 +541,28 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
                 self._state_on = 1
                 self._state_off = 0
 
+    def _set_target_temperature(self, value: float) -> None:
+        """Принять уставку, только если она попадает в диапазон устройства.
+
+        Кондиционер иногда сообщает уставку 0 при собственном диапазоне 16-30.
+        Ноль тут не температура, а заглушка, но принимался как настоящее
+        показание. Home Assistant прячет ползунок, когда уставка вне min/max, -
+        на объекте так и было: температурой стало нечем управлять.
+
+        Проверка идёт по диапазону самого устройства, а не по «нулю»: у тёплого
+        пола нижняя граница своя, и заглушка там будет другой.
+        """
+        if not self.min_temp <= value <= self.max_temp:
+            self.debug(
+                "Уставка %s вне диапазона %s-%s - оставляем прежнюю %s",
+                value,
+                self.min_temp,
+                self.max_temp,
+                self._target_temperature,
+            )
+            return
+        self._target_temperature = value
+
     def status_updated(self):
         """Device status was updated."""
         if (reported := self.dp_value(self._dp_id)) is not None or self._state is None:
@@ -556,7 +578,13 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
             if scaled is None:
                 self.debug("Ignoring non-numeric target temperature %r", target_dp_value)
             else:
-                self._target_temperature = scaled
+                # Перевод единиц - только для СВЕЖЕГО показания. Раньше он стоял
+                # ниже и выполнялся на каждом обновлении, в том числе когда по
+                # датапоинту ничего не пришло: уже пересчитанное значение
+                # пересчитывалось снова и снова и уползало к -40.
+                if self._target_temp_forced_to_celsius:
+                    scaled = f_to_c(scaled)
+                self._set_target_temperature(scaled)
 
         # Update current temperature
         if self.has_config(CONF_CURRENT_TEMPERATURE_DP) and (
@@ -566,13 +594,9 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
             if scaled is None:
                 self.debug("Ignoring non-numeric temperature %r", current_dp_temp)
             else:
+                if self._target_temp_forced_to_celsius is False:
+                    scaled = f_to_c(scaled)
                 self._current_temperature = scaled
-
-        # Force the Current temperature and Target temperature to matching the unit.
-        if self._target_temp_forced_to_celsius:
-            self._target_temperature = f_to_c(self._target_temperature)
-        elif self._target_temp_forced_to_celsius is False:
-            self._current_temperature = f_to_c(self._current_temperature)
 
         # Update preset states
         if self._has_presets:

@@ -78,6 +78,11 @@ GATEWAY_WATCHDOG_INTERVAL = timedelta(seconds=30)
 GATEWAY_WATCHDOG_STAGGER_SECONDS = 0.5
 # A single missed status reply must not tear down an otherwise healthy session.
 GATEWAY_WATCHDOG_FAILURE_THRESHOLD = 2
+# Дочернее устройство, не отдавшее датапоинты при подключении, переспрашивается
+# с нарастающей паузой: сразу после старта - часто, дальше редко, чтобы десятки
+# спящих датчиков не превратились в постоянный поток запросов к общему шлюзу.
+EMPTY_STATUS_RETRY_FIRST = 60
+EMPTY_STATUS_RETRY_MAX = 600
 # Subdevice: Offline events before disconnecting the device, around 5 minutes.
 # int(): HEARTBEAT_INTERVAL is a float, so "//" yielded a float that never
 # compared equal to the integer offline counter.
@@ -149,6 +154,8 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._health_check_lock = asyncio.Lock()
         self._health_check_failures = 0
         self._unsub_refresh: CALLBACK_TYPE | None = None
+        self._unsub_empty_status: CALLBACK_TYPE | None = None
+        self._empty_status_delay = EMPTY_STATUS_RETRY_FIRST
         self._unsub_new_entity: CALLBACK_TYPE | None = None
 
         self._entities = []
@@ -511,6 +518,8 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                         self.hass, self._async_refresh, timedelta(seconds=scan_inv)
                     )
 
+                self._schedule_empty_status_retry()
+
                 self._clear_connect_task()
                 self._health_check_failures = 0
                 # Ensure the connected sub-device is in its gateway's sub_devices
@@ -633,6 +642,8 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         if self._unsub_refresh:
             self._unsub_refresh()
             self._unsub_refresh = None
+
+        self._cancel_empty_status_retry()
 
         await self.abort_connect()
 
@@ -803,6 +814,62 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 f"DPS refresh failed: {ex}", "dps_refresh_failed"
             )
             raise
+
+    @callback
+    def _cancel_empty_status_retry(self) -> None:
+        if self._unsub_empty_status is not None:
+            self._unsub_empty_status()
+            self._unsub_empty_status = None
+        self._empty_status_delay = EMPTY_STATUS_RETRY_FIRST
+
+    @callback
+    def _schedule_empty_status_retry(self) -> None:
+        """Переспросить дочернее устройство, у которого нет ни одного датапоинта.
+
+        Пустой ответ на запрос статуса больше не валит рукопожатие - иначе один
+        спящий датчик рвал общую сессию шлюза всем соседям. Но настоящий запрос
+        статуса делался ровно один раз, при подключении: у кого он вышел
+        пустым, тот оставался пустым навсегда. На объекте так и было - датчик
+        температуры показывал «неизвестно», а штора «закрыто» при нуле
+        датапоинтов, тогда как у соседей по тому же шлюзу было по пять.
+
+        Периодическое обновление тут не помогает по двум причинам: интервал
+        опроса по умолчанию выключен, а update_dps ответа не требует, и
+        молчащее устройство им не поднять.
+        """
+        if (
+            self.is_closing
+            or not self.is_subdevice
+            or self._status
+            or self._unsub_empty_status is not None
+        ):
+            return
+
+        async def _retry(_now):
+            self._unsub_empty_status = None
+            if self.is_closing or self._status or not self.connected:
+                return
+            interface = self._interface
+            if interface is not None and interface.is_connected:
+                try:
+                    status = await interface.status(cid=self._node_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as ex:  # pylint: disable=broad-except
+                    self.debug(f"Silent sub-device did not answer a retry: {ex}")
+                else:
+                    if status:
+                        self.debug("Silent sub-device answered a retry", force=True)
+                        self.status_updated(status)
+                        return
+            self._empty_status_delay = min(
+                self._empty_status_delay * 2, EMPTY_STATUS_RETRY_MAX
+            )
+            self._schedule_empty_status_retry()
+
+        self._unsub_empty_status = async_call_later(
+            self.hass, self._empty_status_delay, _retry
+        )
 
     async def _async_refresh(self, _now):
         if self.connected:
@@ -1182,6 +1249,8 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             self._task_shutdown_entities = None
         self._handle_event(self._status, status)
         self._status.update(status)
+        if self._status:
+            self._cancel_empty_status_retry()
         self._dispatch_status()
 
     @callback
@@ -1203,6 +1272,8 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         if self._unsub_refresh:
             self._unsub_refresh()
             self._unsub_refresh = None
+
+        self._cancel_empty_status_retry()
 
         for subdevice in self.sub_devices.values():
             subdevice.disconnected("Gateway disconnected")

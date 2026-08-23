@@ -297,6 +297,12 @@ def load_sensor():
         "STATE_UNKNOWN": "unknown",
         "STATE_UNAVAILABLE": "unavailable",
         "ATTR_VIA_DEVICE": "via_device",
+        "ATTR_TEMPERATURE": "temperature",
+        "CONF_TEMPERATURE_UNIT": "temperature_unit",
+        "PRECISION_HALVES": 0.5,
+        "PRECISION_TENTHS": 0.1,
+        "PRECISION_WHOLE": 1,
+        "UnitOfTemperature": UnitOfTemperature,
     }.items():
         setattr(ha_const, name, value)
 
@@ -397,6 +403,57 @@ def load_sensor():
     return importlib.import_module("custom_components.bms_integration.sensor")
 
 
+class UnitOfTemperature(str, enum.Enum):
+    CELSIUS = "°C"
+    FAHRENHEIT = "°F"
+    KELVIN = "K"
+
+
+class ClimateEntityFeature(enum.IntFlag):
+    """Значения как в Home Assistant: у кондиционера на объекте features == 409."""
+
+    TARGET_TEMPERATURE = 1
+    TARGET_TEMPERATURE_RANGE = 2
+    TARGET_HUMIDITY = 4
+    FAN_MODE = 8
+    PRESET_MODE = 16
+    SWING_MODE = 32
+    AUX_HEAT = 64
+    TURN_OFF = 128
+    TURN_ON = 256
+    SWING_HORIZONTAL_MODE = 512
+
+
+class HVACMode(str, enum.Enum):
+    OFF = "off"
+    HEAT = "heat"
+    COOL = "cool"
+    HEAT_COOL = "heat_cool"
+    AUTO = "auto"
+    DRY = "dry"
+    FAN_ONLY = "fan_only"
+
+
+class HVACAction(str, enum.Enum):
+    OFF = "off"
+    HEATING = "heating"
+    COOLING = "cooling"
+    DRYING = "drying"
+    IDLE = "idle"
+    FAN = "fan"
+
+
+_CLIMATE_CONST = {
+    "HVACMode": HVACMode,
+    "HVACAction": HVACAction,
+    "ClimateEntityFeature": ClimateEntityFeature,
+    "PRESET_AWAY": "away",
+    "PRESET_ECO": "eco",
+    "PRESET_HOME": "home",
+    "PRESET_NONE": "none",
+}
+
+
 class CoverEntityFeature(enum.IntFlag):
     """Значения как в Home Assistant: у штор на объекте features == 15."""
 
@@ -411,6 +468,11 @@ class CoverEntityFeature(enum.IntFlag):
 
 
 _PLATFORM_EXTRAS = {
+    "climate": {
+        "DEFAULT_MIN_TEMP": 7,
+        "DEFAULT_MAX_TEMP": 35,
+        **_CLIMATE_CONST,
+    },
     "cover": {
         "ATTR_POSITION": "position",
         "ATTR_CURRENT_POSITION": "current_position",
@@ -449,5 +511,21 @@ def load_platform(name: str):
             **_PLATFORM_EXTRAS.get(name, {}),
         )
         setattr(components, name, stub)
+
+        if name == "climate":
+            # Платформа берёт часть имён из подмодуля .const, а не из пакета.
+            const_stub = _mk(f"{mod_name}.const", **_CLIMATE_CONST)
+            stub.const = const_stub
+            if "homeassistant.util.unit_system" not in sys.modules:
+                util = sys.modules.get("homeassistant.util") or _mk(
+                    "homeassistant.util"
+                )
+                sys.modules["homeassistant"].util = util
+                unit_system = _mk(
+                    "homeassistant.util.unit_system",
+                    US_CUSTOMARY_SYSTEM=object(),
+                    METRIC_SYSTEM=object(),
+                )
+                util.unit_system = unit_system
 
     return importlib.import_module(f"custom_components.bms_integration.{name}")
