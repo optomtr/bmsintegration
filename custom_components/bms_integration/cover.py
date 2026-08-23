@@ -14,6 +14,8 @@ from homeassistant.components.cover import (
     DEVICE_CLASSES_SCHEMA,
 )
 from homeassistant.const import CONF_DEVICE_CLASS
+from homeassistant.core import callback, CALLBACK_TYPE
+from homeassistant.helpers.event import async_call_later
 from .config_flow import col_to_select
 from .entity import LocalTuyaEntity, async_setup_entry
 from .const import (
@@ -41,6 +43,9 @@ STATE_STOPPED = "stopped"
 STATE_SET_CMD = "moving"
 STATE_SET_OPENING = "set_opeing"
 STATE_SET_CLOSING = "set_closing"
+# Состояния, в которых Home Assistant считает штору едущей и прячет часть
+# кнопок на карточке.
+MOVING_STATES = (STATE_OPENING, STATE_CLOSING, STATE_SET_OPENING, STATE_SET_CLOSING)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -126,6 +131,8 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
         self._gate_action_dp = self._config.get(CONF_GATE_ACTION_DP)
         self._gate_inverted = bool(self._config.get(CONF_GATE_INVERTED, False))
         self._current_task = None
+        self._movement_watchdog: CALLBACK_TYPE | None = None
+        self._movement_generation = 0
 
     @property
     def _has_gate_state_sensor(self):
@@ -488,9 +495,70 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
         if (self._state is not None) and (not self._device.is_connecting):
             self._last_state = self._state
 
+    async def async_added_to_hass(self):
+        """Зарегистрировать единственный хук отмены сторожа движения."""
+        await super().async_added_to_hass()
+        # Ровно один раз: Home Assistant вычищает список хуков только при
+        # удалении сущности, поэтому вешать его на каждое движение нельзя.
+        self.async_on_remove(self._cancel_movement_watchdog)
+
+    @callback
+    def _cancel_movement_watchdog(self) -> None:
+        if self._movement_watchdog is not None:
+            self._movement_watchdog()
+            self._movement_watchdog = None
+
+    @callback
+    def _arm_movement_watchdog(self) -> None:
+        """Ограничить время, которое штора считается едущей.
+
+        Датапоинт управления хранит ПОСЛЕДНЮЮ КОМАНДУ, а не состояние: мотор
+        давно стоит, а там всё ещё "close". Выйти из движения раньше можно
+        было только по позиции ровно 0 (закрытие) или ровно 100 (открытие) -
+        и если мотор считает позицию в обратную сторону или не доезжает до
+        края, штора оставалась «едет» навсегда. Home Assistant при этом прячет
+        стрелку, и управлять шторой из интерфейса становится нечем.
+
+        Полный ход мотора ограничен по времени, поэтому по его истечении
+        движение считается завершённым. Команду «стоп» при этом НЕ шлём: мы
+        всего лишь перестаём верить, что он едет.
+        """
+        self._cancel_movement_watchdog()
+        # Каждый ход получает свой номер: сторож прошлого хода, если он всё же
+        # успел сработать, не имеет права погасить уже начавшийся новый.
+        self._movement_generation += 1
+        generation = self._movement_generation
+        try:
+            span = float(self._config.get(CONF_SPAN_TIME, DEFAULT_SPAN_TIME))
+        except (TypeError, ValueError):
+            span = DEFAULT_SPAN_TIME
+        delay = span + COVER_TIMEOUT_TOLERANCE
+
+        @callback
+        def _movement_finished(_now):
+            if generation != self._movement_generation:
+                return
+            self._movement_watchdog = None
+            if self._current_state_action not in MOVING_STATES:
+                return
+            self.debug(
+                "Движение не завершилось за %.0f с - считаем штору остановившейся",
+                delay,
+            )
+            self._current_state_action = STATE_STOPPED
+            self.schedule_update_ha_state()
+
+        self._movement_watchdog = async_call_later(
+            self.hass, delay, _movement_finished
+        )
+
     def update_state(self, action, position=None):
         """Update cover current states."""
         if (state := self._current_state_action) == action:
+            if action in MOVING_STATES:
+                # Ту же команду нажали повторно: ход пошёл заново, значит и
+                # отсчёт сторожа должен начаться заново.
+                self._arm_movement_watchdog()
             return
 
         # using Commands.
@@ -519,6 +587,12 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
                     self._current_state_action = STATE_SET_CLOSING
             else:
                 self._current_state_action = STATE_STOPPED
+
+        if self._current_state_action in MOVING_STATES:
+            self._arm_movement_watchdog()
+        else:
+            self._cancel_movement_watchdog()
+
         # Write state data.
         self.schedule_update_ha_state()
 

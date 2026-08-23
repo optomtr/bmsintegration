@@ -22,6 +22,9 @@ DISPATCH_LOG: list = []
 TRACK_INTERVAL_LOG: list = []
 
 
+CALL_LATER_LOG: list = []
+
+
 def _mk(name: str, **attrs) -> types.ModuleType:
     mod = types.ModuleType(name)
     for key, val in attrs.items():
@@ -134,8 +137,18 @@ def install() -> None:
         TRACK_INTERVAL_LOG.append((action, interval))
         return lambda: None
 
+    # Отложенные вызовы запоминаются: тест может выстрелить ими вручную и
+    # проверить, что сторож действительно срабатывает, а не «вроде заведён».
+    CALL_LATER_LOG.clear()
+
     def async_call_later(hass, delay, action):
-        return lambda: None
+        entry = {"delay": delay, "action": action, "cancelled": False}
+        CALL_LATER_LOG.append(entry)
+
+        def cancel():
+            entry["cancelled"] = True
+
+        return cancel
 
     helpers.event = _mk(
         "homeassistant.helpers.event",
@@ -384,6 +397,28 @@ def load_sensor():
     return importlib.import_module("custom_components.bms_integration.sensor")
 
 
+class CoverEntityFeature(enum.IntFlag):
+    """Значения как в Home Assistant: у штор на объекте features == 15."""
+
+    OPEN = 1
+    CLOSE = 2
+    SET_POSITION = 4
+    STOP = 8
+    OPEN_TILT = 16
+    CLOSE_TILT = 32
+    STOP_TILT = 64
+    SET_TILT_POSITION = 128
+
+
+_PLATFORM_EXTRAS = {
+    "cover": {
+        "ATTR_POSITION": "position",
+        "ATTR_CURRENT_POSITION": "current_position",
+        "CoverEntityFeature": CoverEntityFeature,
+    },
+}
+
+
 def load_platform(name: str):
     """Загрузить платформу поверх заглушек (см. load_sensor).
 
@@ -411,6 +446,7 @@ def load_platform(name: str):
             DEVICE_CLASSES_SCHEMA=lambda value: value,
             STATE_CLASSES_SCHEMA=lambda value: value,
             **{entity_cls: _Entity},
+            **_PLATFORM_EXTRAS.get(name, {}),
         )
         setattr(components, name, stub)
 
