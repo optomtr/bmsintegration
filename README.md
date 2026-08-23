@@ -320,6 +320,11 @@ at the command level and never reaches the thermostat card, and it is sized by
 the device's own precision, not by the display step, so the hardware actually
 notices it.
 
+Turning the unit off stops the push: the return to the user's setpoint travels
+in the same packet as the off command, never after it. A setpoint write that
+lands after "off" is exactly what starts these air conditioners again, which
+looked to the owner like a unit that refuses to switch off.
+
 ## Install
 
 ### Manual

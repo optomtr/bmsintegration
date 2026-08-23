@@ -60,6 +60,8 @@ def make_climate(nudge=True, target=22, min_temp=16, max_temp=30, step=1):
     entity._nudge_task = None
     entity._nudge_desired = None
     entity._nudge_in_progress = False
+    entity._nudge_stop = asyncio.Event()
+    entity._nudge_pushed = False
     entity._has_presets = False
     entity._preset_mode = None
     entity._swing_v_mode_dp = None
@@ -179,6 +181,106 @@ class NudgeOnCommand(unittest.IsolatedAsyncioTestCase):
         await climate.async_set_fan_mode("high")
         await settle(climate)
         self.assertEqual(climate._device.sent, [("5", "high"), ("2", 23), ("2", 22)])
+
+
+class NoSignalAfterOff(unittest.IsolatedAsyncioTestCase):
+    """Выключение обязано быть последним словом.
+
+    Толчок живёт в фоне. Если его не остановить, возврат уставки уходит уже
+    после команды «выключить» - а именно смена уставки и заводит эти
+    кондиционеры. Клиент нажимает «выкл», и техника через секунду запускается
+    снова.
+    """
+
+    async def _turn_on_and_freeze_mid_nudge(self, climate):
+        """Довести толчок до паузы между толчком и возвратом."""
+        await climate.async_turn_on()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        self.assertTrue(climate._nudge_pushed, "толчок не успел уйти - тест бесполезен")
+
+    async def test_off_carries_the_setpoint_back_in_one_packet(self):
+        climate_mod.NUDGE_SETTLE_SECONDS = 30
+        try:
+            climate = make_climate(target=22)
+            await self._turn_on_and_freeze_mid_nudge(climate)
+
+            await climate.async_turn_off()
+            await settle(climate)
+        finally:
+            climate_mod.NUDGE_SETTLE_SECONDS = 0
+
+        self.assertEqual(
+            climate._device.sent,
+            [("1", True), ("2", 23), ("1", False), ("2", 22)],
+            "возврат уставки должен уехать вместе с «выкл», а не после него",
+        )
+
+    async def test_nothing_reaches_the_device_after_off(self):
+        climate_mod.NUDGE_SETTLE_SECONDS = 30
+        try:
+            climate = make_climate(target=22)
+            await self._turn_on_and_freeze_mid_nudge(climate)
+
+            await climate.async_turn_off()
+            after_off = len(climate._device.sent)
+            await settle(climate)
+        finally:
+            climate_mod.NUDGE_SETTLE_SECONDS = 0
+
+        self.assertEqual(
+            len(climate._device.sent),
+            after_off,
+            "после «выкл» устройство получило ещё одну команду - оно включится обратно",
+        )
+
+    async def test_hvac_off_stops_the_nudge_too(self):
+        """Кнопка на карточке термостата шлёт режим OFF, а не turn_off."""
+
+        class Modes:
+            names = []
+
+            def to_tuya(self, value):
+                return value
+
+        climate_mod.NUDGE_SETTLE_SECONDS = 30
+        try:
+            climate = make_climate(target=22)
+            climate._hvac_mode_set = Modes()
+            await self._turn_on_and_freeze_mid_nudge(climate)
+
+            await climate.async_set_hvac_mode(climate_mod.HVACMode.OFF)
+            after_off = len(climate._device.sent)
+            await settle(climate)
+        finally:
+            climate_mod.NUDGE_SETTLE_SECONDS = 0
+
+        self.assertEqual(
+            climate._device.sent,
+            [("1", True), ("2", 23), ("1", False), ("2", 22)],
+            "режим OFF должен так же унести возврат уставки с собой",
+        )
+        self.assertEqual(
+            len(climate._device.sent), after_off, "после OFF ушла лишняя команда"
+        )
+
+    async def test_a_quiet_off_sends_only_off(self):
+        """Толчка в полёте нет - и лишней уставки в пакете быть не должно."""
+        climate = make_climate(target=22)
+        await climate.async_turn_off()
+
+        self.assertEqual(climate._device.sent, [("1", False)])
+
+    async def test_the_next_switch_on_is_nudged_again(self):
+        """Остановка толчка не должна выключать саму галочку навсегда."""
+        climate = make_climate(target=22)
+        await climate.async_turn_off()
+        climate._device.sent.clear()
+
+        await climate.async_turn_on()
+        await settle(climate)
+
+        self.assertEqual(climate._device.sent, [("1", True), ("2", 23), ("2", 22)])
 
 
 if __name__ == "__main__":

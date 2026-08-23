@@ -226,6 +226,9 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
         self._nudge_task: asyncio.Task | None = None
         self._nudge_desired = None
         self._nudge_in_progress = False
+        self._nudge_stop = asyncio.Event()
+        # Толчок уже ушёл, а возврат ещё нет: на устройстве стоит чужая уставка.
+        self._nudge_pushed = False
         self._current_temperature = None
         self._hvac_mode: HVACMode | None = None
         self._hvac_action: HVACAction | None = None
@@ -491,16 +494,21 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
         )
         self._nudge_after_command()
 
-    async def _async_send_target(self, temperature):
-        """Отправить уставку в единицах и шаге самого устройства."""
+    def _target_payload(self, temperature) -> dict:
+        """Уставка в единицах и шаге самого устройства, готовая к отправке."""
         if self._target_temp_forced_to_celsius:
             # Revert Temperature to Fahrenheit it was forced to celsius
             temperature = round(c_to_f(temperature))
 
-        await self._device.set_dp(
-            round(temperature / self._precision_target),
-            self._config[CONF_TARGET_TEMPERATURE_DP],
-        )
+        return {
+            self._config[CONF_TARGET_TEMPERATURE_DP]: round(
+                temperature / self._precision_target
+            )
+        }
+
+    async def _async_send_target(self, temperature):
+        """Отправить уставку в единицах и шаге самого устройства."""
+        await self._device.set_dps(self._target_payload(temperature))
 
     def _nudge_after_command(self, desired=None) -> None:
         """Толкнуть уставку вслед за командой, не задерживая саму команду.
@@ -526,6 +534,7 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
 
         # Более свежая команда важнее: к её цели вернётся и уже запущенный толчок.
         self._nudge_desired = desired
+        self._nudge_stop.clear()
         if self._nudge_task is not None and not self._nudge_task.done():
             return
         self._nudge_task = self.hass.async_create_task(self._async_nudge_target())
@@ -547,18 +556,24 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
                 )
                 return
 
+            if self._nudge_stop.is_set():
+                # Успели выключить, пока толчок ждал очереди.
+                return
+
             self._nudge_in_progress = True
             self._target_temperature = desired
             self.schedule_update_ha_state()
             try:
                 await self._async_send_target(nudged)
-                await asyncio.sleep(NUDGE_SETTLE_SECONDS)
-                # Перечитываем: пока мы ждали, человек мог выставить другую.
-                desired = self._nudge_desired
-                await self._async_send_target(desired)
-                # Отчёт с промежуточным числом приходит уже после возврата -
-                # поэтому не верим отчётам об уставке ещё немного.
-                await asyncio.sleep(NUDGE_QUIET_SECONDS)
+                self._nudge_pushed = True
+                if await self._async_nudge_wait(NUDGE_SETTLE_SECONDS):
+                    # Перечитываем: пока мы ждали, человек мог выставить другую.
+                    desired = self._nudge_desired
+                    await self._async_send_target(desired)
+                    self._nudge_pushed = False
+                    # Отчёт с промежуточным числом приходит уже после возврата -
+                    # поэтому не верим отчётам об уставке ещё немного.
+                    await self._async_nudge_wait(NUDGE_QUIET_SECONDS)
             except asyncio.CancelledError:
                 raise
             except Exception as ex:  # pylint: disable=broad-except
@@ -567,6 +582,39 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
                 self._nudge_in_progress = False
                 self._target_temperature = self._nudge_desired
             self.schedule_update_ha_state()
+
+    async def _async_nudge_wait(self, seconds: float) -> bool:
+        """Подождать, но проснуться сразу, если пришла команда «выключить».
+
+        Возвращает False, если толчок нужно бросить: возврат уставки уедет
+        вместе с самой командой выключения, отдельным пакетом его слать нельзя.
+        """
+        try:
+            await asyncio.wait_for(self._nudge_stop.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            return True
+        return False
+
+    def _nudge_payload_for_off(self) -> dict:
+        """Остановить толчок и отдать то, что нужно доложить в команду «выкл».
+
+        Толчок живёт в фоне, а выключение приходит от человека в любой момент.
+        Если отпустить фоновую задачу, она дошлёт уставку уже ПОСЛЕ «выкл» - а
+        именно смена уставки и заводит эти кондиционеры: клиент нажимает
+        «выключить», и техника через секунду запускается снова. Поэтому возврат
+        уставки уезжает одним пакетом с самой командой выключения.
+        """
+        self._nudge_stop.set()
+        if not self._nudge_pushed:
+            return {}
+
+        self._nudge_pushed = False
+        self._nudge_in_progress = False
+        desired = self._nudge_desired
+        if desired is None:
+            return {}
+        self._target_temperature = desired
+        return self._target_payload(desired)
 
     async def async_set_temperature(self, **kwargs):
         """Set new target temperature."""
@@ -597,6 +645,9 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
         elif hvac_mode == HVACMode.OFF:
             new_states[self._dp_id] = self._state_off
 
+        if hvac_mode == HVACMode.OFF:
+            new_states.update(self._nudge_payload_for_off())
+
         await self._device.set_dps(new_states)
         if hvac_mode != HVACMode.OFF:
             self._nudge_after_command()
@@ -608,7 +659,9 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
 
     async def async_turn_off(self) -> None:
         """Turn the entity off."""
-        await self._device.set_dp(self._state_off, self._dp_id)
+        states = {self._dp_id: self._state_off}
+        states.update(self._nudge_payload_for_off())
+        await self._device.set_dps(states)
 
     async def async_set_preset_mode(self, preset_mode):
         """Set new target preset mode."""
