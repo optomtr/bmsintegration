@@ -1,0 +1,41 @@
+# HACS показывает обновление только по GitHub Release, а не по main. Тег и
+# релиз ставит этот workflow: версию он берёт из manifest.json, чтобы она не
+# разъезжалась с тем, что увидит у себя пользователь.
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version from manifest
+        id: manifest
+        run: |
+          version=$(python3 -c "import json;print(json.load(open('custom_components/bms_integration/manifest.json'))['version'])")
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.manifest.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Релиз $TAG уже опубликован."
+            exit 0
+          fi
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --generate-notes
