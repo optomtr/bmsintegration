@@ -335,6 +335,23 @@ and a timeout (TimeoutError is an OSError too). The reason now reaches both
 the log and the availability journal, once per connect attempt rather than
 once per internal retry.
 
+### A gateway everyone depends on retries often enough to get back in
+
+The site outage had a second half. The gateway was only accepting connections
+in short windows; a probe every 5 seconds got in almost at once, while the
+integration - 60 seconds of backoff, doubled after a long outage - sampled
+once every two minutes and missed those windows for hours. The house came back
+because a connect attempt was made by hand at the right second, not because
+anything was repaired.
+
+A device other devices depend on now keeps a short retry interval instead of
+backing off to minutes: while it is down, so is everything behind it. A
+refused or unreachable connection also no longer costs three back-to-back
+attempts - the answer is instant and authoritative, and the burst was pure
+load on a gateway that was already choking. And when a gateway stays down for
+fifteen minutes, the integration says so, with the reason and with the one
+thing it cannot do itself: power-cycle the hardware.
+
 ## Install
 
 ### Manual

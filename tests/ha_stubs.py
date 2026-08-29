@@ -23,6 +23,7 @@ TRACK_INTERVAL_LOG: list = []
 
 
 CALL_LATER_LOG: list = []
+NOTIFICATIONS: dict = {}
 
 
 def _mk(name: str, **attrs) -> types.ModuleType:
@@ -247,6 +248,33 @@ def install() -> None:
     pkg.__spec__ = pkg_spec
     sys.modules["custom_components.bms_integration"] = pkg
 
+    _install_notifications()
+
+
+def _install_notifications() -> None:
+    """homeassistant.components.persistent_notification для координатора.
+
+    Регистрируется в install(), а не в загрузчике платформ: координатор
+    импортирует его напрямую, а платформы он не грузит.
+    """
+    components = sys.modules.get("homeassistant.components") or _mk(
+        "homeassistant.components"
+    )
+    sys.modules["homeassistant"].components = components
+    NOTIFICATIONS.clear()
+
+    def _notify_create(hass, message, title=None, notification_id=None):
+        NOTIFICATIONS[notification_id] = {"message": message, "title": title}
+
+    def _notify_dismiss(hass, notification_id):
+        NOTIFICATIONS.pop(notification_id, None)
+
+    components.persistent_notification = _mk(
+        "homeassistant.components.persistent_notification",
+        async_create=_notify_create,
+        async_dismiss=_notify_dismiss,
+    )
+
 
 def load_coordinator():
     install()
@@ -323,6 +351,7 @@ def load_sensor():
         "homeassistant.components"
     )
     sys.modules["homeassistant"].components = components
+
 
     class SensorEntity:
         _attr_device_class = None

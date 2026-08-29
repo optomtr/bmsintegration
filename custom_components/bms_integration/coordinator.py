@@ -15,6 +15,7 @@ from homeassistant.core import HomeAssistant, CALLBACK_TYPE, callback, State
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.const import CONF_ID, CONF_DEVICES, CONF_HOST, CONF_DEVICE_ID
+from homeassistant.components import persistent_notification
 from homeassistant.helpers.event import async_track_time_interval, async_call_later
 from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
@@ -59,6 +60,20 @@ RECONNECT_INTERVAL = timedelta(seconds=5)
 AVAILABILITY_GRACE_PERIOD = DEFAULT_GRACE_PERIOD
 STARTUP_AVAILABILITY_GRACE_PERIOD = DEFAULT_STARTUP_GRACE
 RECONNECT_BACKOFF_SECONDS = (1, 2, 5, 10, 20, 30, 60)
+# Пока шлюз не подключился, стоит вся установка: его дети сами не
+# подключаются и ждут его. Поэтому шлюзу нельзя разгоняться до двухминутной
+# паузы между попытками, как обычному устройству.
+#
+# На объекте это стоило суток простоя. Шлюз пускал к себе только короткими
+# окнами: опрос раз в 5 секунд входил почти сразу, а интеграция с шагом в две
+# минуты (60 с потолка, удвоенные за долгую недоступность) в эти окна не
+# попадала часами. Дом поднялся не потому, что починили шлюз, а потому что
+# попытку сделали в нужную секунду.
+GATEWAY_RECONNECT_MAX_SECONDS = 15
+# Сколько шлюз должен не подключаться, прежде чем сказать об этом человеку.
+# Перезагрузить железку по питанию интеграция не может - это единственное,
+# что тут остаётся сделать руками, и молчать об этом нельзя.
+GATEWAY_DOWN_NOTIFY_SECONDS = 15 * 60
 # How many commands in a row must fail before the shared transport is judged
 # broken. A gateway socket carries every sub-device behind it, so a single
 # child that stopped answering must not be able to reconnect the whole hub.
@@ -154,6 +169,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._health_check_lock = asyncio.Lock()
         self._health_check_failures = 0
         self._unsub_refresh: CALLBACK_TYPE | None = None
+        self._gateway_down_notified = False
         self._unsub_empty_status: CALLBACK_TYPE | None = None
         self._empty_status_delay = EMPTY_STATUS_RETRY_FIRST
         self._unsub_new_entity: CALLBACK_TYPE | None = None
@@ -246,6 +262,11 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             # The gateway recovers first; connecting it brings sub-devices back.
             return False
         return True
+
+    @property
+    def carries_dependents(self) -> bool:
+        """Есть ли устройства, которые без этого подключения не живут."""
+        return bool(self.sub_devices) or self._fake_gateway
 
     @property
     def is_sleep(self):
@@ -410,16 +431,18 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 )
                 self._last_disconnect_reason = reason
                 self._availability_report("connect_failed", reason)
-                give_up = (
-                    e.errno == errno.EHOSTUNREACH
-                    and not self._status
-                    and not self.is_sleep
-                )
+                # Мгновенный и однозначный отказ: повторять его подряд ещё
+                # дважды в пределах миллисекунд бессмысленно - ответ не
+                # изменится, а на железку это тройная нагрузка. Именно ею
+                # интеграция и била по шлюзу, который и так захлёбывался.
+                # Настойчивость - дело внешнего цикла переподключения, у него
+                # для этого есть пауза.
+                instant_refusal = e.errno in (errno.ECONNREFUSED, errno.EHOSTUNREACH)
                 # Одно сообщение на попытку подключения, а не на каждый из трёх
                 # повторов подряд: причина у них одна и та же.
-                if not self.is_sleep and (give_up or retry >= max_retries):
+                if not self.is_sleep and (instant_refusal or retry >= max_retries):
                     self.warning(f"Не удалось подключиться к {host} - {reason}")
-                if give_up:
+                if instant_refusal:
                     break
             except Exception as ex:  # pylint: disable=broad-except
                 await self.abort_connect()
@@ -996,6 +1019,46 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             return
         self._task_reconnect = asyncio.create_task(self._async_reconnect())
 
+    @property
+    def _gateway_notification_id(self) -> str:
+        return f"{DOMAIN}_gateway_down_{self._device_config.id}"
+
+    def _seconds_disconnected(self) -> float | None:
+        """Сколько секунд длится текущий обрыв, или None, если он не начат."""
+        if self._disconnect_started_at is None:
+            return None
+        return time.monotonic() - self._disconnect_started_at
+
+    def _notify_gateway_down(self, seconds_down: float) -> None:
+        """Сказать человеку, что шлюз не поднимается и нужны его руки.
+
+        Всё, что можно сделать программно, к этому моменту уже перепробовано:
+        попытки идут по кругу с коротким шагом. Перезагрузить железку по
+        питанию интеграция не может, а именно это обычно и помогает - значит
+        надо не молчать, а сказать. Молчание здесь и стоило суток простоя.
+        """
+        if self._gateway_down_notified or not self.carries_dependents:
+            return
+        self._gateway_down_notified = True
+        name = self._device_config.name
+        persistent_notification.async_create(
+            self.hass,
+            f"Шлюз «{name}» ({self._device_config.host}) не подключается "
+            f"{int(seconds_down // 60)} мин. Пока он молчит, не работают все "
+            f"{len(self.sub_devices)} устройств за ним.\n\n"
+            f"Причина последней попытки: {self._last_disconnect_reason or 'неизвестна'}.\n\n"
+            "Обычно помогает выключить шлюз из розетки на 15 секунд. "
+            "Если адрес шлюза меняется сам по себе, закрепите его в роутере.",
+            title="BMS: шлюз не отвечает",
+            notification_id=self._gateway_notification_id,
+        )
+
+    def _clear_gateway_down_notice(self) -> None:
+        if not self._gateway_down_notified:
+            return
+        self._gateway_down_notified = False
+        persistent_notification.async_dismiss(self.hass, self._gateway_notification_id)
+
     def _reconnect_delay(self, attempts: int) -> float:
         """Return the backoff delay before the next reconnect attempt."""
         scale = (
@@ -1011,6 +1074,9 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             # much shorter RECONNECT_INTERVAL: a device that has been offline
             # for hours was otherwise polled every 5 seconds forever.
             delay = max(RECONNECT_BACKOFF_SECONDS[-1], RECONNECT_INTERVAL.total_seconds())
+        if self.carries_dependents:
+            # Реже - значит дольше держать весь дом отключённым.
+            return min(delay, GATEWAY_RECONNECT_MAX_SECONDS)
         return scale * delay
 
     async def _async_reconnect(self):
@@ -1049,6 +1115,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                         await self._task_connect
 
                     if self.connected:
+                        self._clear_gateway_down_notice()
                         if not self.is_sleep and attempts > 0:
                             self.info(f"Reconnect succeeded on attempt: {attempts}")
                             self._availability_report(
@@ -1063,6 +1130,10 @@ class TuyaDevice(TuyaListener, ContextualLogger):
 
                     attempts += 1
                     self._consecutive_connection_failures = attempts
+                    if (down := self._seconds_disconnected()) is not None and (
+                        down >= GATEWAY_DOWN_NOTIFY_SECONDS
+                    ):
+                        self._notify_gateway_down(down)
                     await asyncio.sleep(self._reconnect_delay(attempts))
                 except asyncio.CancelledError:
                     # Only closing the device cancels this task. Any other
