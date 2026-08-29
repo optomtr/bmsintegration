@@ -397,12 +397,29 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 return
             except OSError as e:
                 await self.abort_connect()
-                if (
+                # Причина видна ВСЕГДА. Раньше логировалась ровно одна ошибка -
+                # EHOSTUNREACH, - а всё остальное уходило в тишину: отказ в
+                # соединении, обрыв, таймаут (TimeoutError - тоже OSError).
+                # На объекте это стоило суток простоя: шлюз отвечал "connection
+                # refused", а в журнале не было ни строки, только бесконечное
+                # "Trying to connect", и понять причину было нечем.
+                reason = (
+                    f"{errno.errorcode.get(e.errno, e.errno)}: {e}"
+                    if e.errno is not None
+                    else f"{type(e).__name__}: {e}"
+                )
+                self._last_disconnect_reason = reason
+                self._availability_report("connect_failed", reason)
+                give_up = (
                     e.errno == errno.EHOSTUNREACH
                     and not self._status
                     and not self.is_sleep
-                ):
-                    self.warning(f"Connection failed: {e}")
+                )
+                # Одно сообщение на попытку подключения, а не на каждый из трёх
+                # повторов подряд: причина у них одна и та же.
+                if not self.is_sleep and (give_up or retry >= max_retries):
+                    self.warning(f"Не удалось подключиться к {host} - {reason}")
+                if give_up:
                     break
             except Exception as ex:  # pylint: disable=broad-except
                 await self.abort_connect()

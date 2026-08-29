@@ -325,6 +325,16 @@ in the same packet as the off command, never after it. A setpoint write that
 lands after "off" is exactly what starts these air conditioners again, which
 looked to the owner like a unit that refuses to switch off.
 
+### A failed connection always says why
+
+A gateway changed address and started answering "connection refused". The
+whole house went down, and the log carried not one line about the cause -
+only "Trying to connect" forever. Exactly one error was logged, EHOSTUNREACH;
+everything else fell into silence, including a refused connection, a reset,
+and a timeout (TimeoutError is an OSError too). The reason now reaches both
+the log and the availability journal, once per connect attempt rather than
+once per internal retry.
+
 ## Install
 
 ### Manual
