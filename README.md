@@ -368,6 +368,21 @@ gateway's key. The real error text is also kept instead of being overwritten
 with "Sub device is not connected", which had left every child of a gateway
 showing the same line instead of what happened.
 
+### A busy gateway is not a broken one
+
+Each device counts its own failed commands, but the socket belongs to all of
+them: three unanswered replies from one lamp reset the shared session for every
+device behind the hub. During a sharp pass over a room the timeouts pile up at
+once, and the reset kills every command still in flight, which produces more
+failures. A reset causes a reset.
+
+Measured on site: one sharp pass over 36 lights produced 297 reply timeouts, 88
+closed sessions and 69 reconnects, and the lights stayed on. A live gateway is
+told from a dead one by fresh traffic - while it works through a queue it still
+answers its other children, and a dead one answers nobody. The shared socket is
+now left alone while anything has recently come through it; a genuinely broken
+transport is still reset at once, as before.
+
 ## Install
 
 ### Manual

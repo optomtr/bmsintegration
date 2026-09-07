@@ -78,6 +78,10 @@ GATEWAY_DOWN_NOTIFY_SECONDS = 15 * 60
 # broken. A gateway socket carries every sub-device behind it, so a single
 # child that stopped answering must not be able to reconnect the whole hub.
 COMMAND_FAILURES_BEFORE_RESET = 3
+# Насколько свежим должен быть удачный обмен по общему сокету, чтобы считать
+# шлюз живым, а не сломанным. Занятый шлюз отвечает соседям, пока наши ответы
+# стоят в очереди; мёртвый молчит всем.
+TRANSPORT_ALIVE_WINDOW = 10.0
 # The cloud is only a helper for key rotation, and a rotated key is rare. Ask
 # at most this often per device so an unreachable device cannot turn into a
 # steady stream of cloud requests.
@@ -764,11 +768,43 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             )
             return
 
+        # Три неполученных ответа подряд - это ещё не мёртвый сокет. На
+        # загруженном шлюзе это чаще всего очередь: десятки команд идут через
+        # одну Zigbee-рацию, и ответы опаздывают. Сброс общего сокета в такой
+        # момент убивает ВСЕ команды, которые в нём летят, и порождает новые
+        # неудачи - сброс вызывает сброс. На объекте так и было: один резкий
+        # проход по 36 лампам дал 297 таймаутов, 88 закрытых сессий и 69
+        # переподключений, а свет остался гореть.
+        if self._transport_recently_alive():
+            self._command_failures = 0
+            self.debug(
+                "Шлюз занят, а не сломан: по общему сокету только что был "
+                "успешный обмен - соединение не трогаем"
+            )
+            return
+
         self._command_failures = 0
         await self._async_reset_stale_connection(
             f"{COMMAND_FAILURES_BEFORE_RESET} commands in a row failed: {ex}",
             "command_failed",
         )
+
+    def _transport_recently_alive(self) -> bool:
+        """Был ли на общем сокете свежий успешный обмен.
+
+        Смотрим не на себя, а на всех, кто делит это соединение: пока шлюз
+        разгребает очередь, ответы соседям приходят как обычно. Если по сокету
+        только что шли данные - он живой, просто занят.
+        """
+        owner = self.gateway or self
+        newest = owner._last_successful_update_time
+        for sibling in owner.sub_devices.values():
+            other = sibling._last_successful_update_time
+            if other is not None and (newest is None or other > newest):
+                newest = other
+        if newest is None:
+            return False
+        return (time.monotonic() - newest) < TRANSPORT_ALIVE_WINDOW
 
     async def set_dp(self, state, dp_index):
         """Change value of a DP of the Tuya device."""
