@@ -464,10 +464,19 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
         """Send DPS in the background, restoring the state if it fails."""
         try:
             await self._device.set_dps(status)
+        except TimeoutError as ex:
+            # Ответ не пришёл - это НЕ отказ. Занятый шлюз выполняет команду и
+            # опаздывает с подтверждением. Откат здесь превращал удавшееся
+            # действие в неверный показ: на объекте свет фактически гас, а
+            # Home Assistant возвращал «включено» и оставался врать, потому что
+            # исправлять его было нечему - устройство ведь изменилось, просто
+            # промолчало. Держим ожидаемое значение и идём переспрашивать.
+            self.debug(f"Подтверждение не пришло, сверимся с устройством: {ex}")
+            self._device.schedule_status_verify()
         except Exception as ex:  # pylint: disable=broad-except
             self.warning(f"Optimistic command failed: {ex}")
-            # The device never changed, so it will not send a status update
-            # to correct us: roll the optimistic values back ourselves.
+            # Отказ, обрыв, закрытая сессия: устройство действительно не
+            # изменилось и поправить нас ему нечем - откатываемся сами.
             self._device.restore_optimistic_status(applied, previous)
 
     async def async_set_dps(self, status: dict, optimistic_status: dict | None = None):

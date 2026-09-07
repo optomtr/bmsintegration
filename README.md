@@ -383,6 +383,23 @@ answers its other children, and a dead one answers nobody. The shared socket is
 now left alone while anything has recently come through it; a genuinely broken
 transport is still reset at once, as before.
 
+### A missing acknowledgement is not a refusal
+
+Reported from the site, and it turned out to be the real complaint: "the light
+does switch off, the status in Home Assistant is wrong, the hub itself has no
+trouble". A busy Zigbee hub carries the command out and is late with the
+acknowledgement, or never sends one. The optimistic value was rolled back at
+that moment, which turned a successful action into a false display - and
+nothing could correct it afterwards, because the device had in fact changed and
+therefore had no update to send.
+
+A reply timeout now keeps the expected value and schedules one delayed
+verification per device, which asks the device for its real state once the
+queue has drained; asking immediately, per command, would only join the very
+jam that caused this. A genuine refusal - a reset, a closed session, a
+transport that is gone - still rolls back at once, because there the device
+really did not change.
+
 ## Install
 
 ### Manual

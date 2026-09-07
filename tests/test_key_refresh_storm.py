@@ -86,6 +86,7 @@ def make_subdevice(fail_with=None, gateway_key="sharedGatewayKey"):
     dev._consecutive_connection_failures = 0
     dev._task_shutdown_entities = None
     dev._unsub_empty_status = None
+    dev._unsub_status_verify = None
     dev._empty_status_delay = coordinator.EMPTY_STATUS_RETRY_FIRST
     dev._gateway_down_notified = False
     dev._pending_status = None

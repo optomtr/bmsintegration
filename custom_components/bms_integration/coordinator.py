@@ -82,6 +82,10 @@ COMMAND_FAILURES_BEFORE_RESET = 3
 # шлюз живым, а не сломанным. Занятый шлюз отвечает соседям, пока наши ответы
 # стоят в очереди; мёртвый молчит всем.
 TRANSPORT_ALIVE_WINDOW = 10.0
+# Через сколько после неподтверждённой команды спросить у устройства настоящее
+# состояние. Пауза нужна, чтобы шлюз успел разгрести очередь: спрашивать сразу
+# - значит добавить свой запрос в ту же пробку.
+STATUS_VERIFY_DELAY = 6.0
 # The cloud is only a helper for key rotation, and a rotated key is rare. Ask
 # at most this often per device so an unreachable device cannot turn into a
 # steady stream of cloud requests.
@@ -174,6 +178,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._health_check_failures = 0
         self._unsub_refresh: CALLBACK_TYPE | None = None
         self._gateway_down_notified = False
+        self._unsub_status_verify: CALLBACK_TYPE | None = None
         self._unsub_empty_status: CALLBACK_TYPE | None = None
         self._empty_status_delay = EMPTY_STATUS_RETRY_FIRST
         self._unsub_new_entity: CALLBACK_TYPE | None = None
@@ -707,6 +712,10 @@ class TuyaDevice(TuyaListener, ContextualLogger):
 
         self._cancel_empty_status_retry()
 
+        if self._unsub_status_verify is not None:
+            self._unsub_status_verify()
+            self._unsub_status_verify = None
+
         await self.abort_connect()
 
         if self.gateway:
@@ -788,6 +797,43 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             f"{COMMAND_FAILURES_BEFORE_RESET} commands in a row failed: {ex}",
             "command_failed",
         )
+
+    @callback
+    def schedule_status_verify(self) -> None:
+        """Переспросить у устройства настоящее состояние после команды без ответа.
+
+        Таймаут ответа - это «не услышал подтверждения», а не «команда не
+        прошла»: шлюз выполняет её и опаздывает с ответом. Раньше интерфейс в
+        этот момент откатывался на прежнее значение и оставался врать - свет
+        физически гас, а Home Assistant показывал «включено».
+
+        Сверка одна на устройство и с задержкой: если спросить сразу и за
+        каждую команду, десятки запросов встанут в ту же очередь, из-за
+        которой всё и случилось.
+        """
+        if self.is_closing:
+            return
+        if self._unsub_status_verify is not None:
+            self._unsub_status_verify()
+        self._unsub_status_verify = async_call_later(
+            self.hass, STATUS_VERIFY_DELAY, self._async_status_verify
+        )
+
+    async def _async_status_verify(self, _now) -> None:
+        self._unsub_status_verify = None
+        interface = self._interface
+        if self.is_closing or interface is None or not interface.is_connected:
+            return
+        try:
+            status = await interface.status(cid=self._node_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # pylint: disable=broad-except
+            self.debug(f"Сверка состояния не удалась: {ex}")
+            return
+        if status:
+            self.debug("Сверка состояния после неподтверждённой команды")
+            self.status_updated(status)
 
     def _transport_recently_alive(self) -> bool:
         """Был ли на общем сокете свежий успешный обмен.
@@ -1393,6 +1439,10 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._status.update(status)
         if self._status:
             self._cancel_empty_status_retry()
+
+        if self._unsub_status_verify is not None:
+            self._unsub_status_verify()
+            self._unsub_status_verify = None
         self._dispatch_status()
 
     @callback
@@ -1416,6 +1466,10 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             self._unsub_refresh = None
 
         self._cancel_empty_status_retry()
+
+        if self._unsub_status_verify is not None:
+            self._unsub_status_verify()
+            self._unsub_status_verify = None
 
         for subdevice in self.sub_devices.values():
             subdevice.disconnected("Gateway disconnected")
