@@ -352,6 +352,22 @@ load on a gateway that was already choking. And when a gateway stays down for
 fifteen minutes, the integration says so, with the reason and with the one
 thing it cannot do itself: power-cycle the hardware.
 
+### A gateway hiccup no longer sends every child to the cloud
+
+A site has 70 sub-devices behind one gateway. A sharp mass toggle disturbed
+the shared session for a moment, and every child then asked the Tuya cloud for
+a fresh local key: 82 failed handshakes produced 69 cloud round trips, each
+awaited inside a connect attempt, so recovery dragged on for tens of seconds.
+
+The key was never the problem. A sub-device runs on the gateway's
+already-validated session key and never opens a session with its own, so a
+failure caused by a gateway that was not up yet says nothing about the key. The
+cloud is now asked only when the error actually implicates it; a genuinely
+rotated key is still caught where it always was, by comparing against the
+gateway's key. The real error text is also kept instead of being overwritten
+with "Sub device is not connected", which had left every child of a gateway
+showing the same line instead of what happened.
+
 ## Install
 
 ### Manual

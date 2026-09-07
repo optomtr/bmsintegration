@@ -512,17 +512,35 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 self._clear_connect_task()
             except Exception as e:
                 if not (self._fake_gateway and "Not found" in str(e)):
-                    e = "Sub device is not connected" if self.is_subdevice else e
-                    self.warning(f"Handshake with {host} failed due to: {e}")
+                    # Настоящую причину сохраняем. Раньше её у дочерних
+                    # устройств затирали словами "Sub device is not connected",
+                    # и в карточке у всех детей шлюза стояла одна и та же
+                    # надпись вместо того, что произошло на самом деле.
+                    detail = str(e) or type(e).__name__
+                    reason = (
+                        f"Sub device is not connected: {detail}"
+                        if self.is_subdevice
+                        else detail
+                    )
+                    self.warning(f"Handshake with {host} failed due to: {reason}")
                     # Запомнить причину. Без этого устройство, которое ни разу
                     # не поднялось, показывало в панели пустую строку ошибки -
                     # на объекте так и было: 72 недоступных без единого слова о
                     # том, почему. Причина видна в карточке и попадает в отчёт.
-                    self._last_disconnect_reason = str(e)
-                    self._availability_report("handshake_failed", str(e))
+                    self._last_disconnect_reason = reason
+                    self._availability_report("handshake_failed", reason)
                     await self.abort_connect()
-                    if self.is_subdevice or "key" in str(e):
-                        # TODO: Add exceptions for pytuya.
+                    # В облако за ключом - только если дело действительно в
+                    # ключе. Дочернее устройство работает на УЖЕ проверенном
+                    # ключе сессии шлюза и своим ключом сессию не открывает,
+                    # поэтому неудача из-за неподнявшегося шлюза к ключу
+                    # отношения не имеет. Раньше сюда попадала ЛЮБАЯ неудача
+                    # ребёнка: на объекте с 70 детьми на одном шлюзе одна
+                    # заминка превращалась в 70 запросов к облаку Tuya, и
+                    # восстановление растягивалось на десятки секунд.
+                    # Настоящая смена ключа ловится не здесь, а сверкой с
+                    # ключом шлюза в _get_gateway().
+                    if "key" in detail:
                         update_localkey = True
             except:
                 if self._fake_gateway:
