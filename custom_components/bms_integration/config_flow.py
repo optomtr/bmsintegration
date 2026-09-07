@@ -1341,10 +1341,29 @@ async def validate_input(entry_runtime: HassLocalTuyaData, data):
     # If bypass handshake. otherwise raise failed to make handshake with device.
     # --- Cloud: We will use the DPS found on cloud if exists.
     # --- No cloud: user will have to input the DPS manually.
+    # У Zigbee-шлюза своих датапоинтов нет и быть не должно: он существует,
+    # чтобы носить на себе дочерние устройства, а его собственные показатели
+    # доступны только из облака. Отказ здесь не давал завести шлюз вообще - и
+    # на объекте девять хабов из десяти остались незаведёнными, а их роль
+    # исполняли случайные лампы. Хуже того, сторож соединений намеренно
+    # пропускает такие подменённые шлюзы, то есть за девятью соединениями из
+    # десяти не следил никто.
+    #
+    # Пускаем пустой список только когда устройство ОТВЕТИЛО (значит адрес и
+    # ключ верны) и на него ссылаются как на шлюз уже настроенные устройства.
+    # Просто «ничего не пришло» по-прежнему ошибка.
+    serves_subdevices = not cid and any(
+        dev.device_config.get(CONF_GATEWAY_ID) == dev_id
+        for dev in (d._device_config for d in localtuya_devices.values())
+    )
     if not detected_dps_device and not (
         (cloud_dp_codes or detected_dps) and bypass_handshake
     ):
-        raise EmptyDpsList
+        if not (serves_subdevices and error is None):
+            raise EmptyDpsList
+        logger.info(
+            "У шлюза нет собственных датапоинтов - это нормально, заводим как есть"
+        )
 
     logger.info("Total DPS: %s", detected_dps)
     if conf_protocol == "auto":

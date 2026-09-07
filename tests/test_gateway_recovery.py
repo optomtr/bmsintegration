@@ -57,6 +57,9 @@ def make_gateway(children=3):
     dev._unsub_status_verify = None
     dev._empty_status_delay = coordinator.EMPTY_STATUS_RETRY_FIRST
     dev._gateway_down_notified = False
+    dev._created_at = time.monotonic()
+    dev._last_report_key = None
+    dev._last_report_at = 0.0
     dev._pending_status = None
     dev._entities = []
     dev.dps_to_request = {}
@@ -104,9 +107,10 @@ def connect_attempts(dev, exc):
 
 
 class GatewayRetriesOftenEnough(unittest.TestCase):
-    def test_a_gateway_does_not_slow_down_to_minutes(self):
+    def test_a_fresh_outage_is_retried_often(self):
         """Ровно случай с объекта: редкий шаг не попадал в окна шлюза."""
         gw = make_gateway()
+        gw._disconnect_started_at = time.monotonic() - 10   # обрыв только что
         worst = max(gw._reconnect_delay(n) for n in range(1, 60))
         self.assertLessEqual(
             worst,
@@ -114,9 +118,26 @@ class GatewayRetriesOftenEnough(unittest.TestCase):
             f"шлюз уходит на паузу до {worst} с - за ней стоит весь дом",
         )
 
+    def test_a_long_dead_gateway_is_asked_less_often(self):
+        """Иначе мёртвый хаб забивает журнал: 80 одинаковых записей за 23 мин."""
+        gw = make_gateway()
+        gw._disconnect_started_at = (
+            time.monotonic() - coordinator.GATEWAY_FAST_RETRY_WINDOW - 60
+        )
+        delay = gw._reconnect_delay(10)
+        self.assertGreater(
+            delay, coordinator.GATEWAY_RECONNECT_MAX_SECONDS,
+            "давно лежащий шлюз всё ещё опрашивается с частотой свежего",
+        )
+        self.assertLessEqual(
+            delay, coordinator.GATEWAY_RECONNECT_SLOW_SECONDS,
+            "и при этом не медленнее прежних двух минут",
+        )
+
     def test_a_lone_device_still_backs_off(self):
         """Обычной железке частый опрос не нужен - это лишний трафик."""
         plain = make_plain_device()
+        plain._disconnect_started_at = time.monotonic() - 10
         worst = max(plain._reconnect_delay(n) for n in range(1, 60))
         self.assertGreater(
             worst,
@@ -128,6 +149,7 @@ class GatewayRetriesOftenEnough(unittest.TestCase):
         """«Шлюз понарошку» держит соединение всем - шаг у него тот же."""
         fake = make_gateway(children=0)
         fake._fake_gateway = True
+        fake._disconnect_started_at = time.monotonic() - 10
         self.assertTrue(fake.carries_dependents)
         worst = max(fake._reconnect_delay(n) for n in range(1, 60))
         self.assertLessEqual(worst, coordinator.GATEWAY_RECONNECT_MAX_SECONDS)

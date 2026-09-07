@@ -29,6 +29,7 @@ from homeassistant.helpers.event import async_call_later, async_track_time_inter
 from homeassistant.helpers.service import async_register_admin_service
 
 from .coordinator import (
+    BACKGROUND_VERIFY_SPACING,
     GATEWAY_WATCHDOG_INTERVAL,
     GATEWAY_WATCHDOG_STAGGER_SECONDS,
     HassLocalTuyaData,
@@ -309,8 +310,52 @@ async def async_setup(hass: HomeAssistant, config: dict):
         _LOGGER.debug(
             "Updating keys for device %s: %s %s", device_id, device_ip, product_key
         )
-        new_data[ATTR_UPDATED_AT] = str(int(time.time() * 1000))
+        stamp = str(int(time.time() * 1000))
+        new_data[ATTR_UPDATED_AT] = stamp
+
+        # Изменился только адрес - переводим живые объекты и обходимся без
+        # перезагрузки всей записи.
+        host_only = all(set(c) == {CONF_HOST} for c in changes.values())
+        entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+        if host_only and entry_data is not None:
+            moved = _relocate_devices(entry_data.devices, changes, device_ip)
+            if moved:
+                _applied_without_reload[entry.entry_id] = stamp
+                _LOGGER.info(
+                    "Адрес %s: переведено устройств без перезагрузки - %s",
+                    device_ip,
+                    moved,
+                )
+
         hass.config_entries.async_update_entry(entry, data=new_data)
+
+    def _relocate_devices(devices: dict, changes: dict, host: str) -> int:
+        """Перевести живые устройства на новый адрес и перекинуть ключи.
+
+        В hass.data устройства лежат под ключом с адресом внутри: сам адрес
+        для шлюза и "адрес_узел" для дочернего. Оставить старые ключи нельзя -
+        по ним потом ищут устройство при следующей смене адреса и при выгрузке.
+        """
+        def _key(dev, at_host: str) -> str:
+            # Шлюз лежит под голым адресом - и настоящий, и подменённый, хотя
+            # у подменённого в конфигурации узел есть. Ключ по узлу для него
+            # был бы чужим, и устройство потерялось бы в hass.data.
+            node = dev._device_config.node_id
+            if not node or dev.is_fake_gateway:
+                return at_host
+            return f"{at_host}_{node}"
+
+        moved = 0
+        for dev in list(devices.values()):
+            if dev.id not in changes:
+                continue
+            old_key = _key(dev, dev._device_config.host)
+            new_key = _key(dev, host)
+            hass.async_create_task(dev.async_apply_new_host(host))
+            if old_key != new_key and old_key in devices:
+                devices[new_key] = devices.pop(old_key)
+            moved += 1
+        return moved
 
     def _shutdown(event):
         """Clean up resources when shutting down."""
@@ -460,6 +505,42 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry):
     )
 
     return True
+
+
+async def _background_verify(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Медленно обходить устройства по кругу и сверять их состояние.
+
+    Толчок от устройства может потеряться, и тогда неверный показ висит
+    бесконечно: своего обновления устройство больше не пришлёт, а
+    периодического опроса в интеграции нет - на объекте scan_interval равен
+    нулю у всех 238 устройств. Обход идёт по одному устройству с паузой,
+    поэтому на общей рации шлюза он почти не заметен: полный круг по объекту
+    занимает около двадцати минут.
+    """
+    while True:
+        entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+        targets = (
+            [
+                dev
+                for dev in list(entry_data.devices.values())
+                if dev.connected and not dev.is_fake_gateway and not dev.is_closing
+            ]
+            if entry_data is not None
+            else []
+        )
+        if not targets:
+            await asyncio.sleep(BACKGROUND_VERIFY_SPACING * 10)
+            continue
+        for dev in targets:
+            await asyncio.sleep(BACKGROUND_VERIFY_SPACING)
+            if dev.is_closing or not dev.connected:
+                continue
+            try:
+                await dev.async_verify_status()
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:  # pylint: disable=broad-except
+                _LOGGER.debug("Фоновая сверка не удалась: %s", ex)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
@@ -742,6 +823,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     entry.async_on_unload(entry.add_update_listener(update_listener))
 
+    # Фоновая сверка: лечит расхождение показа, если толчок от устройства
+    # потерялся. Привязана к записи, поэтому снимается вместе с выгрузкой.
+    entry.async_create_background_task(
+        hass, _background_verify(hass, entry), f"{DOMAIN}-background-verify"
+    )
+
     async def _shutdown(event):
         """Clean up resources when shutting down."""
         await asyncio.gather(*[dev.close() for dev in connect_to_devices])
@@ -787,8 +874,21 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
         async_remove_panel(hass)
 
 
+# Записи, чьё последнее изменение уже применено на живых объектах. Смена
+# адреса переписывает конфигурацию, а любая запись в неё означает перезагрузку
+# всей интеграции - на объекте с 238 устройствами это минута простоя всего
+# дома из-за одного нового адреса по DHCP. Метка хранит ровно тот штамп
+# времени, который мы записали: чужое изменение её не подойдёт и перезагрузка
+# пройдёт как обычно.
+_applied_without_reload: dict[str, str] = {}
+
+
 async def update_listener(hass: HomeAssistant, config_entry: ConfigEntry):
     """Update listener."""
+    stamp = config_entry.data.get(ATTR_UPDATED_AT)
+    if stamp and _applied_without_reload.pop(config_entry.entry_id, None) == stamp:
+        _LOGGER.debug("Изменение уже применено на живых устройствах, без перезагрузки")
+        return
     await hass.config_entries.async_reload(config_entry.entry_id)
 
 

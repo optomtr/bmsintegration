@@ -70,6 +70,21 @@ RECONNECT_BACKOFF_SECONDS = (1, 2, 5, 10, 20, 30, 60)
 # попадала часами. Дом поднялся не потому, что починили шлюз, а потому что
 # попытку сделали в нужную секунду.
 GATEWAY_RECONNECT_MAX_SECONDS = 15
+# Лежащий шлюз спрашивать часто стоит недолго. Дальше это уже не помощь, а шум:
+# на объекте два мёртвых хаба дали 156 записей в журнал доступности за 23
+# минуты - около 5000 в сутки, при том что журнал ротируется на 2 МиБ и
+# настоящая диагностика из него вытесняется.
+GATEWAY_FAST_RETRY_WINDOW = 300
+GATEWAY_RECONNECT_SLOW_SECONDS = 60
+# Одно и то же событие с той же причиной пишется в журнал не чаще этого.
+AVAILABILITY_REPEAT_INTERVAL = 300.0
+# Пауза между фоновыми сверками состояния. Интеграция живёт на «толчках» от
+# устройств, периодического опроса нет ни у одного устройства на объекте
+# (scan_interval = 0 у всех 238). Потерянный толчок означает неверный показ
+# НАВСЕГДА - а этот хаб, как записано ниже, состаривает записи о детях в своей
+# LAN-таблице. Медленный обход по кругу лечит такие расхождения сам, по одному
+# устройству за раз, чтобы не толкаться в очереди на общей рации.
+BACKGROUND_VERIFY_SPACING = 5.0
 # Сколько шлюз должен не подключаться, прежде чем сказать об этом человеку.
 # Перезагрузить железку по питанию интеграция не может - это единственное,
 # что тут остаётся сделать руками, и молчать об этом нельзя.
@@ -177,6 +192,9 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._health_check_lock = asyncio.Lock()
         self._health_check_failures = 0
         self._unsub_refresh: CALLBACK_TYPE | None = None
+        self._created_at: float = time.monotonic()
+        self._last_report_key: tuple | None = None
+        self._last_report_at: float = 0.0
         self._gateway_down_notified = False
         self._unsub_status_verify: CALLBACK_TYPE | None = None
         self._unsub_empty_status: CALLBACK_TYPE | None = None
@@ -302,6 +320,18 @@ class TuyaDevice(TuyaListener, ContextualLogger):
     def _availability_report(self, event: str, reason: str = "", **extra):
         """Write a local availability report entry for troubleshooting."""
         now = time.monotonic()
+        # Одно и то же событие с той же причиной подряд - это не новая
+        # информация. Мёртвый шлюз давал 80 одинаковых записей за 23 минуты и
+        # вытеснял из журнала всё остальное: журнал ротируется на 2 МиБ, и
+        # разбирать в нём потом нечего. Разные события по-прежнему пишутся
+        # всегда - именно смена событий и есть картина обрыва.
+        key = (event, str(reason or ""))
+        if key == self._last_report_key and (
+            now - self._last_report_at
+        ) < AVAILABILITY_REPEAT_INTERVAL:
+            return
+        self._last_report_key = key
+        self._last_report_at = now
         last_success_age = (
             round(now - self._last_successful_update_time, 3)
             if self._last_successful_update_time is not None
@@ -798,6 +828,40 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             "command_failed",
         )
 
+    async def async_apply_new_host(self, host: str) -> None:
+        """Переехать на новый адрес, не перезагружая запись целиком.
+
+        Раньше смена адреса ЛЮБОГО устройства переписывала запись
+        конфигурации, а это перезагрузка всей интеграции: на объекте с 238
+        устройствами на десяти шлюзах один новый адрес по DHCP ронял весь дом
+        на минуту-полторы. Перевести нужно только само устройство и тех, кто
+        сидит на его соединении.
+        """
+        if self._device_config.host == host:
+            return
+        self.info(f"Адрес сменился: {self._device_config.host} -> {host}")
+        self._device_config.device_config[CONF_HOST] = host
+        self._device_config.host = host
+        for subdevice in self.sub_devices.values():
+            subdevice._device_config.device_config[CONF_HOST] = host
+            subdevice._device_config.host = host
+        # Соединение открыто на старый адрес: его надо пересоздать. Дети
+        # поднимутся вслед за шлюзом, у них общий сокет.
+        await self.abort_connect()
+        if self._interface is not None:
+            await self.close_interface()
+        self._ensure_reconnect_task()
+
+    async def close_interface(self) -> None:
+        """Закрыть текущее соединение, оставив устройство работающим."""
+        interface, self._interface = self._interface, None
+        if interface is None:
+            return
+        try:
+            await interface.close()
+        except Exception as ex:  # pylint: disable=broad-except
+            self.debug(f"Не удалось закрыть соединение: {ex}")
+
     @callback
     def schedule_status_verify(self) -> None:
         """Переспросить у устройства настоящее состояние после команды без ответа.
@@ -821,6 +885,10 @@ class TuyaDevice(TuyaListener, ContextualLogger):
 
     async def _async_status_verify(self, _now) -> None:
         self._unsub_status_verify = None
+        await self.async_verify_status()
+
+    async def async_verify_status(self) -> None:
+        """Спросить у устройства настоящее состояние и принять его."""
         interface = self._interface
         if self.is_closing or interface is None or not interface.is_connected:
             return
@@ -832,7 +900,6 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             self.debug(f"Сверка состояния не удалась: {ex}")
             return
         if status:
-            self.debug("Сверка состояния после неподтверждённой команды")
             self.status_updated(status)
 
     def _transport_recently_alive(self) -> bool:
@@ -1124,10 +1191,20 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         return f"{DOMAIN}_gateway_down_{self._device_config.id}"
 
     def _seconds_disconnected(self) -> float | None:
-        """Сколько секунд длится текущий обрыв, или None, если он не начат."""
-        if self._disconnect_started_at is None:
-            return None
-        return time.monotonic() - self._disconnect_started_at
+        """Сколько секунд устройство недоступно.
+
+        Отсчёт идёт от начала обрыва, а если устройство не поднималось НИ
+        РАЗУ с запуска - от появления самого объекта. Без этого шлюз, который
+        лежит с самого старта, отсчёт не начинал вовсе и молчал навсегда:
+        ровно тот случай, ради которого уведомление и делалось. На объекте
+        так и вышло - два хаба лежали больше получаса, 54 устройства
+        недоступны, уведомлений ноль.
+        """
+        if self._disconnect_started_at is not None:
+            return time.monotonic() - self._disconnect_started_at
+        if self._last_successful_update_time is None and not self.connected:
+            return time.monotonic() - self._created_at
+        return None
 
     def _notify_gateway_down(self, seconds_down: float) -> None:
         """Сказать человеку, что шлюз не поднимается и нужны его руки.
@@ -1175,7 +1252,13 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             # for hours was otherwise polled every 5 seconds forever.
             delay = max(RECONNECT_BACKOFF_SECONDS[-1], RECONNECT_INTERVAL.total_seconds())
         if self.carries_dependents:
-            # Реже - значит дольше держать весь дом отключённым.
+            # Пока обрыв свежий - часто: реже значит дольше держать весь дом
+            # отключённым. Но если шлюз лежит давно, частота уже ничего не
+            # даёт, а журнал забивает, поэтому переходим на редкий шаг -
+            # всё равно вчетверо чаще прежних двух минут.
+            down = self._seconds_disconnected()
+            if down is not None and down >= GATEWAY_FAST_RETRY_WINDOW:
+                return GATEWAY_RECONNECT_SLOW_SECONDS
             return min(delay, GATEWAY_RECONNECT_MAX_SECONDS)
         return scale * delay
 

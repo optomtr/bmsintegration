@@ -400,6 +400,37 @@ jam that caused this. A genuine refusal - a reset, a closed session, a
 transport that is gone - still rolls back at once, because there the device
 really did not change.
 
+### Findings from a 238-device site
+
+An audit of a site with 238 devices, 844 entities and ten gateways produced
+five fixes, two of them to work shipped days earlier.
+
+An address change no longer reloads the whole entry. Any device's new DHCP
+address used to rewrite the config entry, and a write to it reloads the
+integration: one lease renewal took all 238 devices down for a minute. The
+address is now applied to the live objects, only the affected gateway and its
+children reconnect, and the reload is skipped by a token.
+
+A gateway that has been down since startup is now counted as down. The outage
+timer only ever started for a device that had previously been connected, so the
+"gateway down for fifteen minutes" notice never fired for a hub that never came
+up at all - the very case it exists for. On the site two hubs were down for over
+half an hour, 54 devices were unavailable, and nothing was reported.
+
+A long-dead gateway is asked less often, and the availability journal no longer
+repeats itself. Two dead hubs were writing 156 identical entries every 23
+minutes - about 5000 a day against a journal that rotates at 2 MiB, which
+crowded out everything worth reading.
+
+A hub with no datapoints of its own can now be added as a device. Refusing it
+left nine of the site's ten gateways unconfigured, their role taken by arbitrary
+sub-devices - and the connection watchdog deliberately skips such stand-ins, so
+nine of ten sockets had nobody watching them.
+
+And a slow background sweep verifies devices in turn, one every few seconds.
+The integration is push-only by design, but a lost push means a wrong state
+forever, because the device has already changed and has nothing more to send.
+
 ## Install
 
 ### Manual
