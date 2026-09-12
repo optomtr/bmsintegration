@@ -507,6 +507,25 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry):
     return True
 
 
+def _entry_platforms(hass: HomeAssistant) -> list:
+    """Платформы записи.
+
+    Домен `infrared` появился в ядре только в 2026.4, а интеграция работает и
+    на более старых выпусках - минимальная поддерживаемая версия 2025.1. Жёсткая
+    зависимость сломала бы там запуск целиком, поэтому платформа добавляется
+    только если ядро её знает.
+    """
+    platforms = list(PLATFORMS.values())
+    try:
+        # Проверяем именно ядро, а не свой модуль: импорт своей платформы здесь
+        # выполнил бы её на старом Home Assistant и сломал бы запуск.
+        from homeassistant.components import infrared  # noqa: F401
+    except ImportError:
+        return platforms
+    platforms.append("infrared")
+    return platforms
+
+
 async def _background_verify(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Медленно обходить устройства по кругу и сверять их состояние.
 
@@ -654,7 +673,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     connect_to_devices = _setup_devices(entry.data[CONF_DEVICES])
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS.values())
+    await hass.config_entries.async_forward_entry_setups(
+        entry, _entry_platforms(hass)
+    )
 
     # Note: entry.async_on_unload items are called in LIFO order!
 
@@ -849,7 +870,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Assistant an entry was unloaded when some of its entities were still
     # live; the reload that followed then built a second set on top.
     unloaded = await hass.config_entries.async_unload_platforms(
-        entry, PLATFORMS.values()
+        entry, _entry_platforms(hass)
     )
     if not unloaded:
         _LOGGER.warning("Не удалось выгрузить платформы записи %s", entry.title)

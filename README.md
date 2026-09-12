@@ -451,6 +451,27 @@ A device whose entities are all command-only now connects on an empty status. A
 switch or a light still does not: there an empty answer means a rotated key or
 an error frame, and refusing is right.
 
+### The IR blaster is now an emitter Home Assistant can build on
+
+Home Assistant has an `infrared` entity domain: adapters publish an emitter, and
+brand integrations - Samsung Infrared, LG Infrared and the rest - put their own
+code databases on top of whichever emitter is available. Our blaster was
+invisible to them, because it was published as a `remote` entity, a different
+domain entirely. Asked to set up, Samsung Infrared aborted with `no_emitters`
+before its first question.
+
+A device configured with an IR remote now also gets an emitter entity. The core
+hands over a command as raw microsecond timings plus a carrier; the blaster
+speaks its own code instead - 16-bit durations, FastLZ-packed, base64 - so the
+translation between the two lives in `core/ir_codec.py`, tested both ways.
+
+The platform is added only where the core knows the domain, which arrived in
+2026.4; older installations, down to the supported 2025.1, are untouched.
+
+RF is not part of this. The `infrared` domain has no notion of radio frequency
+at all, and its consumers speak only IR, so RF buttons stay on the `remote`
+entity, where sending and learning already work.
+
 ## Install
 
 ### Manual
