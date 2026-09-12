@@ -521,8 +521,16 @@ def _entry_platforms(hass: HomeAssistant) -> list:
         # выполнил бы её на старом Home Assistant и сломал бы запуск.
         from homeassistant.components import infrared  # noqa: F401
     except ImportError:
-        return platforms
-    platforms.append("infrared")
+        pass
+    else:
+        platforms.append("infrared")
+
+    try:
+        from homeassistant.components import radio_frequency  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        platforms.append("radio_frequency")
     return platforms
 
 

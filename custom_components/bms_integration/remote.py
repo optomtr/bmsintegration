@@ -291,6 +291,37 @@ class LocalTuyaRemote(LocalTuyaEntity, RemoteEntity):
         for command in commands:
             await self._delete_command(device, command)
 
+    async def async_send_rf_raw(
+        self, code: str, frequency_hz: int, repeats: int = 6
+    ) -> None:
+        """Отправить РЧ-посылку с ЯВНО заданной частотой.
+
+        Путь заученных кнопок частоту достаёт из самого кода: там лежит
+        base64 с JSON, в котором есть study_feq. Для платформы
+        radio_frequency так нельзя - ядро отдаёт частоту отдельным полем, и
+        код у нас свой, без JSON. Молча отправить его как обычную кнопку
+        значило бы уехать на 433.92 даже тогда, когда просили 315.
+        """
+        commands = {NSDP_CONTROL: MODE_IR_TO_RF[ControlMode.SEND_IR]}
+        for attr, default_value in RF_DEFAULTS:
+            commands[attr] = default_value
+        # Частота у Tuya - мегагерцы строкой: 433920000 Гц -> "433.92".
+        commands[ATTR_STUDY_FREQ] = f"{frequency_hz / 1_000_000:g}"
+        commands[NSDP_KEY1] = {"code": code}
+        for attr, default_value in SEND_DEFAULTS:
+            commands[NSDP_KEY1][attr] = default_value
+        if repeats:
+            commands[NSDP_KEY1][ATTR_TIMES] = str(repeats)
+
+        if self._ir_control_type == ControlType.ENUM:
+            raise ServiceValidationError(
+                "Этот передатчик управляется перечислением и сырую РЧ-посылку "
+                "не принимает - пользуйтесь заученными кнопками"
+            )
+
+        self.debug(f"РЧ-посылка на {commands[ATTR_STUDY_FREQ]} МГц")
+        await self._device.set_dps({self._dp_id: json.dumps(commands)})
+
     async def send_signal(self, control, base64_code=None, rf=False):
         """Send command to the remote device."""
         rf_data = rf_decode_button(base64_code)

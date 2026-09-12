@@ -61,10 +61,14 @@ def install() -> None:
     class ServiceValidationError(HomeAssistantError):
         """Stub of homeassistant.exceptions.ServiceValidationError."""
 
+    class NoEntitySpecifiedError(HomeAssistantError):
+        """Stub of homeassistant.exceptions.NoEntitySpecifiedError."""
+
     ha.exceptions = _mk(
         "homeassistant.exceptions",
         HomeAssistantError=HomeAssistantError,
         ServiceValidationError=ServiceValidationError,
+        NoEntitySpecifiedError=NoEntitySpecifiedError,
     )
     ha.core = _mk(
         "homeassistant.core",
@@ -150,6 +154,21 @@ def install() -> None:
             entry["cancelled"] = True
 
         return cancel
+
+    # `import homeassistant.helpers.config_validation as cv` требует, чтобы
+    # helpers был пакетом, а подмодуль лежал в sys.modules.
+    helpers.__path__ = []
+    helpers.storage = _mk(
+        "homeassistant.helpers.storage",
+        Store=type("Store", (), {"__init__": lambda self, *a, **k: None}),
+    )
+    helpers.config_validation = _mk(
+        "homeassistant.helpers.config_validation",
+        string=str,
+        boolean=bool,
+        positive_int=int,
+        ensure_list=lambda v: v if isinstance(v, list) else [v],
+    )
 
     helpers.event = _mk(
         "homeassistant.helpers.event",
@@ -331,6 +350,8 @@ def load_sensor():
         "PRECISION_TENTHS": 0.1,
         "PRECISION_WHOLE": 1,
         "UnitOfTemperature": UnitOfTemperature,
+        "STATE_OFF": "off",
+        "STATE_ON": "on",
     }.items():
         setattr(ha_const, name, value)
 
@@ -496,7 +517,23 @@ class CoverEntityFeature(enum.IntFlag):
     SET_TILT_POSITION = 128
 
 
+class RemoteEntityFeature(enum.IntFlag):
+    LEARN_COMMAND = 1
+    DELETE_COMMAND = 2
+    ACTIVITY = 4
+
+
 _PLATFORM_EXTRAS = {
+    "remote": {
+        "ATTR_ACTIVITY": "activity",
+        "ATTR_COMMAND": "command",
+        "ATTR_COMMAND_TYPE": "command_type",
+        "ATTR_NUM_REPEATS": "num_repeats",
+        "ATTR_DELAY_SECS": "delay_secs",
+        "ATTR_DEVICE": "device",
+        "ATTR_TIMEOUT": "timeout",
+        "RemoteEntityFeature": RemoteEntityFeature,
+    },
     "climate": {
         "DEFAULT_MIN_TEMP": 7,
         "DEFAULT_MAX_TEMP": 35,

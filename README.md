@@ -468,9 +468,12 @@ translation between the two lives in `core/ir_codec.py`, tested both ways.
 The platform is added only where the core knows the domain, which arrived in
 2026.4; older installations, down to the supported 2025.1, are untouched.
 
-RF is not part of this. The `infrared` domain has no notion of radio frequency
-at all, and its consumers speak only IR, so RF buttons stay on the `remote`
-entity, where sending and learning already work.
+RF is covered too, by the second entity. Home Assistant keeps infrared and radio
+on two separate domains - `infrared` and `radio_frequency` - built the same way,
+and the blaster does both, so it publishes both. The difference that matters is
+the frequency: a learned RF button carries its own, but the core passes one as a
+separate field, and sending it the learned-button way would have put a 315 MHz
+request out on 433.92.
 
 ## Install
 
