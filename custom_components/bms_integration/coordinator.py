@@ -14,7 +14,14 @@ from typing import Any, NamedTuple
 from homeassistant.core import HomeAssistant, CALLBACK_TYPE, callback, State
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.const import CONF_ID, CONF_DEVICES, CONF_HOST, CONF_DEVICE_ID
+from homeassistant.const import (
+    CONF_ID,
+    CONF_DEVICES,
+    CONF_HOST,
+    CONF_DEVICE_ID,
+    CONF_PLATFORM,
+    Platform,
+)
 from homeassistant.components import persistent_notification
 from homeassistant.helpers.event import async_track_time_interval, async_call_later
 from homeassistant.helpers.dispatcher import (
@@ -306,6 +313,33 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         return False
 
     @property
+    def is_command_only(self) -> bool:
+        """Устройству нечего сообщать о себе - оно только отправляет команды.
+
+        ИК/РЧ-передатчик так и устроен: его датапоинты на запись, своего
+        состояния у него нет, и на запрос статуса он честно отвечает пустотой.
+        На объекте это кончалось тем, что пульт не подключался НИКОГДА -
+        соединение устанавливалось, устройство отвечало пустым статусом, и
+        рукопожатие объявлялось неудачным:
+
+            Connected attempt to detect the device DPS
+            Total DPS: {}
+            Handshake with 192.168.1.15 failed due to: Failed to retrieve status
+
+        Сущность при этом показывала "включено", а команды уйти не могли.
+        Проверено: ключ устройства совпадал с облачным, то есть пустой ответ
+        был не про расшифровку, а нормальным ответом такой железки.
+
+        Проверка узкая - только когда ВСЕ сущности устройства командные.
+        У выключателя или лампы пустой статус по-прежнему повод отказать:
+        там он означает либо сменившийся ключ, либо кадр с ошибкой.
+        """
+        entities = self._device_config.entities or []
+        return bool(entities) and all(
+            e.get(CONF_PLATFORM) == Platform.REMOTE for e in entities
+        )
+
+    @property
     def is_write_only(self):
         """Return if this sub-device is BLE. We uses 0 in manual dps as mark for BLE devices.
 
@@ -537,6 +571,11 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                         self.debug(
                             "Sub-device gave no initial status; keeping the "
                             "shared gateway session"
+                        )
+                    elif self.is_command_only:
+                        self.debug(
+                            "Устройство только отправляет команды и своего "
+                            "состояния не имеет - пустой ответ это норма"
                         )
                     else:
                         raise Exception("Failed to retrieve status")

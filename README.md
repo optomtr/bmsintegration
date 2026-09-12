@@ -431,6 +431,26 @@ And a slow background sweep verifies devices in turn, one every few seconds.
 The integration is push-only by design, but a lost push means a wrong state
 forever, because the device has already changed and has nothing more to send.
 
+### A remote has nothing to report, and that is not a reason to refuse it
+
+From a site: `remote.ir_rf_remote_control` showed "on" while no command could
+ever leave, because the device never connected at all. The log named it - the
+connection was made, the device answered the status query with nothing, and the
+handshake was then declared failed:
+
+    Connected attempt to detect the device DPS
+    Total DPS: {}
+    Handshake with 192.168.1.15 failed due to: Failed to retrieve status
+
+That is how an IR/RF blaster is built: its datapoints are write-only and it has
+no state of its own, so an empty answer is the correct one. The device's key was
+checked against the cloud and matched, which rules out the decryption failure
+the refusal exists to catch.
+
+A device whose entities are all command-only now connects on an empty status. A
+switch or a light still does not: there an empty answer means a rotated key or
+an error frame, and refusing is right.
+
 ## Install
 
 ### Manual
