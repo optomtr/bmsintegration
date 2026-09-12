@@ -93,11 +93,12 @@ class TuyaRadioFrequencyTransmitter(_Transmitter):
                 "проверьте, что оно на связи"
             )
 
-        timings = [
-            interval
-            for timing in command.get_raw_timings()
-            for interval in (timing.high_us, -timing.low_us)
-        ]
+        # Плоский список знаковых чисел: плюс - импульс, минус - пауза, всё в
+        # микросекундах (так объявлено в infrared_protocols). Образец в блоге
+        # разработчиков показывает объекты с high_us/low_us - он устарел, и
+        # дословно взятый оттуда код падал прямо при нажатии кнопки:
+        # "'int' object has no attribute 'high_us'".
+        timings = list(command.get_raw_timings())
         if not timings:
             raise HomeAssistantError("Пустая команда: передавать нечего")
 
