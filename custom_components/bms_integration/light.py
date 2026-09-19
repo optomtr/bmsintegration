@@ -647,7 +647,29 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
             )
             brightness = max(brightness, self._lower_brightness)
 
-            if self.is_color_mode and self._hs is not None:
+            # Куда писать яркость, решает ЦЕЛЕВОЙ режим вызова, а не текущий
+            # режим лампы. Если в том же вызове есть цвет, температура или
+            # белый, режим задаёт та ветка ниже - и яркость она пишет сама, в
+            # своём режиме: в V цвета или в DP яркости белого. Раньше эта ветка
+            # смотрела на текущий режим и клала своё, а ветка ниже - своё, и
+            # лампе в одной посылке велели быть и цветной, и белой.
+            #
+            # С объекта: Moes ZB-TDA14 через шлюз, переходы «Лаунж -> Уют» и
+            # вечерний график не переводили цвет в белый (яркость +
+            # температура). Тем же путём ломались ещё два сочетания: яркость +
+            # white из цвета слала colour_data с режимом white, а яркость +
+            # цвет из белого - лишнюю белую яркость в цветную команду.
+            target_mode_set_below = (
+                (ATTR_HS_COLOR in kwargs and ColorMode.HS in color_modes)
+                or (
+                    ATTR_COLOR_TEMP_KELVIN in kwargs
+                    and ColorMode.COLOR_TEMP in color_modes
+                )
+                or (ATTR_WHITE in kwargs and ColorMode.WHITE in color_modes)
+            )
+            if target_mode_set_below:
+                pass
+            elif self.is_color_mode and self._hs is not None:
                 states[self._config.get(CONF_COLOR)] = self.__to_color(
                     self._hs, brightness
                 )

@@ -498,6 +498,20 @@ cloud which groups a device belongs to and returns the raw answer, to see
 whether it carries the group's local id; `group_send` sends one group command
 through a member lamp's gateway socket, in either framing.
 
+### Brightness follows the mode the call asks for, not the one the lamp is in
+
+Reported from a site with a local fix: from colour mode, a single `light.turn_on`
+carrying both brightness and a colour temperature left the lamp in colour. The
+brightness branch looked at the lamp's current mode and wrote `colour_data` with
+the colour mode; the temperature branch then wrote DP 3/4 with the white mode,
+so one frame told the lamp to be both. Reviewing that fix turned up two more
+calls with the same root: brightness plus `white` from colour sent `colour_data`
+with the white mode, and brightness plus a colour from white sent a stray white
+brightness inside a colour command. When the call also sets a colour, a
+temperature or white, that branch now writes the brightness itself, in its own
+mode; the brightness branch acts on the current mode only when brightness is all
+that was asked.
+
 ## Install
 
 ### Manual
