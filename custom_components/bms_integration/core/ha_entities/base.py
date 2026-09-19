@@ -222,6 +222,9 @@ class DPCode(StrEnum):
     COLLECTION_MODE = "collection_mode"
     COLOR_DATA_V2 = "color_data_v2"
     COLOUR_DATA = "colour_data"  # Colored light mode
+    # Цвет адресных («dream color») лент и SPI-контроллеров: двоичный HSV в
+    # base64. Такие контроллеры заодно несут и colour_data, но игнорируют его.
+    PAINT_COLOUR_DATA = "paint_colour_data"
     COLOUR_DATA_HSV = "colour_data_hsv"  # Colored light mode
     COLOUR_DATA_RAW = "colour_data_raw"  # Colored light mode for BLE
     COLOUR_DATA_V2 = "colour_data_v2"  # Colored light mode

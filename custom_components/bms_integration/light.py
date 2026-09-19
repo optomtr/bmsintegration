@@ -42,6 +42,15 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Стандартный датапоинт Tuya для цвета адресных лент (paint_colour_data).
+PAINT_COLOUR_DP = "61"
+# Число сегментов, если устройство своё ещё не сообщило. 0x14 - то, что
+# держал контроллер GLEDOPTO SPI на объекте.
+PAINT_DEFAULT_SEGMENTS = 0x14
+# Режим закраски в заголовке: 1 - цвет (HSV), 0 - белый.
+PAINT_MODE_COLOUR = 0x01
+
+
 DEFAULT_MIN_KELVIN = 2700  # MIRED 370
 DEFAULT_MAX_KELVIN = 6500  # MIRED 153
 
@@ -250,8 +259,12 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
             self._config.get(CONF_COLOR_TEMP_MAX_KELVIN, DEFAULT_MAX_KELVIN)
         )
 
+        self._paint_segments = PAINT_DEFAULT_SEGMENTS
         self.__to_color = self.__to_color_common
         self.__from_color = self.__from_color_common
+        if self.__is_paint_colour():
+            self.__to_color = self.__to_color_paint
+            self.__from_color = self.__from_color_paint
 
     def connection_made(self):
         """The connection has made with the device and status retrieved, Configure the entity based on its reserved status."""
@@ -278,7 +291,10 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
         if self.has_config(CONF_COLOR):
             color_data = self.dp_value(CONF_COLOR)
-            if is_write_only and not color_data:
+            if self.__is_paint_colour():
+                self.__to_color = self.__to_color_paint
+                self.__from_color = self.__from_color_paint
+            elif is_write_only and not color_data:
                 self.__to_color = self.__to_color_raw
                 self.__from_color = self.__from_color_raw
             else:
@@ -464,6 +480,55 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
             if self.has_config(CONF_COLOR_MODE)
             else self._modes.white
         )
+
+    def __is_paint_colour(self) -> bool:
+        """Цвет задаётся форматом адресных лент (paint_colour_data).
+
+        У контроллеров адресных лент - на объекте это GLEDOPTO SPI - цвет
+        живёт не в colour_data (DP 5), а в paint_colour_data (DP 61), и формат
+        там свой, двоичный. DP 5 такие контроллеры несут, но игнорируют: цвет
+        «ставился» только на экране Home Assistant по оптимистичному значению,
+        а лента оставалась прежней.
+        """
+        return str(self._config.get(CONF_COLOR)) == PAINT_COLOUR_DP
+
+    def __to_color_paint(self, hs, brightness):
+        """HS и яркость -> paint_colour_data.
+
+        Раскладка по документации Tuya для адресных лент, проверена на
+        железе байт в байт:
+            00        версия
+            01        режим: цвет
+            00        эффект: нет
+            NN        число сегментов - берём то, что сообщило устройство
+            00        закраска: вся лента («заливка»)
+            HHHH      оттенок 0-360
+            SSSS      насыщенность 0-1000
+            VVVV      яркость 0-1000
+        """
+        hue = max(0, min(360, round(hs[0])))
+        sat = max(0, min(1000, round(hs[1] * 10)))
+        val = max(0, min(1000, round(brightness * 1000 / self._upper_brightness)))
+        head = bytes([0x00, PAINT_MODE_COLOUR, 0x00, self._paint_segments, 0x00])
+        body = hue.to_bytes(2, "big") + sat.to_bytes(2, "big") + val.to_bytes(2, "big")
+        return base64.b64encode(head + body).decode("ascii")
+
+    def __from_color_paint(self, color):
+        """paint_colour_data -> HS и яркость."""
+        data = base64.b64decode(color)
+        if len(data) < 11:
+            raise ValueError(f"paint_colour_data слишком короткий: {len(data)} байт")
+        # Число сегментов запоминаем, чтобы вернуть его устройству как есть.
+        self._paint_segments = data[3]
+        if data[1] not in (1, 2):
+            # Белый режим или комбинация цветов: HS отсюда не взять, а белый
+            # берётся из своих датапоинтов яркости и температуры.
+            return
+        hue = int.from_bytes(data[5:7], "big")
+        sat = int.from_bytes(data[7:9], "big")
+        val = int.from_bytes(data[9:11], "big")
+        self._hs = [hue, sat / 10]
+        self._brightness = val * self._upper_brightness / 1000
 
     def __to_color_raw(self, hs, brightness):
         return base64.b64encode(

@@ -475,6 +475,18 @@ the frequency: a learned RF button carries its own, but the core passes one as a
 separate field, and sending it the learned-button way would have put a 315 MHz
 request out on 433.92.
 
+### Addressable strips take their colour from paint_colour_data
+
+From a site: a GLEDOPTO SPI controller would not turn blue. Home Assistant showed
+blue while the strip stayed as it was, because the colour went to `colour_data`
+(DP 5), the format of ordinary RGB bulbs. Addressable-strip controllers carry
+that datapoint and ignore it; their colour lives in `paint_colour_data` (DP 61),
+a binary HSV frame in base64. The layout was confirmed on the hardware byte for
+byte - a hand-sent frame turned the strip blue - and is now encoded and decoded
+by the light platform whenever the colour datapoint is 61. Auto-configure puts
+`paint_colour_data` first for strip and string lights, since the first matching
+code wins and these controllers also expose DP 5.
+
 ## Install
 
 ### Manual

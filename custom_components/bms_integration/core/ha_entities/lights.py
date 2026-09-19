@@ -64,7 +64,7 @@ LIGHTS: dict[str, tuple[LocalTuyaEntity, ...]] = {
             color_mode=DPCode.WORK_MODE,
             brightness=DPCode.BRIGHT_VALUE,
             color_temp=DPCode.TEMP_VALUE,
-            color=DPCode.COLOUR_DATA,
+            color=(DPCode.PAINT_COLOUR_DATA, DPCode.COLOUR_DATA),
             custom_configs=localtuya_light(29, 1000, 2700, 6500, False, False),
         ),
     ),
@@ -77,7 +77,9 @@ LIGHTS: dict[str, tuple[LocalTuyaEntity, ...]] = {
             color_mode=DPCode.WORK_MODE,
             brightness=(DPCode.BRIGHT_VALUE_V2, DPCode.BRIGHT_VALUE),
             color_temp=(DPCode.TEMP_VALUE_V2, DPCode.TEMP_VALUE),
-            color=(DPCode.COLOUR_DATA_V2, DPCode.COLOUR_DATA),
+            # paint первым: адресные ленты несут и colour_data, но цвет берут
+            # только из paint_colour_data - иначе цвет «ставится» лишь на экране.
+            color=(DPCode.PAINT_COLOUR_DATA, DPCode.COLOUR_DATA_V2, DPCode.COLOUR_DATA),
             scene=(DPCode.SCENE_DATA_V2, DPCode.SCENE_DATA),
             custom_configs=localtuya_light(29, 1000, 2700, 6500, False, False),
             # default_color_type=DEFAULT_COLOR_TYPE_DATA_V2,
@@ -92,7 +94,12 @@ LIGHTS: dict[str, tuple[LocalTuyaEntity, ...]] = {
             color_mode=DPCode.WORK_MODE,
             brightness=(DPCode.BRIGHT_VALUE_V2, DPCode.BRIGHT_VALUE),
             color_temp=(DPCode.TEMP_VALUE_V2, DPCode.TEMP_VALUE),
-            color=(DPCode.COLOUR_DATA_V2, DPCode.COLOUR_DATA, DPCode.COLOUR_DATA_RAW),
+            color=(
+                DPCode.PAINT_COLOUR_DATA,
+                DPCode.COLOUR_DATA_V2,
+                DPCode.COLOUR_DATA,
+                DPCode.COLOUR_DATA_RAW,
+            ),
             scene=(DPCode.SCENE_DATA_V2, DPCode.SCENE_DATA, DPCode.SCENE_DATA_RAW),
             custom_configs=localtuya_light(29, 1000, 2700, 6500, False, True),
         ),

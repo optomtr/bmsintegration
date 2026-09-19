@@ -268,6 +268,26 @@ def install() -> None:
     sys.modules["custom_components.bms_integration"] = pkg
 
     _install_notifications()
+    _install_util()
+
+
+def _install_util() -> None:
+    """homeassistant.util.color для платформы света.
+
+    Подставляем настоящую формулу HSV -> RGB из colorsys, а не заглушку:
+    тест обязан видеть то же число, что увидит лампа.
+    """
+    import colorsys
+
+    util = sys.modules.get("homeassistant.util") or _mk("homeassistant.util")
+    util.__path__ = []
+    sys.modules["homeassistant"].util = util
+
+    def color_hsv_to_RGB(h, s, v):
+        r, g, b = colorsys.hsv_to_rgb(h / 360, s / 100, v / 100)
+        return round(r * 255), round(g * 255), round(b * 255)
+
+    util.color = _mk("homeassistant.util.color", color_hsv_to_RGB=color_hsv_to_RGB)
 
 
 def _install_notifications() -> None:
@@ -351,6 +371,9 @@ def load_sensor():
         "PRECISION_WHOLE": 1,
         "UnitOfTemperature": UnitOfTemperature,
         "STATE_OFF": "off",
+        "CONF_BRIGHTNESS": "brightness",
+        "CONF_COLOR_TEMP": "color_temp",
+        "CONF_SCENE": "scene",
         "STATE_ON": "on",
     }.items():
         setattr(ha_const, name, value)
@@ -523,7 +546,31 @@ class RemoteEntityFeature(enum.IntFlag):
     ACTIVITY = 4
 
 
+class ColorMode(str, enum.Enum):
+    ONOFF = "onoff"
+    BRIGHTNESS = "brightness"
+    COLOR_TEMP = "color_temp"
+    HS = "hs"
+    WHITE = "white"
+    UNKNOWN = "unknown"
+
+
+class LightEntityFeature(enum.IntFlag):
+    EFFECT = 4
+    FLASH = 8
+    TRANSITION = 32
+
+
 _PLATFORM_EXTRAS = {
+    "light": {
+        "ATTR_BRIGHTNESS": "brightness",
+        "ATTR_COLOR_TEMP_KELVIN": "color_temp_kelvin",
+        "ATTR_EFFECT": "effect",
+        "ATTR_HS_COLOR": "hs_color",
+        "ATTR_WHITE": "white",
+        "ColorMode": ColorMode,
+        "LightEntityFeature": LightEntityFeature,
+    },
     "remote": {
         "ATTR_ACTIVITY": "activity",
         "ATTR_COMMAND": "command",
