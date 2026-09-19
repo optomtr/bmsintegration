@@ -367,6 +367,33 @@ class TuyaCloudApi:
 
         return resp["result"], "ok"
 
+    async def async_get_device_groups_raw(self, device_id) -> dict:
+        """Группы, в которых состоит устройство, и подробности каждой - как есть.
+
+        Отдаём сырой ответ облака намеренно: документация Tuya не перечисляет
+        поля ответа, а нам нужно увидеть, есть ли среди них localId - адрес
+        Zigbee-группы внутри шлюза. Без него групповую команду не собрать, а
+        приложение получает его через свой мобильный API, которого у нас нет.
+        """
+        out: dict = {"device_id": device_id, "groups": []}
+        resp = await self.async_make_request(
+            "GET", url=f"/v2.0/cloud/thing/group/device/{device_id}"
+        )
+        out["by_device"] = resp
+        if not resp or not resp.get("success"):
+            return out
+        result = resp.get("result")
+        items = result if isinstance(result, list) else (result or {}).get("list") or []
+        for item in items:
+            group_id = item.get("id") or item.get("group_id") if isinstance(item, dict) else item
+            if not group_id:
+                continue
+            detail = await self.async_make_request(
+                "GET", url=f"/v2.0/cloud/thing/group/{group_id}"
+            )
+            out["groups"].append({"group_id": group_id, "detail": detail})
+        return out
+
     async def async_get_device_query_properties(self, device_id) -> dict[dict, str]:
         """Obtain the DP ID mappings for a device correctly! Note: This won't works if the subscription expired."""
 

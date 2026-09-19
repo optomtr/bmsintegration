@@ -1105,6 +1105,36 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         """Set values for a set of datapoints."""
         return await self.exchange(CMDType.CONTROL, dps, nodeID=cid)
 
+    async def set_group_dps(
+        self, dps: dict, cid: str, mbid: str, wrapped: bool = True
+    ):
+        """Групповая команда Zigbee: одна передача на всю группу.
+
+        Формат восстановлен из приложения Tuya: к обычной команде дочернему
+        устройству добавляются ctype = 2 («это группа») и mbid - адрес группы
+        внутри шлюза (в документации TuyaOS поле называется mb_id, «multicast
+        ID»). cid - адрес одной из ламп группы, через неё шлюз узнаёт сеть.
+
+        Какую обёртку ждёт шлюз 3.5, из приложения однозначно не видно,
+        поэтому пока умеем обе: обёрнутую протоколом 5, как мы шлём лампам, и
+        плоскую, как её собирает SDK. Какая верная - решает проверка на железе.
+        """
+        body = {"cid": cid, "ctype": 2, "mbid": str(mbid), "dps": dps}
+        if wrapped:
+            payload_dict = {"protocol": 5, "t": int(time.time()), "data": body}
+        else:
+            payload_dict = {
+                "devId": self.id,
+                "uid": self.id,
+                "t": str(int(time.time())),
+                **body,
+            }
+        # Компактная запись - как у стандартной сборки кадров.
+        raw = json.dumps(payload_dict, separators=(",", ":"))
+        self.debug("Групповая команда: %s", raw)
+        payload = MessagePayload(CMDType.CONTROL_NEW, raw.encode())
+        return await self.exchange(command=CMDType.CONTROL_NEW, payload=payload)
+
     async def subdevices_query(self):
         """Request a list of sub-devices and their status."""
         # Before asking again, judge the cycle that the previous query opened:

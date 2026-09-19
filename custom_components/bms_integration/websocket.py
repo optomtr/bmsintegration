@@ -537,6 +537,82 @@ async def ws_refresh_keys(hass: HomeAssistant, connection, msg: dict) -> None:
     connection.send_result(msg["id"], summary)
 
 
+@websocket_api.websocket_command(
+    {vol.Required("type"): f"{DOMAIN}/cloud_groups", vol.Required("device_id"): str}
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_cloud_groups(hass: HomeAssistant, connection, msg: dict) -> None:
+    """Спросить облако, в каких группах состоит устройство, - сырым ответом.
+
+    Служебная команда для проверки Zigbee-групп: нужен localId группы, а
+    документация Tuya не говорит, отдаёт ли его облачный API. Запрос идёт
+    изнутри Home Assistant, поэтому ключи облака никуда не уходят, и через
+    общий замок - в изолированном режиме облако не спрашивается вовсе.
+    """
+    cloud = None
+    for _entry_id, data in _entries(hass):
+        if data.cloud_data is not None:
+            cloud = data.cloud_data
+            break
+    if cloud is None:
+        connection.send_error(msg["id"], "no_cloud", "Облачная учётная запись не настроена")
+        return
+    try:
+        result = await cloud.async_get_device_groups_raw(msg["device_id"])
+    except Exception as ex:  # noqa: BLE001 - report, do not raise
+        connection.send_error(msg["id"], "cloud_failed", str(ex))
+        return
+    connection.send_result(msg["id"], result)
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/group_send",
+        vol.Required("device_id"): str,
+        vol.Optional("node_id"): vol.Any(str, None),
+        vol.Required("mbid"): vol.Coerce(str),
+        vol.Required("dps"): dict,
+        vol.Optional("wrapped", default=True): bool,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_group_send(hass: HomeAssistant, connection, msg: dict) -> None:
+    """Отправить групповую Zigbee-команду через шлюз - для проверки на железе.
+
+    device_id - любая лампа группы: через её общий со шлюзом сокет уходит
+    кадр, а её узел идёт в cid. mbid - адрес группы внутри шлюза.
+    """
+    target = _resolve_device(hass, msg["device_id"], msg.get("node_id"))
+    if target is None:
+        connection.send_error(msg["id"], "not_found", f"Устройство {msg['device_id']} не найдено")
+        return
+    interface = target._interface
+    if interface is None or not target._node_id:
+        connection.send_error(
+            msg["id"], "not_ready", "Нужна лампа за шлюзом, и она должна быть на связи"
+        )
+        return
+    started = time.monotonic()
+    try:
+        reply = await interface.set_group_dps(
+            msg["dps"], target._node_id, msg["mbid"], wrapped=msg["wrapped"]
+        )
+    except Exception as ex:  # noqa: BLE001 - report the failure, do not raise
+        connection.send_error(msg["id"], "send_failed", str(ex))
+        return
+    connection.send_result(
+        msg["id"],
+        {
+            "ok": True,
+            "reply": reply,
+            "wrapped": msg["wrapped"],
+            "took_ms": round((time.monotonic() - started) * 1000),
+        },
+    )
+
+
 def async_register_websocket_api(hass: HomeAssistant) -> None:
     """Register every panel command, once per Home Assistant."""
     domain_data = hass.data.setdefault(DOMAIN, {})
@@ -563,6 +639,8 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
         ws_remove_device,
         ws_set_lockdown,
         ws_refresh_keys,
+        ws_cloud_groups,
+        ws_group_send,
     ):
         websocket_api.async_register_command(hass, command)
     domain_data[DATA_WS_REGISTERED] = True

@@ -487,6 +487,17 @@ by the light platform whenever the colour datapoint is 61. Auto-configure puts
 `paint_colour_data` first for strip and string lights, since the first matching
 code wins and these controllers also expose DP 5.
 
+### Probing Tuya Zigbee groups
+
+A Tuya Zigbee group switches every lamp in it with one radio transmission: the
+app sends the gateway a single command carrying `ctype: 2` and `mbid`, the
+group's address inside the gateway. That would replace a burst of per-lamp
+commands queuing behind one radio. Two admin-only panel commands exist to verify
+it on real hardware before anything is built on top: `cloud_groups` asks the
+cloud which groups a device belongs to and returns the raw answer, to see
+whether it carries the group's local id; `group_send` sends one group command
+through a member lamp's gateway socket, in either framing.
+
 ## Install
 
 ### Manual
