@@ -298,6 +298,11 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         return True
 
     @property
+    def device_config(self) -> DeviceConfig:
+        """Конфигурация устройства - только для чтения."""
+        return self._device_config
+
+    @property
     def carries_dependents(self) -> bool:
         """Есть ли устройства, которые без этого подключения не живут."""
         return bool(self.sub_devices) or self._fake_gateway

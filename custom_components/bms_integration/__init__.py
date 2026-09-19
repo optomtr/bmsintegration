@@ -40,6 +40,7 @@ from .config_flow import ENTRIES_VERSION
 from .panel import async_remove_panel, async_setup_panel
 from .websocket import async_register_websocket_api
 from .const import (
+    device_registry_fields,
     ATTR_UPDATED_AT,
     CONF_FRIENDLY_NAME,
     DEFAULT_WATCHDOG_INTERVAL,
@@ -570,6 +571,30 @@ async def _background_verify(hass: HomeAssistant, entry: ConfigEntry) -> None:
                 _LOGGER.debug("Фоновая сверка не удалась: %s", ex)
 
 
+def _register_gateways(hass: HomeAssistant, entry: ConfigEntry, devices: dict) -> None:
+    """Завести шлюзы в реестре устройств до того, как поднимутся платформы.
+
+    Дочерние устройства ссылаются на шлюз через via_device_id, а это номер
+    УЖЕ существующей записи. Сама по себе запись появляется только вместе с
+    сущностями устройства: шлюз, у которого своих сущностей нет (датапоинты
+    хаба приходят только из облака), не попадал в реестр вовсе, а у шлюза с
+    сущностями порядок их добавления решал, останутся ли дети сиротами.
+
+    Подменённые шлюзы - дочернее устройство, держащее соединение за
+    отсутствующий хаб - не трогаем: родителя для них сущность и не ставит.
+    """
+    dev_reg = dr.async_get(hass)
+    for device in list(devices.values()):
+        if not device.sub_devices or device.is_fake_gateway:
+            continue
+        config = device.device_config
+        dev_reg.async_get_or_create(
+            config_entry_id=entry.entry_id,
+            identifiers={(DOMAIN, f"local_{config.id}")},
+            **device_registry_fields(config),
+        )
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Set up LocalTuya integration from a config entry."""
     if entry.version < ENTRIES_VERSION:
@@ -680,6 +705,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         return connect_to_devices
 
     connect_to_devices = _setup_devices(entry.data[CONF_DEVICES])
+    _register_gateways(hass, entry, hass_localtuya.devices)
 
     await hass.config_entries.async_forward_entry_setups(
         entry, _entry_platforms(hass)

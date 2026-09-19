@@ -20,7 +20,6 @@ from homeassistant.const import (
     EntityCategory,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
-    ATTR_VIA_DEVICE,
 )
 from homeassistant.helpers.device_registry import DeviceInfo, async_get as async_get_dev_reg
 from homeassistant.helpers.dispatcher import (
@@ -34,6 +33,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .core import pytuya
 from .coordinator import HassLocalTuyaData, TuyaDevice
 from .const import (
+    device_registry_fields,
     ATTR_STATE,
     CONF_DEFAULT_VALUE,
     CONF_ID,
@@ -238,10 +238,7 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
         device_info = DeviceInfo(
             # Serial numbers are unique identifiers within a specific domain
             identifiers={(DOMAIN, f"local_{device_config.id}")},
-            name=device_config.name,
-            manufacturer="Tuya",
-            model=f"{device_config.model} ({device_config.id})",
-            sw_version=device_config.protocol_version,
+            **device_registry_fields(device_config),
         )
         if self._device.is_subdevice and self._device.id != self._device.gateway.id:
             # Only claim a parent that actually exists. Nothing registers a
@@ -249,9 +246,22 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
             # declares it - so a hub whose datapoints are cloud-only has no
             # entities and therefore no registry entry, and pointing at it
             # left every child orphaned in the device tree.
-            gateway_id = (DOMAIN, f"local_{self._device.gateway.id}")
-            if async_get_dev_reg(self.hass).async_get_device(identifiers={gateway_id}):
-                device_info[ATTR_VIA_DEVICE] = gateway_id
+            #
+            # Родитель ставится через via_device_id - номер записи шлюза в
+            # реестре. Прежний ключ via_device (кортеж идентификатора) ядро
+            # выводит из оборота: с 2026.9 предупреждает о нём при каждом
+            # запуске, при переименовании сущности через реестр уже падает с
+            # RuntimeError - и сущность не добавляется до перезагрузки записи
+            # (с объекта: так отвалились light.lk_lenta_local и
+            # switch.lk_lenta_dnd), а в 2027.8 его уберут совсем. Запись
+            # шлюза к этому моменту есть: async_setup_entry регистрирует
+            # шлюзы до того, как поднимаются платформы.
+            gateway_ident = (DOMAIN, f"local_{self._device.gateway.id}")
+            gateway = async_get_dev_reg(self.hass).async_get_device(
+                identifiers={gateway_ident}
+            )
+            if gateway is not None:
+                device_info["via_device_id"] = gateway.id
         return device_info
 
     @property

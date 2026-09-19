@@ -232,6 +232,21 @@ DEFAULT_CATEGORIES = {
 }
 
 
+def device_registry_fields(config: "DeviceConfig") -> dict:
+    """Поля записи устройства в реестре Home Assistant.
+
+    Одно место на двоих: DeviceInfo сущности и явная регистрация шлюза при
+    запуске. Разойдись они - запись шлюза переписывалась бы при каждом
+    запуске туда-обратно.
+    """
+    return {
+        "name": config.name,
+        "manufacturer": "Tuya",
+        "model": f"{config.model} ({config.id})",
+        "sw_version": config.protocol_version,
+    }
+
+
 @dataclass
 class DictSelector:
     """

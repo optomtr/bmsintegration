@@ -512,6 +512,19 @@ temperature or white, that branch now writes the brightness itself, in its own
 mode; the brightness branch acts on the current mode only when brightness is all
 that was asked.
 
+### A sub-device names its gateway through via_device_id
+
+Reported from a site and checked against Home Assistant core 2026.9.3: the
+`via_device` key in `DeviceInfo` is deprecated and goes away in 2027.8. The core
+warns about it on every start, and renaming an entity through the registry
+already raises there, leaving the entity unadded until the entry is reloaded.
+Sub-devices now name their parent with `via_device_id`, the registry id of the
+gateway's record. That record used to appear only alongside the gateway's own
+entities - a hub with cloud-only datapoints had none, and never got one - so
+real gateways are now registered explicitly before the platforms start. The
+record's fields come from one helper shared with the entities, so it is not
+rewritten back and forth on every start.
+
 ## Install
 
 ### Manual
