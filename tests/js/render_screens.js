@@ -252,6 +252,33 @@ try {
   cases.push(["«все на связи» считает устройства, а не сущности",
               calm.vOverview().includes("Все 2 устройств на связи")]);
 
+  // Очистка ленты инцидентов на обзоре: скрывает бывшее, не новое, и не
+  // трогает журнал в разделе «События».
+  const withFeed = () => {
+    const p = new Panel();
+    p.d = JSON.parse(JSON.stringify(fixtures));
+    p.d.report.entries = [
+      { ts: "2026-09-23T10:00:00+00:00", event: "disconnect_detected", name: "Старый сбой", device_id: "d1", reason: "" },
+      { ts: "2026-09-23T12:00:00+00:00", event: "disconnect_detected", name: "Новый сбой", device_id: "d1", reason: "" },
+    ];
+    return p;
+  };
+  const f0 = withFeed().vOverview();
+  cases.push(["до очистки видны оба инцидента и кнопка «Очистить»",
+              f0.includes("Старый сбой") && f0.includes("Новый сбой") && f0.includes('data-act="feed-clear"')]);
+  const fc = withFeed();
+  fc.s.feedClearedAt = Date.parse("2026-09-23T11:00:00+00:00");
+  const f1 = fc.vOverview();
+  cases.push(["после очистки старое скрыто", !f1.includes("Старый сбой")]);
+  cases.push(["инцидент после очистки виден", f1.includes("Новый сбой")]);
+  cases.push(["после очистки есть «Вернуть»", f1.includes('data-act="feed-restore"')]);
+  cases.push(["раздел «События» очистку не видит",
+              (() => { fc.s.screen = "events"; const ev = fc.vEvents(); return ev.includes("Старый сбой"); })()]);
+  const fe = new Panel();
+  fe.d = JSON.parse(JSON.stringify(fixtures));
+  fe.d.report.entries = [];
+  cases.push(["пустую ленту нечего очищать", !fe.vOverview().includes('data-act="feed-clear"')]);
+
   for (const [name, ok] of cases) {
     if (ok) console.log(`  ✓ ${name}`);
     else { console.error(`  ✗ ${name}`); failed++; }

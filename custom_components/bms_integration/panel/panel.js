@@ -179,6 +179,9 @@ class BmsControlCenter extends HTMLElement {
       // Чем считать обзор: устройствами или сущностями. Помнится в браузере -
       // это выбор того, кто смотрит, а не настройка объекта.
       countBy: readPref("bms_cc_count_by", "devices"),
+      // С какого момента показывать ленту инцидентов на обзоре. Журнал при
+      // этом не трогаем: раздел «События» показывает его целиком.
+      feedClearedAt: Number(readPref("bms_cc_feed_cleared_at", "0")) || 0,
       collapsed: new Set(),
       updatedAt: null,
       busy: false,
@@ -588,7 +591,12 @@ class BmsControlCenter extends HTMLElement {
       </button>`;
     }).join("") : empty("Шлюзов нет — все устройства подключаются напрямую", "i-wifi", C.mut);
 
-    const incidents = (this.d.report?.entries || []).slice(-8).reverse();
+    // Очистка скрывает то, что уже было, а не всё подряд: инцидент, случившийся
+    // после неё, появится в ленте снова.
+    const cleared = this.s.feedClearedAt;
+    const incidents = (this.d.report?.entries || [])
+      .filter((e) => !cleared || Date.parse(e.ts) > cleared)
+      .slice(-8).reverse();
     const feed = incidents.length ? incidents.map((e) => {
       const m = EVENT_META[e.event] || { label: e.event, color: C.mut, icon: "i-dots" };
       return `<div class="inc">
@@ -635,7 +643,11 @@ class BmsControlCenter extends HTMLElement {
         <div style="flex:1 1 380px;min-width:300px;display:flex;flex-direction:column;background:${C.card};border:1px solid ${C.line};border-radius:10px;box-shadow:0 1px 2px rgba(24,39,58,.05)">
           <div style="padding:13px 16px;border-bottom:1px solid ${C.line};display:flex;align-items:center;justify-content:space-between;gap:12px">
             <span class="cap">Лента инцидентов</span>
-            ${btn("Все события", { act: "nav", data: 'data-nav="events"', small: true, ico: "i-chev-r" })}
+            <span style="display:inline-flex;gap:6px">
+              ${cleared ? btn("Вернуть", { act: "feed-restore", small: true })
+                : incidents.length ? btn("Очистить", { act: "feed-clear", small: true }) : ""}
+              ${btn("Все события", { act: "nav", data: 'data-nav="events"', small: true, ico: "i-chev-r" })}
+            </span>
           </div>
           <div style="flex:1;padding:4px 0">${feed}</div>
           <div style="padding:11px 16px;border-top:1px solid ${C.line};display:flex;gap:8px;flex-wrap:wrap">
@@ -1504,6 +1516,11 @@ class BmsControlCenter extends HTMLElement {
     if (a === "dtab") { this.s.deviceTab = el.dataset.tab; return this.paint(); }
     if (a === "refresh") return this.refresh();
     if (a === "expert") { this.s.expert = !this.s.expert; return this.paint(); }
+    if (a === "feed-clear" || a === "feed-restore") {
+      this.s.feedClearedAt = a === "feed-clear" ? Date.now() : 0;
+      writePref("bms_cc_feed_cleared_at", String(this.s.feedClearedAt));
+      return this.paint();
+    }
     if (a === "count-by") {
       this.s.countBy = el.dataset.by === "entities" ? "entities" : "devices";
       writePref("bms_cc_count_by", this.s.countBy);
