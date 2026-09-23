@@ -279,6 +279,59 @@ try {
   fe.d.report.entries = [];
   cases.push(["пустую ленту нечего очищать", !fe.vOverview().includes('data-act="feed-clear"')]);
 
+  // Графики обзора: кольцо, состав, комнаты.
+  const pg = new Panel();
+  pg.d = JSON.parse(JSON.stringify(fixtures));
+  pg.d.overview.devices = [
+    device("g", "Шлюз", { is_gateway: true, sub_device_count: 2, entity_count: 2, area_name: null }),
+    device("z1", "Лампа", { is_subdevice: true, gateway_id: "g", entity_count: 3, area_name: "Кухня" }),
+    device("z2", "Реле", { is_subdevice: true, gateway_id: "g", entity_count: 2, area_name: "Кухня", state: "unavailable" }),
+    device("w", "Розетка", { entity_count: 4, area_name: "Холл" }),
+  ];
+  pg.s.entryFilter = "e1";
+  const g1 = pg.vOverview();
+  // Число в строке легенды или полосы: от подписи до ближайшего data-count.
+  const legendN = (html, label) => {
+    const part = html.split('<span class="bl">' + label + "</span>")[1];
+    const m = part && part.split('<span class="bl">')[0].match(/data-count="(\d+)"/);
+    return m ? Number(m[1]) : null;
+  };
+  cases.push(["кольцо: 3 из 4 онлайн = 75%", /data-count="75">75<\/span>%/.test(g1)]);
+  cases.push(["состав: Wi-Fi 1, Zigbee 2, шлюзы 1",
+              legendN(g1, "Wi-Fi напрямую") === 1 && legendN(g1, "Zigbee за шлюзом") === 2 && legendN(g1, "Шлюзы") === 1]);
+  cases.push(["комнаты: Кухня 2, Без комнаты 1", legendN(g1, "Кухня") === 2 && legendN(g1, "Без комнаты") === 1]);
+  pg.s.countBy = "entities";
+  const g2 = pg.vOverview();
+  cases.push(["по сущностям кольцо: 9 из 11 = 82%", /data-count="82">82<\/span>%/.test(g2)]);
+  cases.push(["по сущностям Zigbee 5, шлюзы 2, Кухня 5, Без комнаты 2",
+              legendN(g2, "Zigbee за шлюзом") === 5 && legendN(g2, "Шлюзы") === 2 &&
+              legendN(g2, "Кухня") === 5 && legendN(g2, "Без комнаты") === 2]);
+
+  // Вступление - один раз на заход в обзор. Экран перерисовывается при
+  // каждом опросе; без этой проверки кольцо и числа проигрывались бы заново
+  // каждые несколько секунд.
+  const pi = new Panel();
+  pi.d = JSON.parse(JSON.stringify(fixtures));
+  const els = {};
+  pi.shadowRoot = { getElementById: (id) => (els[id] ||= sandbox.document.createElement("div")),
+                    querySelector: () => null, querySelectorAll: () => [], activeElement: null };
+  pi._built = true;
+  const introNow = () => /class="pad col16 intro"/.test(els.main.innerHTML);
+  pi.s.screen = "overview";
+  pi.paint();
+  const first = introNow();
+  pi.paint(true);
+  const onPoll = introNow();
+  pi.s.screen = "events"; pi.paint(); pi.s.screen = "overview"; pi.paint();
+  const back = introNow();
+  pi.paint(true);
+  pi.onClick({ composedPath: () => [{ dataset: { act: "count-by", by: "entities" } }] });
+  const onToggle = introNow();
+  cases.push(["вступление на первом показе обзора", first]);
+  cases.push(["опрос вступление не повторяет", !onPoll]);
+  cases.push(["возврат на обзор играет его снова", back]);
+  cases.push(["переключение режима играет его снова", onToggle]);
+
   for (const [name, ok] of cases) {
     if (ok) console.log(`  ✓ ${name}`);
     else { console.error(`  ✗ ${name}`); failed++; }

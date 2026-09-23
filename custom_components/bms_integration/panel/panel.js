@@ -455,6 +455,11 @@ class BmsControlCenter extends HTMLElement {
       add: () => this.vAdd(), events: () => this.vEvents(), settings: () => this.vSettings(),
       rooms: () => this.vRooms(),
     }[this.s.screen];
+    // Вступительная анимация - один раз на заход в обзор. Экран
+    // перерисовывается при каждом опросе, и без этого кольцо и числа
+    // проигрывались бы заново каждые несколько секунд.
+    if (this.s.screen !== "overview") this._introFor = null;
+    this._intro = this.s.screen === "overview" && this._introFor !== "overview" && !!this.d.overview;
     try {
       main.innerHTML = view ? view() : "";
     } catch (err) {
@@ -469,6 +474,27 @@ class BmsControlCenter extends HTMLElement {
       main.scrollTop = scroll;
       if (main.parentElement) main.parentElement.scrollTop = outerScroll;
     }
+    if (this._intro) {
+      this._introFor = "overview";
+      this.countUp(main);
+    }
+  }
+
+  // Числа отсчитываются от нуля до значения. В разметке уже стоит итог: без
+  // анимации (или если она выключена в системе) человек сразу видит верное.
+  countUp(root) {
+    const raf = globalThis.requestAnimationFrame;
+    const reduce = globalThis.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+    if (!raf || reduce || !root?.querySelectorAll) return;
+    const els = [...root.querySelectorAll("[data-count]")];
+    const start = performance.now(), DUR = 900;
+    const ease = (t) => 1 - Math.pow(1 - t, 3);
+    const tick = (now) => {
+      const t = Math.min(1, (now - start) / DUR);
+      for (const el of els) el.textContent = String(Math.round(Number(el.dataset.count) * ease(t)));
+      if (t < 1) raf(tick);
+    };
+    raf(tick);
   }
 
   holdsLiveInput() {
@@ -543,6 +569,101 @@ class BmsControlCenter extends HTMLElement {
       </div></div>`;
   }
 
+  // Кольцо здоровья: секторы по состояниям, по часовой от верха. Длины -
+  // доли окружности; между секторами небольшой зазор, если их больше одного.
+  healthRing(s) {
+    const order = ["online", "connecting", "reconnecting", "grace", "unavailable", "config"];
+    const R = 54, CIRC = 2 * Math.PI * R;
+    const parts = order.map((k) => ({ k, n: s[k] || 0 })).filter((p) => p.n > 0);
+    const total = Math.max(1, s.total);
+    const gap = parts.length > 1 ? 3 : 0;
+    let at = 0;
+    const segs = parts.map((p, i) => {
+      const len = Math.max(0, (p.n / total) * CIRC - gap);
+      const seg = `<circle class="ring-seg" cx="70" cy="70" r="${R}" fill="none"
+        stroke="${ST[p.k].color}" stroke-width="12" stroke-linecap="butt"
+        stroke-dasharray="${len.toFixed(2)} ${CIRC.toFixed(2)}" stroke-dashoffset="${(-at).toFixed(2)}"
+        style="--d:${(i * 0.12).toFixed(2)}s"></circle>`;
+      at += (p.n / total) * CIRC;
+      return seg;
+    }).join("");
+    const pct = s.total ? Math.round(((s.online || 0) / s.total) * 100) : 0;
+    return `<div class="ring">
+      <svg viewBox="0 0 140 140" width="148" height="148" aria-hidden="true">
+        <circle cx="70" cy="70" r="${R}" fill="none" stroke="${C.div}" stroke-width="12"></circle>
+        <g transform="rotate(-90 70 70)">${segs}</g>
+      </svg>
+      <div class="ring-c">
+        <div class="ring-v" style="color:${s.total ? C.ink : C.mut}"><span data-count="${pct}">${pct}</span>%</div>
+        <div class="ring-l">онлайн</div>
+      </div>
+    </div>`;
+  }
+
+  // Полосы: одна строка - подпись, растущая заливка, число и доля.
+  bars(items, colorOf) {
+    const max = Math.max(1, ...items.map((i) => i.n));
+    const total = Math.max(1, items.reduce((a, i) => a + i.n, 0));
+    return items.map((it, i) => `
+      <div class="brow">
+        <span class="bl">${esc(it.label)}</span>
+        <span class="bt"><span class="bar-fill" style="width:${((it.n / max) * 100).toFixed(1)}%;
+          background:${colorOf(it, i)};--d:${(i * 0.06).toFixed(2)}s"></span></span>
+        <span class="bn"><span data-count="${it.n}">${it.n}</span></span>
+        <span class="bp">${Math.round((it.n / total) * 100)}%</span>
+      </div>`).join("");
+  }
+
+  compositionCard(rows, byEntities) {
+    const w = (r) => (byEntities ? r.entity_count || 0 : 1);
+    const kinds = [
+      { label: "Wi-Fi напрямую", n: 0, c: C.accent },
+      { label: "Zigbee за шлюзом", n: 0, c: "#5AA2FF" },
+      { label: "Шлюзы", n: 0, c: "#A9CBFF" },
+    ];
+    rows.forEach((r) => {
+      const k = r.is_gateway ? 2 : r.is_subdevice ? 1 : 0;
+      kinds[k].n += w(r);
+    });
+    const shown = kinds.filter((k) => k.n > 0);
+    const total = Math.max(1, shown.reduce((a, k) => a + k.n, 0));
+    const stack = shown.map((k, i) => `<span class="bar-fill" style="width:${((k.n / total) * 100).toFixed(2)}%;
+      background:${k.c};--d:${(i * 0.1).toFixed(2)}s"></span>`).join("");
+    return `${cardOpen("Состав системы", `<span class="mono small">${byEntities ? "сущности" : "устройства"}</span>`)}
+      <div style="padding:16px;display:flex;flex-direction:column;gap:14px">
+        <div class="stack">${stack}</div>
+        <div>${shown.length ? shown.map((k) => `
+          <div class="lrow">
+            <span class="hd" style="background:${k.c}"></span>
+            <span class="bl">${esc(k.label)}</span>
+            <span class="bn"><span data-count="${k.n}">${k.n}</span></span>
+            <span class="bp">${Math.round((k.n / total) * 100)}%</span>
+          </div>`).join("") : empty("Устройств пока нет", "i-chip", C.mut)}</div>
+      </div>${cardClose}`;
+  }
+
+  roomsCard(rows, byEntities) {
+    const w = (r) => (byEntities ? r.entity_count || 0 : 1);
+    const by = new Map();
+    let none = 0;
+    rows.forEach((r) => {
+      if (!r.area_name) { none += w(r); return; }
+      by.set(r.area_name, (by.get(r.area_name) || 0) + w(r));
+    });
+    const sorted = [...by.entries()].map(([label, n]) => ({ label, n })).sort((a, b) => b.n - a.n);
+    const TOP = 7;
+    const items = sorted.slice(0, TOP);
+    const rest = sorted.slice(TOP);
+    if (rest.length) items.push({ label: `Остальные · ${rest.length}`, n: rest.reduce((a, i) => a + i.n, 0), muted: true });
+    if (none) items.push({ label: "Без комнаты", n: none, muted: true });
+    const rooms = by.size;
+    return `${cardOpen("По комнатам", `<span class="mono small">${plural(rooms, "комната", "комнаты", "комнат")}</span>`)}
+      <div style="padding:16px">
+        ${items.length ? this.bars(items, (it) => (it.muted ? "#CBD3DB" : `linear-gradient(90deg,${C.accent},#5AA2FF)`))
+                       : empty("Комнаты не назначены", "i-home", C.mut)}
+      </div>${cardClose}`;
+  }
+
   // ================================================== 01 Обзор ============
   vOverview() {
     const rows = this.rows();
@@ -561,20 +682,18 @@ class BmsControlCenter extends HTMLElement {
       { label: "Grace-период", value: s.grace, icon: "i-clock", color: C.grace, note: "ожидание", vColor: s.grace ? C.grace : C.ink },
       { label: "Недоступно", value: s.unavailable, icon: "i-octagon", color: C.bad, note: "подтв. сбой", vColor: s.unavailable ? C.bad : C.ink },
       { label: "Шлюзы с проблемой", value: s.bad_gateways, icon: "i-alert", color: C.stale, note: s.bad_gateway_children ? `${s.bad_gateway_children} ${byEntities ? "сущн." : "детей"}` : "", vColor: s.bad_gateways ? C.stale : C.ink },
-    ].map((t) => `
-      <div class="tile" style="--tc:${t.color}">
+    ].map((t, i) => `
+      <div class="tile" style="--tc:${t.color};--d:${(i * 0.04).toFixed(2)}s">
         <div class="tl">${icon(t.icon, 14, t.color)}<span>${t.label}</span></div>
-        <div class="tv"><span style="color:${t.vColor}">${t.value}</span><span class="tn">${t.note || ""}</span></div>
+        <div class="tv"><span style="color:${t.vColor}" data-count="${t.value}">${t.value}</span><span class="tn">${t.note || ""}</span></div>
       </div>`).join("");
 
     const order = ["online", "connecting", "reconnecting", "grace", "unavailable", "config"];
     const health = order.map((k) => ({ k, n: s[k] || 0, c: ST[k].color, l: ST[k].label }));
-    const bar = health.filter((h) => h.n).map((h) =>
-      `<span style="width:${(h.n / Math.max(1, s.total)) * 100}%;background:${h.c}"></span>`).join("");
     const legend = health.map((h) => `
       <button data-act="filter-state" data-state="${h.k}" class="hrow">
         <span class="hd" style="background:${h.c}"></span>
-        <span class="hl">${h.l}</span><span class="hn">${h.n}</span></button>`).join("");
+        <span class="hl">${h.l}</span><span class="hn" data-count="${h.n}">${h.n}</span></button>`).join("");
 
     const gateways = rows.filter((r) => r.is_gateway);
     const gwList = gateways.length ? gateways.map((g) => {
@@ -625,15 +744,15 @@ class BmsControlCenter extends HTMLElement {
         ${btn("Открыть", { act: "open-device", data: `data-id="${esc(r.device_id)}"`, small: true })}
       </div>`).join("") : empty(`Все ${rows.length} устройств на связи`);
 
-    return `<div class="pad col16" style="max-width:1560px">
+    return `<div class="pad col16 ${this._intro ? "intro" : ""}" style="max-width:1560px">
       ${this.countByToggle()}
       <div class="tiles">${tiles}</div>
       <div class="row16">
         <div class="col16" style="flex:1 1 480px;min-width:320px">
           ${cardOpen("Здоровье соединений", `<span class="mono small">${esc(this.scopeName())}</span>`)}
-            <div style="padding:16px">
-              <div class="hbar">${bar}</div>
-              <div class="hgrid">${legend}</div>
+            <div class="health">
+              ${this.healthRing(s)}
+              <div class="hgrid" style="flex:1;min-width:240px">${legend}</div>
             </div>
           ${cardClose}
           ${cardOpen(`Шлюзы · ${esc(this.scopeName())}`, btn("На карте", { act: "nav", data: 'data-nav="map"', small: true, ico: "i-chev-r" }))}
@@ -655,6 +774,10 @@ class BmsControlCenter extends HTMLElement {
             ${btn("Перезагрузить интеграцию", { act: "reload-all", danger: true, ico: "i-alert" })}
           </div>
         </div>
+      </div>
+      <div class="row16 eqh">
+        <div style="flex:1 1 380px;min-width:300px">${this.compositionCard(rows, byEntities)}</div>
+        <div style="flex:1 1 380px;min-width:300px">${this.roomsCard(rows, byEntities)}</div>
       </div>
       ${cardOpen("Требуют внимания",
         `${attention.length ? `<span class="badge-w">${attention.length}</span>` : ""}
@@ -1524,6 +1647,7 @@ class BmsControlCenter extends HTMLElement {
     if (a === "count-by") {
       this.s.countBy = el.dataset.by === "entities" ? "entities" : "devices";
       writePref("bms_cc_count_by", this.s.countBy);
+      this._introFor = null;
       return this.paint();
     }
     if (a === "incidents") { this.s.incidentsOnly = !this.s.incidentsOnly; return this.paint(); }
@@ -1907,6 +2031,33 @@ main{flex:1;min-height:0}
 .inp{height:32px;padding:0 10px;border:1px solid #DDE3E9;border-radius:7px;background:${C.card};
   color:${C.ink};font-size:12.5px;outline:none}
 .inp:focus{border-color:${C.accent}}
+.health{padding:16px;display:flex;align-items:center;gap:22px;flex-wrap:wrap}
+.ring{position:relative;width:148px;height:148px;flex:0 0 auto}
+.ring svg{display:block;filter:drop-shadow(0 4px 10px rgba(20,154,84,.14))}
+.ring-c{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.ring-v{font-size:34px;font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums;line-height:1}
+.ring-l{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:${C.mut2};margin-top:4px}
+.row16.eqh{align-items:stretch}
+.eqh>div{display:flex;flex-direction:column}
+.eqh>div>div{flex:1}
+.lrow{display:grid;grid-template-columns:10px 1fr 44px 38px;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid ${C.div}}
+.lrow:last-child{border-bottom:0}
+.stack{display:flex;height:14px;border-radius:7px;overflow:hidden;background:${C.div};gap:2px}
+.stack .bar-fill{display:block;height:100%}
+.brow{display:grid;grid-template-columns:minmax(110px,1.1fr) 2fr 44px 38px;align-items:center;gap:10px;padding:6px 0}
+.bl{font-size:12.5px;color:${C.ink2};white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bt{height:8px;border-radius:4px;background:${C.div};overflow:hidden}
+.bt .bar-fill{display:block;height:100%;border-radius:4px}
+.bn{font-size:13px;font-weight:600;color:${C.ink};text-align:right;font-variant-numeric:tabular-nums}
+.bp{font-size:11.5px;color:${C.mut};text-align:right;font-variant-numeric:tabular-nums}
+@media (prefers-reduced-motion:no-preference){
+  .intro .tile{animation:bmsTileIn .45s cubic-bezier(.22,1,.36,1) both;animation-delay:var(--d,0s)}
+  .intro .ring-seg{animation:bmsRingIn 1.1s cubic-bezier(.22,1,.36,1) both;animation-delay:var(--d,0s)}
+  .intro .bar-fill{animation:bmsBarIn .9s cubic-bezier(.22,1,.36,1) both;animation-delay:calc(.25s + var(--d,0s));transform-origin:left center}
+}
+@keyframes bmsTileIn{from{opacity:0;transform:translateY(6px)}}
+@keyframes bmsRingIn{from{stroke-dasharray:0 999}}
+@keyframes bmsBarIn{from{transform:scaleX(0)}}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:10px}
 .tile{background:${C.card};border:1px solid ${C.line};border-radius:10px;box-shadow:0 1px 2px rgba(24,39,58,.05);
   padding:13px 14px;display:flex;flex-direction:column;gap:9px;position:relative;overflow:hidden}
@@ -1916,7 +2067,6 @@ main{flex:1;min-height:0}
 .tv{display:flex;align-items:baseline;gap:8px}
 .tv>span:first-child{font-family:${MONO};font-size:27px;font-weight:600;line-height:1;letter-spacing:-.02em}
 .tn{font-size:11px;color:${C.mut}}
-.hbar{display:flex;height:9px;border-radius:5px;overflow:hidden;gap:1.5px;background:#F2F5F8}
 .hgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:2px;margin-top:14px}
 .hrow{display:flex;align-items:center;gap:10px;padding:7px 8px;border:0;background:transparent;border-radius:6px;
   cursor:pointer;text-align:left;width:100%}

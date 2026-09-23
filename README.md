@@ -97,6 +97,9 @@ the license text.
   an event timeline over the availability report, and integration settings.
   Backed by admin-only WebSocket commands that never serialize local keys or
   cloud credentials.
+- The Control Center overview can count entities instead of devices, its
+  incident feed can be cleared (and brought back), and it draws a health ring
+  plus breakdowns by connection type and by room, animated once per visit.
 - A gateway that reports its sub-devices in several reply frames no longer
   gets a fixed subset of them flap-disconnected: absence is now judged over
   the union of all frames of a poll cycle, across two consecutive cycles,
