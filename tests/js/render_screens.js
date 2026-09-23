@@ -214,6 +214,44 @@ try {
   p4.s.screen = "overview";
   cases.push(["без облака кнопка не предлагается",
               !p4.vOverview().includes("Обновить ключи из облака")]);
+  // Переключатель «Устройства / Сущности» на обзоре. Одно устройство на
+  // связи с двумя сущностями, второе лежит, и у него пять.
+  const tileValue = (html, label) => {
+    const m = html.match(new RegExp(label + "</span></div>\\s*<div class=\"tv\"><span[^>]*>(\\d+)</span>"));
+    return m ? Number(m[1]) : null;
+  };
+  const mixed = () => {
+    const p = new Panel();
+    p.d = JSON.parse(JSON.stringify(fixtures));
+    p.d.overview.devices[0].entity_count = 2;
+    p.d.overview.devices[1].entity_count = 5;
+    p.d.overview.devices[1].state = "unavailable";
+    p.s.screen = "overview";
+    p.s.entryFilter = "e1";          // считать по строкам, а не по сводке сервера
+    return p;
+  };
+  const pd = mixed();
+  pd.s.countBy = "devices";
+  const byDev = pd.vOverview();
+  const pe = mixed();
+  pe.s.countBy = "entities";
+  const byEnt = pe.vOverview();
+  cases.push(["по устройствам: всего 2", tileValue(byDev, "Всего устройств") === 2]);
+  cases.push(["по сущностям: всего 7", tileValue(byEnt, "Всего сущностей") === 7]);
+  cases.push(["по сущностям: онлайн 2", tileValue(byEnt, "Онлайн") === 2]);
+  cases.push(["по сущностям: недоступно 5", tileValue(byEnt, "Недоступно") === 5]);
+  cases.push(["переключатель показывает выбранное",
+              /data-by="entities" aria-pressed="true"/.test(byEnt)
+              && /data-by="devices" aria-pressed="true"/.test(byDev)]);
+  cases.push(["в режиме сущностей нет undefined", !byEnt.includes("undefined")]);
+  // Список «требуют внимания» - это устройства: текст «все N на связи»
+  // не должен подхватывать число сущностей.
+  const calm = new Panel();
+  calm.d = JSON.parse(JSON.stringify(fixtures));
+  calm.s.countBy = "entities";
+  cases.push(["«все на связи» считает устройства, а не сущности",
+              calm.vOverview().includes("Все 2 устройств на связи")]);
+
   for (const [name, ok] of cases) {
     if (ok) console.log(`  ✓ ${name}`);
     else { console.error(`  ✗ ${name}`); failed++; }

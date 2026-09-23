@@ -147,6 +147,15 @@ const empty = (text, ico = "i-check", color = C.ok) => `
     ${icon(ico, 15, color)}<span style="font-size:12.5px;color:${C.mut2}">${esc(text)}</span></div>`;
 
 // ============================================================== компонент ==
+// Память браузера бывает недоступна (приватное окно, запрет сайта) - тогда
+// выбор просто живёт до перезагрузки страницы.
+function readPref(key, fallback) {
+  try { return globalThis.localStorage?.getItem(key) || fallback; } catch { return fallback; }
+}
+function writePref(key, value) {
+  try { globalThis.localStorage?.setItem(key, value); } catch { /* не помним - не страшно */ }
+}
+
 class BmsControlCenter extends HTMLElement {
   constructor() {
     super();
@@ -167,6 +176,9 @@ class BmsControlCenter extends HTMLElement {
       search: "",
       eventSearch: "",
       entryFilter: "all",
+      // Чем считать обзор: устройствами или сущностями. Помнится в браузере -
+      // это выбор того, кто смотрит, а не настройка объекта.
+      countBy: readPref("bms_cc_count_by", "devices"),
       collapsed: new Set(),
       updatedAt: null,
       busy: false,
@@ -494,13 +506,49 @@ class BmsControlCenter extends HTMLElement {
     };
   }
 
+  // Та же сводка, но каждое устройство весит столько, сколько у него
+  // сущностей. Считается по строкам всегда: серверная сводка знает только
+  // общее число сущностей, без разбивки по состояниям.
+  sumEntities() {
+    const rows = this.rows();
+    const w = (r) => r.entity_count || 0;
+    const by = {};
+    rows.forEach((r) => (by[r.state] = (by[r.state] || 0) + w(r)));
+    const badGw = rows.filter((r) => r.is_gateway && r.state !== "online");
+    const badIds = new Set(badGw.map((g) => g.device_id));
+    return {
+      total: rows.reduce((a, r) => a + w(r), 0),
+      online: by.online || 0, connecting: by.connecting || 0,
+      reconnecting: by.reconnecting || 0, grace: by.grace || 0,
+      unavailable: by.unavailable || 0, config: by.config || 0,
+      bad_gateways: badGw.length,
+      bad_gateway_children: rows.filter((r) => badIds.has(r.gateway_id)).reduce((a, r) => a + w(r), 0),
+    };
+  }
+
+  countByToggle() {
+    const opt = (key, label) => {
+      const on = this.s.countBy === key;
+      return `<button data-act="count-by" data-by="${key}" aria-pressed="${on}"
+        style="height:28px;padding:0 12px;border:0;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;
+        background:${on ? C.card : "transparent"};color:${on ? C.ink : C.ink3};
+        box-shadow:${on ? "0 1px 2px rgba(24,39,58,.12)" : "none"}">${label}</button>`;
+    };
+    return `<div style="display:flex;justify-content:flex-end">
+      <div role="group" aria-label="Считать" style="display:inline-flex;gap:2px;padding:2px;border-radius:8px;background:#EDF1F4;border:1px solid ${C.line}">
+        ${opt("devices", "Устройства")}${opt("entities", "Сущности")}
+      </div></div>`;
+  }
+
   // ================================================== 01 Обзор ============
   vOverview() {
-    const s = this.sum(), rows = this.rows();
+    const rows = this.rows();
     if (!this.d.overview) return `<div class="pad muted">Загрузка…</div>`;
+    const byEntities = this.s.countBy === "entities";
+    const s = byEntities ? this.sumEntities() : this.sum();
 
     const tiles = [
-      { label: "Всего устройств", value: s.total, icon: "i-chip", color: "#98A2AC", vColor: C.ink },
+      { label: byEntities ? "Всего сущностей" : "Всего устройств", value: s.total, icon: "i-chip", color: "#98A2AC", vColor: C.ink },
       { label: "Онлайн", value: s.online, icon: "i-check", color: C.ok, vColor: C.ok },
       // Без этой плитки устройства в состоянии «Подключение» не попадали
       // никуда: на объекте было «Всего 72» при нулях во всех остальных
@@ -509,7 +557,7 @@ class BmsControlCenter extends HTMLElement {
       { label: "Переподключение", value: s.reconnecting, icon: "i-refresh", color: C.warn, note: "ретраи", vColor: s.reconnecting ? C.warn : C.ink },
       { label: "Grace-период", value: s.grace, icon: "i-clock", color: C.grace, note: "ожидание", vColor: s.grace ? C.grace : C.ink },
       { label: "Недоступно", value: s.unavailable, icon: "i-octagon", color: C.bad, note: "подтв. сбой", vColor: s.unavailable ? C.bad : C.ink },
-      { label: "Шлюзы с проблемой", value: s.bad_gateways, icon: "i-alert", color: C.stale, note: s.bad_gateway_children ? `${s.bad_gateway_children} детей` : "", vColor: s.bad_gateways ? C.stale : C.ink },
+      { label: "Шлюзы с проблемой", value: s.bad_gateways, icon: "i-alert", color: C.stale, note: s.bad_gateway_children ? `${s.bad_gateway_children} ${byEntities ? "сущн." : "детей"}` : "", vColor: s.bad_gateways ? C.stale : C.ink },
     ].map((t) => `
       <div class="tile" style="--tc:${t.color}">
         <div class="tl">${icon(t.icon, 14, t.color)}<span>${t.label}</span></div>
@@ -567,9 +615,10 @@ class BmsControlCenter extends HTMLElement {
         <span class="areason">${esc(r.last_error || "—")}</span>
         <span class="amono">${age(r.last_update_age)}</span>
         ${btn("Открыть", { act: "open-device", data: `data-id="${esc(r.device_id)}"`, small: true })}
-      </div>`).join("") : empty(`Все ${s.total} устройств на связи`);
+      </div>`).join("") : empty(`Все ${rows.length} устройств на связи`);
 
     return `<div class="pad col16" style="max-width:1560px">
+      ${this.countByToggle()}
       <div class="tiles">${tiles}</div>
       <div class="row16">
         <div class="col16" style="flex:1 1 480px;min-width:320px">
@@ -1455,6 +1504,11 @@ class BmsControlCenter extends HTMLElement {
     if (a === "dtab") { this.s.deviceTab = el.dataset.tab; return this.paint(); }
     if (a === "refresh") return this.refresh();
     if (a === "expert") { this.s.expert = !this.s.expert; return this.paint(); }
+    if (a === "count-by") {
+      this.s.countBy = el.dataset.by === "entities" ? "entities" : "devices";
+      writePref("bms_cc_count_by", this.s.countBy);
+      return this.paint();
+    }
     if (a === "incidents") { this.s.incidentsOnly = !this.s.incidentsOnly; return this.paint(); }
     if (a === "chip") {
       this.s.mapState = this.s.mapState === el.dataset.state ? null : el.dataset.state;

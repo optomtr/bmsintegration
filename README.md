@@ -525,6 +525,14 @@ real gateways are now registered explicitly before the platforms start. The
 record's fields come from one helper shared with the entities, so it is not
 rewritten back and forth on every start.
 
+### The overview counts devices or entities
+
+A toggle above the overview tiles switches every count - total, online, the
+state tiles and the health bar - between devices and entities, where each
+device weighs as many entities as it carries. The choice is the viewer's, kept
+in the browser, not a setting of the site. The attention list stays a list of
+devices either way.
+
 ## Install
 
 ### Manual
