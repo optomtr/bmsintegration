@@ -5,6 +5,7 @@
 методы клиента облака — если хоть один пройдёт мимо замка, тест упадёт.
 """
 
+import ast
 import asyncio
 import os
 import sys
@@ -182,6 +183,66 @@ class SourceGuards(unittest.TestCase):
         init = self._src("__init__.py")
         self.assertIn("set_global_lockdown", init)
         self.assertIn("tuya_api.set_lockdown(lockdown)", init)
+
+
+
+class SettingsWizardKeepsIt(unittest.TestCase):
+    """Мастер «Настроить» у записи не стирает изолированный режим.
+
+    Завершение мастера Home Assistant записывает его data в options записи
+    целиком (config_entries.OptionsFlowManager.async_finish_flow, ядро
+    2026.9.3). Мастер отдавал пустой словарь, и любое добавление устройства
+    стирало всё, что хранит панель, - в том числе запрет обмена с облаком.
+    """
+
+    PATH = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "custom_components", "bms_integration", "config_flow.py",
+    )
+
+    def _options_flow(self):
+        with open(self.PATH, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        return next(
+            n for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "LocalTuyaOptionsFlowHandler"
+        )
+
+    def test_no_exit_hands_back_empty_options(self):
+        for call in ast.walk(self._options_flow()):
+            if not (isinstance(call, ast.Call) and getattr(call.func, "attr", "") == "async_create_entry"):
+                continue
+            data = next((k.value for k in call.keywords if k.arg == "data"), None)
+            self.assertFalse(
+                isinstance(data, ast.Dict) and not data.keys,
+                f"строка {call.lineno}: data={{}} сотрёт options записи",
+            )
+
+    def test_update_entry_returns_current_options(self):
+        fn = next(
+            n for n in self._options_flow().body
+            if isinstance(n, ast.FunctionDef) and n.name == "_update_entry"
+        )
+        fn.decorator_list = []
+        namespace = {"copy": __import__("copy"), "time": __import__("time"),
+                     "ATTR_UPDATED_AT": "updated_at"}
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), "config_flow.py", "exec"), namespace)
+
+        class Entry:
+            data = {"devices": {}}
+            options = {"cloud_lockdown": True, "integration_debug": True}
+            title = "bms"
+
+        class Flow:
+            config_entry = Entry()
+            hass = type("H", (), {"config_entries": type("CE", (), {
+                "async_update_entry": lambda self, *a, **k: True})()})()
+
+            def async_create_entry(self, title, data):
+                return data
+
+        result = namespace["_update_entry"](Flow(), {"cloud_locks": {}})
+        self.assertEqual(result, {"cloud_lockdown": True, "integration_debug": True})
 
 
 if __name__ == "__main__":

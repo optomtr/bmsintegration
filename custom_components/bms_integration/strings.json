@@ -35,7 +35,8 @@
     "abort": {
       "already_configured": "This account has already been configured.",
       "device_success": "Device {dev_name} successfully {action}.",
-      "no_entities": "Cannot remove all entities from a device.\nIf you want to delete a device: Browse to `Devices & services` menu, search for your device in `Devices` tab, click the 3 dots in the `Device info` frame, and press the `Delete` button."
+      "no_entities": "Cannot remove all entities from a device.\nIf you want to delete a device: Browse to `Devices & services` menu, search for your device in `Devices` tab, click the 3 dots in the `Device info` frame, and press the `Delete` button.",
+      "no_cloud_locks": "This cloud account has no locks that are not added yet."
     },
     "error": {
       "authentication_failed": "Failed to authenticate.\n{msg}",
@@ -60,7 +61,15 @@
         "menu_options": {
           "add_device": "Add new device",
           "edit_device": "Reconfigure existing device",
-          "configure_cloud": "Manage Cloud API account"
+          "configure_cloud": "Manage Cloud API account",
+          "add_cloud_lock": "Add cloud-only lock"
+        }
+      },
+      "add_cloud_lock": {
+        "title": "Add cloud-only lock",
+        "description": "Tuya Wi-Fi locks keep their radio off and accept no local connections, so they never show up in device discovery. Such a lock is opened through the Tuya cloud, the same way the app does it. The cloud project needs the Smart Lock Open Service enabled, and remote unlock without password must be allowed in the lock's settings in the Tuya app. Works only while the site has internet.",
+        "data": {
+          "selected_device": "Lock"
         }
       },
       "add_device": {

@@ -42,6 +42,7 @@ from .websocket import async_register_websocket_api
 from .const import (
     device_registry_fields,
     ATTR_UPDATED_AT,
+    CONF_CLOUD_LOCKS,
     CONF_FRIENDLY_NAME,
     DEFAULT_WATCHDOG_INTERVAL,
     OPT_DEBUG,
@@ -58,6 +59,7 @@ from .const import (
 )
 
 from .discovery import TuyaDiscovery
+from .cloud_lock import CloudLocks
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -639,7 +641,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             hass, tuya_api.async_connect(), "localtuya-cloudAPI"
         )
 
-    hass_localtuya = HassLocalTuyaData(tuya_api, {})
+    # Облачные замки без облака не работают: при выключенном облаке запись
+    # их не заводит, а не показывает замок, который никогда не откроется.
+    cloud_locks = None
+    if not no_cloud and (locks := entry.data.get(CONF_CLOUD_LOCKS)):
+        cloud_locks = CloudLocks(entry.entry_id, tuya_api, locks)
+    hass_localtuya = HassLocalTuyaData(tuya_api, {}, cloud_locks)
     hass.data[DOMAIN][entry.entry_id] = hass_localtuya
 
     # Отладка всей интеграции одним переключателем из панели: иначе её
@@ -961,6 +968,21 @@ async def async_remove_config_entry_device(
     }
     for entity_id in entities.values():
         ent_reg.async_remove(entity_id)
+
+    cloud_locks = config_entry.data.get(CONF_CLOUD_LOCKS) or {}
+    if dev_id in cloud_locks:
+        # Без этого облачный замок возвращался после первой же перезагрузки:
+        # удаление снимало его из реестра, но не из записи.
+        hass.config_entries.async_update_entry(
+            config_entry,
+            data={
+                **config_entry.data,
+                CONF_CLOUD_LOCKS: {k: v for k, v in cloud_locks.items() if k != dev_id},
+                ATTR_UPDATED_AT: str(int(time.time() * 1000)),
+            },
+        )
+        _LOGGER.info("Cloud lock %s removed.", dev_id)
+        return True
 
     if dev_id not in config_entry.data[CONF_DEVICES]:
         _LOGGER.info(

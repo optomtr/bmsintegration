@@ -7,9 +7,12 @@ from .config_flow import col_to_select
 
 import voluptuous as vol
 from homeassistant.components.lock import DOMAIN, LockEntity
-from .entity import LocalTuyaEntity, async_setup_entry
+from homeassistant.core import callback
+from homeassistant.helpers.event import async_call_later
+from .entity import LocalTuyaEntity, async_setup_entry as _async_setup_platform
 
-from .const import CONF_JAMMED_DP, CONF_LOCK_STATE_DP
+from . import cloud_lock
+from .const import CONF_JAMMED_DP, CONF_LOCK_STATE_DP, DOMAIN as INTEGRATION
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -68,4 +71,85 @@ class LocalTuyaLock(LocalTuyaEntity, LockEntity):
         return
 
 
-async_setup_entry = partial(async_setup_entry, DOMAIN, LocalTuyaLock, flow_schema)
+class CloudTuyaLock(LockEntity):
+    """Замок, которым можно управлять только через облако Tuya."""
+
+    _attr_has_entity_name = True
+    _attr_name = None
+    _attr_should_poll = False
+    # Положения засова замок не сообщает: «открыт» держится окно после удачной
+    # команды, дальше замок запирается сам.
+    _attr_assumed_state = True
+
+    def __init__(self, locks: cloud_lock.CloudLocks, dev_id: str, config: dict):
+        self._locks = locks
+        self._dev_id = dev_id
+        self._attr_unique_id = f"cloud_lock_{dev_id}"
+        self._attr_device_info = cloud_lock.device_info(dev_id, config)
+        self._attr_is_locked = True
+        self._attr_is_unlocking = False
+        self._attr_is_locking = False
+        self._relock = None
+
+    @property
+    def available(self) -> bool:
+        # Связь с замком не опрашивается (см. cloud_lock). Недоступен он только
+        # в изолированном режиме: тогда команда не уйдёт наверняка.
+        return not self._locks.api.lockdown
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._cancel_relock()
+
+    def _cancel_relock(self) -> None:
+        if self._relock:
+            self._relock()
+            self._relock = None
+
+    async def _operate(self, open_door: bool) -> None:
+        """Команда в облако; «открывается/запирается» снимается при любом исходе."""
+        flag = "_attr_is_unlocking" if open_door else "_attr_is_locking"
+        setattr(self, flag, True)
+        self.async_write_ha_state()
+        try:
+            await cloud_lock.async_operate(self._locks.api, self._dev_id, open_door)
+        except BaseException:
+            setattr(self, flag, False)
+            self.async_write_ha_state()
+            raise
+        setattr(self, flag, False)
+
+    async def async_unlock(self, **kwargs: Any) -> None:
+        await self._operate(True)
+        self._attr_is_locked = False
+        self._cancel_relock()
+        self._relock = async_call_later(
+            self.hass, cloud_lock.RELOCK_SECONDS, self._relocked
+        )
+        self.async_write_ha_state()
+
+    async def async_lock(self, **kwargs: Any) -> None:
+        await self._operate(False)
+        self._cancel_relock()
+        self._attr_is_locked = True
+        self.async_write_ha_state()
+
+    # callback обязателен: без него Home Assistant выполнит отложенный вызов в
+    # потоке, а запись состояния оттуда запрещена.
+    @callback
+    def _relocked(self, _now=None) -> None:
+        self._relock = None
+        self._attr_is_locked = True
+        self.async_write_ha_state()
+
+
+_async_setup_local = partial(_async_setup_platform, DOMAIN, LocalTuyaLock, flow_schema)
+
+
+async def async_setup_entry(hass, config_entry, async_add_entities):
+    """Локальные замки из устройств записи и облачные - из её списка замков."""
+    await _async_setup_local(hass, config_entry, async_add_entities)
+    locks = getattr(hass.data[INTEGRATION][config_entry.entry_id], "cloud_locks", None)
+    if locks and locks.locks:
+        async_add_entities(
+            [CloudTuyaLock(locks, dev_id, cfg) for dev_id, cfg in locks.locks.items()]
+        )

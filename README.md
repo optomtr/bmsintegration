@@ -100,6 +100,18 @@ the license text.
 - The Control Center overview can count entities instead of devices, its
   incident feed can be cleared (and brought back), and it draws a health ring
   plus breakdowns by connection type and by room, animated once per visit.
+- Cloud-only locks: a Tuya Wi-Fi lock that accepts no local connection at all
+  (the radio sleeps, every port is closed) can be added from the entry's
+  **Configure → Add cloud-only lock**. It opens through the Tuya cloud
+  (Smart Lock Open Service must be enabled in the cloud project) and shows
+  "unlocked" for a few seconds after a successful command. Nothing is polled:
+  the cloud hears from the integration only when the door is opened, two
+  requests per opening. Refusals from the cloud are shown in plain words: no
+  subscription, lock offline, remote unlock switched off in the app, isolation
+  mode.
+- Saving anything through an entry's **Configure** dialog no longer erases the
+  settings kept by the Control Center (isolation mode, debug, availability
+  windows, watchdog interval).
 - A gateway that reports its sub-devices in several reply frames no longer
   gets a fixed subset of them flap-disconnected: absence is now judged over
   the union of all frames of a poll cycle, across two consecutive cycles,

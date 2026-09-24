@@ -147,6 +147,8 @@ class HassLocalTuyaData(NamedTuple):
 
     cloud_data: TuyaCloudApi
     devices: dict[str, TuyaDevice]
+    # Замки, которыми управляют только через облако (cloud_lock.CloudLocks).
+    cloud_locks: Any = None
 
 
 class TuyaDevice(TuyaListener, ContextualLogger):

@@ -43,12 +43,15 @@ from homeassistant.const import (
 )
 
 from .coordinator import HassLocalTuyaData
+from .cloud_lock import lock_candidates, lock_labels
 from .core import pytuya
 from .core.cloud_api import TUYA_ENDPOINTS, TuyaCloudApi
 from .core.helpers import templates, get_gateway_by_deviceid, gen_localtuya_entities
 from .const import (
     ATTR_UPDATED_AT,
+    CONF_ADD_CLOUD_LOCK,
     CONF_ADD_DEVICE,
+    CONF_CLOUD_LOCKS,
     CONF_CONFIGURE_CLOUD,
     CONF_DPS_STRINGS,
     CONF_EDIT_DEVICE,
@@ -286,8 +289,47 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
 
         if not self.config_entry.data.get(CONF_NO_CLOUD, True):
             self.hass.async_create_task(self.cloud_data.async_get_devices_list())
+            # Wi-Fi замок по локальной сети не отвечает вовсе, поэтому в поиске
+            # устройств его нет - заводится отдельно, через облако.
+            configure_menu.insert(
+                configure_menu.index(CONF_CONFIGURE_CLOUD), CONF_ADD_CLOUD_LOCK
+            )
 
         return self.async_show_menu(step_id="init", menu_options=configure_menu)
+
+    async def async_step_add_cloud_lock(self, user_input=None):
+        """Замок, которым можно управлять только через облако."""
+        locks = dict(self.config_entry.data.get(CONF_CLOUD_LOCKS) or {})
+        if user_input is not None:
+            dev_id = user_input[SELECTED_DEVICE]
+            cloud_dev = self.cloud_data.device_list.get(dev_id) or {}
+            locks[dev_id] = {
+                CONF_FRIENDLY_NAME: cloud_dev.get("name") or dev_id,
+                CONF_PRODUCT_NAME: cloud_dev.get(CONF_PRODUCT_NAME) or "",
+                TUYA_CATEGORY: cloud_dev.get(TUYA_CATEGORY) or "",
+            }
+            return self._update_entry({CONF_CLOUD_LOCKS: locks})
+
+        await self.cloud_data.async_get_devices_list(force_update=True)
+        # Один и тот же замок может оказаться в облаке нескольких записей;
+        # второй экземпляр открывал бы ту же дверь из двух мест.
+        taken: set[str] = set()
+        for entry in self.hass.config_entries.async_entries(DOMAIN):
+            taken.update(entry.data.get(CONF_DEVICES) or {})
+            taken.update(entry.data.get(CONF_CLOUD_LOCKS) or {})
+        candidates = lock_candidates(self.cloud_data.device_list, taken)
+        if not candidates:
+            return self.async_abort(reason="no_cloud_locks")
+        return self.async_show_form(
+            step_id="add_cloud_lock",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(SELECTED_DEVICE): col_to_select(
+                        lock_labels(candidates)
+                    )
+                }
+            ),
+        )
 
     async def async_step_configure_cloud(self, user_input=None):
         """Handle the initial step."""
@@ -481,7 +523,9 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
                             dev_config,
                             self.device_data[CONF_FRIENDLY_NAME],
                         )
-                        return self.async_create_entry(title="", data={})
+                        return self.async_create_entry(
+                            title="", data=dict(self.config_entry.options)
+                        )
 
                     # We will restore device details if it's already existed!
                     for res_conf in [CONF_GATEWAY_ID, CONF_MODEL, CONF_PRODUCT_KEY]:
@@ -848,7 +892,13 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
         self.hass.config_entries.async_update_entry(
             self.config_entry, data=_data, title=new_title or self.config_entry.title
         )
-        return self.async_create_entry(title=new_title, data={})
+        # Завершение мастера записывает data в options записи целиком. Пустой
+        # словарь здесь стирал всё, что хранит панель: изолированный режим,
+        # отладку, окна доступности - добавил устройство, и запись снова ходит
+        # в облако.
+        return self.async_create_entry(
+            title=new_title, data=dict(self.config_entry.options)
+        )
 
     def available_dps_strings(self):
         """Return list of DPs use by the device's entities."""
