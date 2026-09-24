@@ -221,7 +221,15 @@ class TuyaCloudApi:
                 return self._logger.debug(f"Refresh Token failed due to: {res}")
 
         timestamp = str(int(time.time() * 1000))
-        payload = self.generate_payload(method, timestamp, url, headers, body)
+        # Подписывается и отправляется ОДНА и та же строка. Раньше подпись
+        # считалась от пустого тела, а уходило json.dumps(None) == "null", и
+        # облако отвечало «sign invalid» (1004) на первый же POST - запрос
+        # билета для открытия замка. Словарь в подпись не шёл вовсе: .encode()
+        # у него нет. До облачного замка интеграция ходила только GET-ами.
+        body_text = "" if body is None else json.dumps(body)
+        if body_text:
+            headers = {**headers, "Content-Type": "application/json"}
+        payload = self.generate_payload(method, timestamp, url, headers, body_text)
         default_par = {
             "client_id": self._client_id,
             "access_token": self._access_token,
@@ -255,7 +263,7 @@ class TuyaCloudApi:
                     async with session.post(
                         full_url,
                         headers=dict(default_par, **headers),
-                        data=json.dumps(body),
+                        data=body_text,
                         timeout=REQUEST_TIMEOUT,
                     ) as resp:
                         return await _read_json(resp)
@@ -264,7 +272,7 @@ class TuyaCloudApi:
                     async with session.put(
                         full_url,
                         headers=dict(default_par, **headers),
-                        data=json.dumps(body),
+                        data=body_text,
                         timeout=REQUEST_TIMEOUT,
                     ) as resp:
                         return await _read_json(resp)

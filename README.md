@@ -109,6 +109,9 @@ the license text.
   requests per opening. Refusals from the cloud are shown in plain words: no
   subscription, lock offline, remote unlock switched off in the app, isolation
   mode.
+- Cloud requests with a body are signed over the exact text that is sent. The
+  first POST the integration ever made - the unlock ticket - was refused with
+  "sign invalid" (1004).
 - Saving anything through an entry's **Configure** dialog no longer erases the
   settings kept by the Control Center (isolation mode, debug, availability
   windows, watchdog interval).

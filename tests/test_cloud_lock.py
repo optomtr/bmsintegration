@@ -308,6 +308,110 @@ class Platforms(unittest.TestCase):
         self.assertEqual(self.setup(with_locks=False), [])
 
 
+class WireSession:
+    """Сетевой слой по сценарию: запоминает, что ушло в сеть на самом деле."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.sent = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def _request(self, method, url, headers, data=None, timeout=None):
+        self.sent.append({"method": method, "url": url, "headers": headers, "data": data})
+        reply = self.replies.pop(0)
+
+        class Resp:
+            status = 200
+
+            async def json(self, content_type=None):
+                return reply
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return Resp()
+
+    def get(self, url, headers, timeout=None):
+        return self._request("GET", url, headers, None, timeout)
+
+    def post(self, url, headers, data=None, timeout=None):
+        return self._request("POST", url, headers, data, timeout)
+
+    def put(self, url, headers, data=None, timeout=None):
+        return self._request("PUT", url, headers, data, timeout)
+
+
+def tuya_sign(client_id, secret, token, t, method, path, body_text):
+    """Подпись по документации Tuya, написанная заново, а не взятая из клиента:
+    иначе тест подтверждал бы клиент им же самим."""
+    import hashlib
+    import hmac
+
+    content = hashlib.sha256((body_text or "").encode("utf-8")).hexdigest()
+    message = client_id + token + t + f"{method}\n{content}\n\n{path}"
+    return hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest().upper()
+
+
+class Signing(unittest.TestCase):
+    """С объекта: первое же открытие - «sign invalid (код 1004)».
+
+    Подпись считалась от пустого тела, а в сеть уходило json.dumps(None) ==
+    "null"; словарь-тело до подписи не доходил вовсе (.encode у него нет).
+    До облачного замка интеграция ходила в облако только GET-ами. Фальшивый
+    клиент в тестах выше этого не видит - здесь настоящий, до самой сети.
+    """
+
+    def api(self, replies):
+        cloud_api = sys.modules["custom_components.bms_integration.core.cloud_api"]
+        api = cloud_api.TuyaCloudApi("eu", "client", "secret", "user")
+        api._token_expire_time = 2**31
+        api._access_token = "token"
+        api._session = WireSession(replies)
+        return api
+
+    def check(self, sent, path):
+        h = sent["headers"]
+        expected = tuya_sign("client", "secret", "token", h["t"], sent["method"], path, sent["data"])
+        self.assertEqual(h["sign"], expected, f"{sent['method']} {path}: подпись не от того тела")
+
+    def test_post_without_body_signs_what_it_sends(self):
+        api = self.api([ok({"ticket_id": "t1"})])
+        run(api.async_make_request("POST", TICKET))
+        (sent,) = api._session.sent
+        self.check(sent, TICKET)
+
+    def test_post_with_body_signs_what_it_sends(self):
+        api = self.api([ok()])
+        run(api.async_make_request("POST", OPERATE, {"ticket_id": "t1", "open": True}))
+        (sent,) = api._session.sent
+        self.assertEqual(json.loads(sent["data"]), {"ticket_id": "t1", "open": True})
+        self.assertEqual(sent["headers"].get("Content-Type"), "application/json")
+        self.check(sent, OPERATE)
+
+    def test_get_is_unchanged(self):
+        api = self.api([ok({})])
+        run(api.async_make_request("GET", f"/v1.0/devices/{LOCK}"))
+        (sent,) = api._session.sent
+        self.assertIsNone(sent["data"])
+        self.check(sent, f"/v1.0/devices/{LOCK}")
+
+    def test_opening_end_to_end_through_the_real_client(self):
+        api = self.api([ok({"ticket_id": "t1", "ticket_key": "k", "expire_time": 300}), ok()])
+        run(cloud_lock.async_operate(api, LOCK, True))
+        ticket, operate = api._session.sent
+        self.check(ticket, TICKET)
+        self.check(operate, OPERATE)
+        self.assertEqual(json.loads(operate["data"]), {"ticket_id": "t1", "open": True})
+
+
 def _removal_hook():
     """async_remove_config_entry_device из __init__.py (весь модуль под
     заглушками не поднять - как в test_via_device_id)."""
