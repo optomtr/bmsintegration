@@ -28,7 +28,9 @@ from .const import (
     CONF_GATE_OPEN_STATE,
     CONF_GATE_OPENING_STATE,
     CONF_GATE_STATE_DP,
+    CONF_POSITION_CLOSED_RAW,
     CONF_POSITION_INVERTED,
+    CONF_POSITION_OPEN_RAW,
     CONF_POSITIONING_MODE,
     CONF_SET_POSITION_DP,
     CONF_SPAN_TIME,
@@ -99,12 +101,60 @@ def flow_schema(dps):
         vol.Optional(CONF_GATE_CLOSING_STATE, default=DEFAULT_GATE_CLOSING_STATE): str,
         vol.Optional(CONF_GATE_INVERTED, default=False): bool,
         vol.Optional(CONF_POSITION_INVERTED, default=False): bool,
+        vol.Optional(CONF_POSITION_OPEN_RAW): vol.All(
+            vol.Coerce(int), vol.Range(min=0, max=100)
+        ),
+        vol.Optional(CONF_POSITION_CLOSED_RAW): vol.All(
+            vol.Coerce(int), vol.Range(min=0, max=100)
+        ),
         vol.Optional(CONF_SPAN_TIME, default=DEFAULT_SPAN_TIME): vol.All(
             vol.Coerce(float), vol.Range(min=1.0, max=300.0)
         ),
         vol.Optional(CONF_STOP_SWITCH_DP): col_to_select(dps, is_dps=True),
         vol.Optional(CONF_DEVICE_CLASS): DEVICE_CLASSES_SCHEMA,
     }
+
+
+def _calibration(config) -> tuple[float, float] | None:
+    """Показания мотора (открыто, закрыто) или None, если штора не калибрована.
+
+    Бывают моторы, которые считают положение в обратную сторону и не доходят
+    до края шкалы: на объекте закрытая штора показывала 100, открытая - 7.
+    Одна галочка «инвертировать» такое не лечит, нужны оба края. Не заданный
+    край берётся из этой галочки, чтобы калибровка одного края не
+    переворачивала штору.
+    """
+    open_raw = config.get(CONF_POSITION_OPEN_RAW)
+    closed_raw = config.get(CONF_POSITION_CLOSED_RAW)
+    if open_raw is None and closed_raw is None:
+        return None
+    inverted = bool(config.get(CONF_POSITION_INVERTED))
+    if open_raw is None:
+        open_raw = 0 if inverted else 100
+    if closed_raw is None:
+        closed_raw = 100 if inverted else 0
+    if open_raw == closed_raw:
+        return None
+    return float(open_raw), float(closed_raw)
+
+
+def position_from_device(raw: float, config) -> int:
+    """Показание мотора -> положение Home Assistant (0 закрыто, 100 открыто)."""
+    if (ends := _calibration(config)) is None:
+        return round(100 - raw if config.get(CONF_POSITION_INVERTED) else raw)
+    open_raw, closed_raw = ends
+    position = (raw - closed_raw) / (open_raw - closed_raw) * 100
+    # За краем калибровки - край: мотор, доехавший до 5 при «открыто = 7»,
+    # открыт полностью, а не на 102%.
+    return round(min(100.0, max(0.0, position)))
+
+
+def position_to_device(position: int, config) -> int:
+    """Положение Home Assistant -> значение, которое понимает мотор."""
+    if (ends := _calibration(config)) is None:
+        return 100 - position if config.get(CONF_POSITION_INVERTED) else position
+    open_raw, closed_raw = ends
+    return round(closed_raw + position / 100 * (open_raw - closed_raw))
 
 
 class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
@@ -295,9 +345,9 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
             self.debug("Done")
 
         elif self._config[CONF_POSITIONING_MODE] == MODE_SET_POSITION:
-            converted_position = int(kwargs[ATTR_POSITION])
-            if self._position_inverted:
-                converted_position = 100 - converted_position
+            converted_position = position_to_device(
+                int(kwargs[ATTR_POSITION]), self._config
+            )
             if 0 <= converted_position <= 100 and self.has_config(CONF_SET_POSITION_DP):
                 await self._device.set_dp(
                     converted_position, self._config[CONF_SET_POSITION_DP]
@@ -455,9 +505,9 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
                 except (TypeError, ValueError):
                     self.debug("Ignoring non-numeric position %r", curr_pos)
                 else:
-                    if self._position_inverted:
-                        curr_pos = 100 - curr_pos
-                    self._current_cover_position = round(curr_pos)
+                    self._current_cover_position = position_from_device(
+                        curr_pos, self._config
+                    )
 
         if (
             self._config[CONF_POSITIONING_MODE] == MODE_TIME_BASED

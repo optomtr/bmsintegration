@@ -109,6 +109,11 @@ the license text.
   requests per opening. Refusals from the cloud are shown in plain words: no
   subscription, lock offline, remote unlock switched off in the app, isolation
   mode.
+- Cover calibration: two optional fields in a cover's settings say what the
+  motor reports when fully open and when fully closed (for example 7 and 100
+  for a motor that counts backwards and stops short of the scale's end). Home
+  Assistant then sees a true 0-100, and position commands are converted back.
+  Covers without these fields behave exactly as before.
 - Cloud requests with a body are signed over the exact text that is sent. The
   first POST the integration ever made - the unlock ticket - was refused with
   "sign invalid" (1004).
