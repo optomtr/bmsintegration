@@ -292,5 +292,12 @@
       }
     }
   },
-  "title": "BMS Integration"
+  "title": "BMS Integration",
+  "entity": {
+    "button": {
+      "cover_calibrate": {
+        "name": "Откалибровать"
+      }
+    }
+  }
 }

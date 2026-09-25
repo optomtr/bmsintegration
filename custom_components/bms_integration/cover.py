@@ -1,6 +1,7 @@
 """Platform to locally control Tuya-based cover devices."""
 
 import asyncio
+import copy
 import logging
 import time
 from functools import partial
@@ -13,12 +14,20 @@ from homeassistant.components.cover import (
     CoverEntity,
     DEVICE_CLASSES_SCHEMA,
 )
-from homeassistant.const import CONF_DEVICE_CLASS
+from homeassistant.const import (
+    CONF_DEVICE_CLASS,
+    CONF_DEVICES,
+    CONF_ENTITIES,
+    CONF_ID,
+    CONF_PLATFORM,
+)
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.core import callback, CALLBACK_TYPE
 from homeassistant.helpers.event import async_call_later
 from .config_flow import col_to_select
 from .entity import LocalTuyaEntity, async_setup_entry
 from .const import (
+    ATTR_UPDATED_AT,
     CONF_COMMANDS_SET,
     CONF_CURRENT_POSITION_DP,
     CONF_GATE_ACTION_DP,
@@ -72,6 +81,19 @@ COVER_MODES = {
 }
 
 COVER_TIMEOUT_TOLERANCE = 3.0
+
+# Калибровка кнопкой: штора сама едет в оба края, а положение мотора в
+# каждом крае записывается в настройки. Край считается достигнутым, когда
+# показание не меняется CALIBRATION_SETTLE секунд, но не раньше полного хода
+# (span_time, не меньше CALIBRATION_MIN_TRAVEL): мотор может прислать
+# показание в начале хода и молчать до конца - принять его за край нельзя.
+CALIBRATION_TICK = 1.0
+CALIBRATION_SETTLE = 3.0
+CALIBRATION_MIN_TRAVEL = 5.0
+CALIBRATION_TIMEOUT = 120.0
+# Меньший разброс краёв - штора не ехала, а не откалибровалась.
+CALIBRATION_MIN_SPREAD = 10
+_monotonic = time.monotonic
 
 DEF_CMD_SET = list(COVER_COMMANDS.values())[0]
 DEF_POS_MODE = list(COVER_MODES.values())[0]
@@ -434,6 +456,117 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
             command[self._stop_switch] = True
         await self._device.set_dps(command)
         self.update_state(STATE_STOPPED)
+
+    @property
+    def can_calibrate(self) -> bool:
+        """Калибровать можно штору, которая сама сообщает своё положение."""
+        return self._config.get(
+            CONF_POSITIONING_MODE
+        ) == MODE_SET_POSITION and self.has_config(CONF_CURRENT_POSITION_DP)
+
+    def _raw_position(self) -> float | None:
+        """Положение, как его сообщает мотор, без калибровки и инверсии."""
+        value = self.dp_value(CONF_CURRENT_POSITION_DP)
+        if isinstance(value, bool):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    async def _drive_to_end(self, command) -> float:
+        """Отправить штору в край и вернуть показание мотора там."""
+        dp = self._config[CONF_CURRENT_POSITION_DP]
+        try:
+            travel = float(self._config.get(CONF_SPAN_TIME) or 0)
+        except (TypeError, ValueError):
+            travel = 0.0
+        travel = max(travel, CALIBRATION_MIN_TRAVEL)
+
+        await self._device.set_dp(command, self._dp_id)
+        start = last_change = _monotonic()
+        last = self._raw_position()
+        while _monotonic() - start < CALIBRATION_TIMEOUT:
+            await asyncio.sleep(CALIBRATION_TICK)
+            now = _monotonic()
+            current = self._raw_position()
+            if current != last:
+                last, last_change = current, now
+            if now - start < travel or now - last_change < CALIBRATION_SETTLE:
+                continue
+            # Похоже, приехала. Переспросить сам мотор: показание из кеша
+            # могло прийти в начале хода, а свежее - ещё не прийти.
+            try:
+                await self._device.async_update_dps([int(dp)])
+            except Exception as ex:  # pylint: disable=broad-except
+                self.debug("Calibration: position refresh failed: %s", ex)
+            await asyncio.sleep(CALIBRATION_TICK)
+            confirmed = self._raw_position()
+            if confirmed is not None and confirmed == last:
+                return confirmed
+            last, last_change = confirmed, _monotonic()
+        if last is None:
+            raise HomeAssistantError(
+                "Мотор не сообщает положение - откалибровать эти шторы нельзя."
+            )
+        raise HomeAssistantError(
+            f"Шторы не остановились за {CALIBRATION_TIMEOUT:.0f} с - калибровка не записана."
+        )
+
+    async def async_calibrate(self) -> tuple[int, int]:
+        """Открыть, закрыть и записать, что мотор показывает в обоих краях."""
+        if not self.can_calibrate:
+            raise HomeAssistantError(
+                "Калибровка нужна шторам, которые сами сообщают положение."
+            )
+        if getattr(self, "_calibrating", False):
+            raise HomeAssistantError("Калибровка этих штор уже идёт.")
+        self._calibrating = True
+        try:
+            if self._current_task is not None:
+                self._current_task.cancel()
+            self.update_state(STATE_OPENING)
+            opened = await self._drive_to_end(self._open_cmd)
+            self.update_state(STATE_CLOSING)
+            closed = await self._drive_to_end(self._close_cmd)
+        finally:
+            self._calibrating = False
+            self.update_state(STATE_STOPPED)
+        if abs(opened - closed) < CALIBRATION_MIN_SPREAD:
+            raise HomeAssistantError(
+                f"Шторы почти не сдвинулись (открыто {opened:g}, закрыто "
+                f"{closed:g}) - калибровка не записана."
+            )
+        self._store_calibration(round(opened), round(closed))
+        return round(opened), round(closed)
+
+    def _store_calibration(self, opened: int, closed: int) -> None:
+        """Записать края в настройки записи без перезагрузки всей записи."""
+        from . import _applied_without_reload
+
+        entry = self.hass.config_entries.async_get_entry(self._device._entry.entry_id)
+        dev_id = self._device_config.id
+        new_data = copy.deepcopy(dict(entry.data))
+        for config in new_data[CONF_DEVICES][dev_id][CONF_ENTITIES]:
+            if str(config.get(CONF_ID)) == str(self._dp_id) and config.get(
+                CONF_PLATFORM
+            ) == "cover":
+                config[CONF_POSITION_OPEN_RAW] = opened
+                config[CONF_POSITION_CLOSED_RAW] = closed
+        stamp = str(int(time.time() * 1000))
+        new_data[ATTR_UPDATED_AT] = stamp
+        # Перезагрузка записи - это переподключение всех её устройств ради
+        # одной шторы. Настройки применяются к живой сущности здесь же.
+        _applied_without_reload[entry.entry_id] = stamp
+        self._config = {
+            **self._config,
+            CONF_POSITION_OPEN_RAW: opened,
+            CONF_POSITION_CLOSED_RAW: closed,
+        }
+        self.hass.config_entries.async_update_entry(entry, data=new_data)
+        if (raw := self._raw_position()) is not None:
+            self._current_cover_position = position_from_device(raw, self._config)
+        self.schedule_update_ha_state()
 
     def status_restored(self, stored_state):
         """Restore the last stored cover status."""
