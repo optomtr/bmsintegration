@@ -721,8 +721,15 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
         # A plain dimmer has no colour-mode datapoint configured, and
         # states[None] = ... put a null key into the command payload.
+        #
+        # Режим шлём, только когда он меняется. С объекта (Zigbee-лента за
+        # шлюзом): «режим = цвет» к каждой смене цвета - это вторая команда по
+        # Zigbee на каждое нажатие. С ней лента сообщала новый цвет в 5 случаях
+        # из 10, без неё - в 5 из 6 и вдвое быстрее. Выключенной лампе режим
+        # шлём всегда: включение может вернуть её в прежний режим.
         if color_mode is not None and (mode_dp := self._config.get(CONF_COLOR_MODE)):
-            states[mode_dp] = color_mode
+            if self._dp_id in states or self.dp_value(mode_dp) != color_mode:
+                states[mode_dp] = color_mode
 
         await self.async_set_dps(states)
 

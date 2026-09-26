@@ -115,6 +115,11 @@ the license text.
   skipped the last ones and was left on a colour passed along the way. While
   one command is on its way, newer ones are merged and sent as one when it is
   done. Buttons and IR remotes still send every press.
+- A light no longer resends its mode with every colour. On a Zigbee strip
+  "mode = colour" was a second Zigbee command per change; without it the strip
+  reported the new colour 5 times in 6 instead of 5 in 10, and twice as fast.
+  Merged commands to a Zigbee device also wait 0.5 s after the gateway's
+  acknowledgement, which only means the gateway received the command.
 - Cloud requests with a body are signed over the exact text that is sent. The
   first POST the integration ever made - the unlock ticket - was refused with
   "sign invalid" (1004).

@@ -126,7 +126,8 @@ class NeighboursAreUnchanged(unittest.TestCase):
         states = turn_on(light, brightness=200)
 
         self.assertIn(COLOUR, states)
-        self.assertEqual(states[MODE], light._modes.color)
+        # Режим уже цветной - не шлётся вовсе (см. ModeOnlyWhenItChanges).
+        self.assertNotIn(MODE, states)
         self.assertNotIn(TEMP, states)
 
     def test_temperature_alone_from_colour_goes_white(self):
@@ -141,7 +142,7 @@ class NeighboursAreUnchanged(unittest.TestCase):
         states = turn_on(light, brightness=200, color_temp_kelvin=3000)
 
         self.assertNotIn(COLOUR, states)
-        self.assertEqual(states[MODE], light._modes.white)
+        self.assertNotIn(MODE, states, "белый остаётся белым - режим не шлётся")
 
     def test_hs_with_brightness_from_white_goes_colour(self):
         light = make_light(light_mod.MAP_MODE_SET[0].white)
@@ -149,6 +150,34 @@ class NeighboursAreUnchanged(unittest.TestCase):
 
         self.assertIn(COLOUR, states)
         self.assertEqual(states[MODE], light._modes.color)
+
+
+
+class ModeOnlyWhenItChanges(unittest.TestCase):
+    """С объекта: «режим = цвет» к каждой смене цвета - вторая Zigbee-команда.
+
+    Лента уже в цвете: с режимом она сообщала новый цвет в 5 случаях из 10,
+    без него - в 5 из 6 и вдвое быстрее.
+    """
+
+    def test_colour_to_colour_sends_no_mode(self):
+        light = make_light(light_mod.MAP_MODE_SET[0].color)
+        states = turn_on(light, hs_color=[120, 80])
+        self.assertIn(COLOUR, states)
+        self.assertNotIn(MODE, states, "режим, который уже стоит, - лишняя команда")
+
+    def test_white_to_colour_still_switches_the_mode(self):
+        light = make_light(light_mod.MAP_MODE_SET[0].white)
+        states = turn_on(light, hs_color=[120, 80])
+        self.assertEqual(states[MODE], light._modes.color)
+
+    def test_turning_on_always_names_the_mode(self):
+        # Выключенная лампа при включении может вспомнить прежний режим.
+        light = make_light(light_mod.MAP_MODE_SET[0].color)
+        light.__class__ = type("_Off", (_Light,), {"is_on": False})
+        states = turn_on(light, hs_color=[120, 80])
+        self.assertEqual(states[MODE], light._modes.color)
+        self.assertIs(states[SWITCH], True)
 
 
 if __name__ == "__main__":

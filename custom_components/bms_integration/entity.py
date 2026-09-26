@@ -1,5 +1,6 @@
 """Code shared between all platforms."""
 
+import asyncio
 import logging
 from typing import Any, Coroutine, Callable
 
@@ -128,6 +129,10 @@ def get_entity_config(config_entry, dp_id) -> dict:
         if entity[CONF_ID] == dp_id:
             return entity
     raise Exception(f"missing entity config for id {dp_id}")
+
+
+# Пауза между слитыми командами одному Zigbee-устройству (см. _send_queued).
+ZIGBEE_COMMAND_GAP = 0.5
 
 
 class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
@@ -554,6 +559,12 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
         while self._queued_command is not None:
             queued, self._queued_command = self._queued_command, None
             await self._send_dps_background(*queued)
+            if self._queued_command is not None and self._device.is_subdevice:
+                # «Принято» от шлюза - это «шлюз получил», а не «лампа
+                # выполнила»: по Zigbee это ещё 0,2-0,5 с. Следующая команда,
+                # посланная сразу, налезала на незаконченную, и лента теряла
+                # её отчёт, а бывало и саму команду.
+                await asyncio.sleep(ZIGBEE_COMMAND_GAP)
 
     async def async_set_dp(self, value, dp_id):
         """Set a single DP, optionally returning to Home Assistant optimistically."""

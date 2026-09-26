@@ -31,6 +31,7 @@ class SlowDevice:
     is_connecting = False
     is_sleep = False
     connected = True
+    is_subdevice = False
 
     def __init__(self, fail=None):
         self.status = {"61": RED}
@@ -150,6 +151,46 @@ class Light(unittest.TestCase):
         # Откат слитой команды - к синему, который до неё уже ушёл, а не к
         # промежуточному зелёному и не к красному, бывшему до всего.
         self.assertEqual(asyncio.run(scenario()), [({"61": YELLOW}, {"61": BLUE})])
+
+
+class ZigbeeGap(unittest.TestCase):
+    """«Принято» от шлюза - не «выполнено»: следующей команде Zigbee-ленте
+    нужна пауза, иначе она налезает на незаконченную и теряет отчёт."""
+
+    def run_burst(self, subdevice):
+        sleeps = []
+        real_sleep = asyncio.sleep
+
+        async def fake_sleep(delay):
+            sleeps.append(delay)
+            await real_sleep(0)
+
+        async def scenario():
+            ent = make(light_mod.LocalTuyaLight)
+            ent._device.is_subdevice = subdevice
+            for colour in (BLUE, GREEN, RED):
+                await ent.async_set_dps({"61": colour})
+                await settle()
+            base.asyncio.sleep = fake_sleep
+            try:
+                await release_all(ent._device)
+            finally:
+                base.asyncio.sleep = real_sleep
+            return ent._device.sent
+
+        sent = asyncio.run(scenario())
+        return sent, [d for d in sleeps if d]
+
+    def test_zigbee_waits_before_the_merged_command(self):
+        sent, sleeps = self.run_burst(subdevice=True)
+        self.assertEqual(sent, [{"61": BLUE}, {"61": RED}])
+        self.assertEqual(sleeps, [base.ZIGBEE_COMMAND_GAP])
+        self.assertGreaterEqual(base.ZIGBEE_COMMAND_GAP, 0.4)
+
+    def test_wifi_does_not_wait(self):
+        sent, sleeps = self.run_burst(subdevice=False)
+        self.assertEqual(sent, [{"61": BLUE}, {"61": RED}])
+        self.assertEqual(sleeps, [])
 
 
 class NotALight(unittest.TestCase):
