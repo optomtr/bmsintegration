@@ -136,6 +136,11 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
     _attr_device_class = None
     _attr_has_entity_name = True
     _attr_should_poll = False
+    # Сливать ли команды, пока предыдущая в пути (см. _queue_latest). Только
+    # для состояний: у кнопки и ИК-пульта пять нажатий - это пять команд.
+    _latest_command_wins = False
+    _queued_command: tuple | None = None
+    _command_sender = None
 
     def __init__(
         self, device: TuyaDevice, device_config: dict, dp_id: str, logger, **kwargs
@@ -507,19 +512,48 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
         # confirmation from the device cannot bounce sibling datapoints back
         # to their stale cached values.
         applied, previous = self._device.apply_optimistic_status(optimistic_status)
+        if self._latest_command_wins:
+            self._queue_latest(status, applied, previous)
+            return
+        self._run_in_background(self._send_dps_background(status, applied, previous))
+
+    def _run_in_background(self, coro):
         # Tie the task to the config entry so it is cancelled on unload
         # instead of outliving the integration.
         entry = getattr(self, "platform", None) and self.platform.config_entry
         if entry is not None:
-            entry.async_create_background_task(
-                self.hass,
-                self._send_dps_background(status, applied, previous),
-                f"{DOMAIN}-optimistic-{self.unique_id}",
+            return entry.async_create_background_task(
+                self.hass, coro, f"{DOMAIN}-optimistic-{self.unique_id}"
             )
+        return self.hass.async_create_task(coro)
+
+    def _queue_latest(self, status: dict, applied: dict, previous: dict) -> None:
+        """Пока команда в пути, новые сливаются в одну - уходит последняя.
+
+        С объекта: цвет купола «очень долго меняется», хотя из Smart Life
+        через тот же хаб - сразу. Круг выбора цвета шлёт команду на каждое
+        движение пальца, и все они уходили разом: пять за 90 мс. Zigbee-лента
+        переваривает их по одной, отвечала на старые ещё секунды, а три
+        последних не выполнила вовсе - купол остался зелёным при выбранном
+        красном. Для состояния света промежуточные значения не нужны: важно
+        только последнее.
+        """
+        if self._queued_command is None:
+            self._queued_command = (dict(status), dict(applied), dict(previous))
         else:
-            self.hass.async_create_task(
-                self._send_dps_background(status, applied, previous)
-            )
+            queued_status, queued_applied, queued_previous = self._queued_command
+            queued_status.update(status)
+            queued_applied.update(applied)
+            # Откатывать слитую команду - к тому, что было до первой из них.
+            for dp, value in previous.items():
+                queued_previous.setdefault(dp, value)
+        if self._command_sender is None or self._command_sender.done():
+            self._command_sender = self._run_in_background(self._send_queued())
+
+    async def _send_queued(self) -> None:
+        while self._queued_command is not None:
+            queued, self._queued_command = self._queued_command, None
+            await self._send_dps_background(*queued)
 
     async def async_set_dp(self, value, dp_id):
         """Set a single DP, optionally returning to Home Assistant optimistically."""

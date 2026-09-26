@@ -109,6 +109,12 @@ the license text.
   requests per opening. Refusals from the cloud are shown in plain words: no
   subscription, lock offline, remote unlock switched off in the app, isolation
   mode.
+- A light sends only the latest of a burst of commands. The colour wheel sends
+  a command for every movement of the finger, and all of them went out at
+  once: a Zigbee strip behind a busy gateway worked through them for seconds,
+  skipped the last ones and was left on a colour passed along the way. While
+  one command is on its way, newer ones are merged and sent as one when it is
+  done. Buttons and IR remotes still send every press.
 - Cloud requests with a body are signed over the exact text that is sent. The
   first POST the integration ever made - the unlock ticket - was refused with
   "sign invalid" (1004).

@@ -217,6 +217,9 @@ def flow_schema(dps):
 class LocalTuyaLight(LocalTuyaEntity, LightEntity):
     """Representation of a Tuya light."""
 
+    # Яркость, цвет, температура - состояния: из пачки команд важна последняя.
+    _latest_command_wins = True
+
     def __init__(
         self,
         device,
