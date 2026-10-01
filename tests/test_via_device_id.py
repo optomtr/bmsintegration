@@ -76,7 +76,8 @@ class FakeDevice:
         self.device_config = config(dev_id)
 
 
-def device_info_of(device, registry):
+def device_info_of(device, registry, new_core=True):
+    entity_mod.VIA_DEVICE_ID_SUPPORTED = new_core
     ent = entity_mod.LocalTuyaEntity.__new__(entity_mod.LocalTuyaEntity)
     ent._device = device
     ent._device_config = device.device_config
@@ -117,6 +118,46 @@ def register_gateways_fn(registry):
 
 class Entry:
     entry_id = "entry-1"
+
+
+class AnOlderCoreKeepsWorking(unittest.TestCase):
+    """С объекта на Home Assistant 2026.6.4: после обновления 121 сущность
+    из 136 без состояния. Регистр того ядра не знает via_device_id и падал с
+    TypeError на каждой сущности за шлюзом. Минимальная версия интеграции -
+    2025.1, поэтому старое ядро получает прежний via_device."""
+
+    def test_old_core_gets_the_old_key(self):
+        gateway = FakeDevice("gw1")
+        child = FakeDevice("lamp1", gateway=gateway)
+        registry = FakeRegistry(known=[(DOMAIN, "local_gw1")])
+
+        info = device_info_of(child, registry, new_core=False)
+
+        self.assertEqual(info.get("via_device"), (DOMAIN, "local_gw1"))
+        self.assertNotIn("via_device_id", info, "ключ, которого старое ядро не знает")
+
+    def test_the_core_is_asked_not_guessed(self):
+        dr_mod = sys.modules["homeassistant.helpers.device_registry"]
+        saved = getattr(dr_mod, "DeviceRegistry", None)
+
+        class New:
+            def async_get_or_create(self, *, config_entry_id, via_device=None, via_device_id=None):
+                pass
+
+        class Old:
+            def async_get_or_create(self, *, config_entry_id, via_device=None):
+                pass
+
+        try:
+            dr_mod.DeviceRegistry = New
+            self.assertTrue(entity_mod._core_takes_via_device_id())
+            dr_mod.DeviceRegistry = Old
+            self.assertFalse(entity_mod._core_takes_via_device_id())
+            del dr_mod.DeviceRegistry
+            self.assertFalse(entity_mod._core_takes_via_device_id())
+        finally:
+            if saved is not None:
+                dr_mod.DeviceRegistry = saved
 
 
 class TheParentIsSetTheNewWay(unittest.TestCase):

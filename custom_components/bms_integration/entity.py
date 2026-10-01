@@ -1,6 +1,7 @@
 """Code shared between all platforms."""
 
 import asyncio
+import inspect
 import logging
 from typing import Any, Coroutine, Callable
 
@@ -130,6 +131,25 @@ def get_entity_config(config_entry, dp_id) -> dict:
             return entity
     raise Exception(f"missing entity config for id {dp_id}")
 
+
+
+def _core_takes_via_device_id() -> bool:
+    """Знает ли регистр устройств этого ядра ключ via_device_id.
+
+    Минимальная версия Home Assistant у интеграции - 2025.1, а ключ появился
+    только с 2026.9; спрашиваем само ядро, а не номер версии.
+    """
+    try:
+        from homeassistant.helpers.device_registry import DeviceRegistry
+
+        return "via_device_id" in inspect.signature(
+            DeviceRegistry.async_get_or_create
+        ).parameters
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return False
+
+
+VIA_DEVICE_ID_SUPPORTED = _core_takes_via_device_id()
 
 # Пауза между слитыми командами одному Zigbee-устройству (см. _send_queued).
 ZIGBEE_COMMAND_GAP = 0.5
@@ -271,7 +291,14 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
                 identifiers={gateway_ident}
             )
             if gateway is not None:
-                device_info["via_device_id"] = gateway.id
+                if VIA_DEVICE_ID_SUPPORTED:
+                    device_info["via_device_id"] = gateway.id
+                else:
+                    # Ядро до 2026.9 ключа via_device_id не знает: регистр
+                    # падал с TypeError на каждой сущности за шлюзом (с
+                    # объекта на 2026.6.4 - 121 сущность из 136 без
+                    # состояния). Там работает прежний via_device.
+                    device_info["via_device"] = gateway_ident
         return device_info
 
     @property
