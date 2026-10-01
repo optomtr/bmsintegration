@@ -109,6 +109,9 @@ the license text.
   requests per opening. Refusals from the cloud are shown in plain words: no
   subscription, lock offline, remote unlock switched off in the app, isolation
   mode.
+- Works again on Home Assistant older than 2026.9: those cores do not accept
+  via_device_id, and every entity behind a gateway failed to load (121 of 136
+  on one site). The integration now asks the core and uses via_device there.
 - A light sends only the latest of a burst of commands. The colour wheel sends
   a command for every movement of the finger, and all of them went out at
   once: a Zigbee strip behind a busy gateway worked through them for seconds,
