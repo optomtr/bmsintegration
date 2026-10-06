@@ -39,9 +39,10 @@ class FakeInterface:
 
 class Config:
     id = "sim-silent-01"
+    manual_dps = ""
 
 
-def make_subdevice(interface, status=None):
+def make_subdevice(interface, status=None, manual_dps=""):
     device = coordinator.TuyaDevice.__new__(coordinator.TuyaDevice)
     device.hass = object()
     device.is_closing = False
@@ -50,6 +51,7 @@ def make_subdevice(interface, status=None):
     device._interface = interface
     device._status = dict(status or {})
     device._device_config = Config()
+    device._device_config.manual_dps = manual_dps
     device._unsub_empty_status = None
     device._empty_status_delay = coordinator.EMPTY_STATUS_RETRY_FIRST
     device.debug = lambda *a, **kw: None
@@ -136,6 +138,43 @@ class SilentSubdeviceIsAskedAgain(unittest.TestCase):
             device._empty_status_delay, coordinator.EMPTY_STATUS_RETRY_FIRST,
             "после переподключения устройство переспрашивалось бы редко",
         )
+
+
+
+class RestoredButSilent(unittest.TestCase):
+    """С объекта: после череды перезагрузок 20 Zigbee-выключателей стояли
+    «неизвестно» до первого нажатия. Теперь устройство за хабом с пустым
+    статусом получает метку восстановления - сущности показывают последнее
+    известное состояние, - но метка - не ответ устройства, и переспрашивать
+    его по-прежнему нужно."""
+
+    def setUp(self):
+        ha_stubs.CALL_LATER_LOG.clear()
+
+    def test_the_restore_mark_is_not_data(self):
+        device = make_subdevice(FakeInterface(), status=dict(coordinator.RESTORE_STATES))
+        self.assertFalse(device._has_reported())
+        device._status["1"] = True
+        self.assertTrue(device._has_reported())
+
+    def test_a_restored_child_is_still_asked_again(self):
+        interface = FakeInterface({"1": True})
+        device = make_subdevice(interface, status=dict(coordinator.RESTORE_STATES))
+        device._schedule_empty_status_retry()
+        armed = pending()
+        self.assertTrue(armed, "метка восстановления выключила повторный запрос")
+        fire(armed[-1])
+        self.assertEqual(device.dispatched, [{"1": True}])
+
+    def test_a_child_added_with_zero_is_asked_like_any_other(self):
+        # «0» вписывали, чтобы добавить Zigbee-устройство, о котором хаб не
+        # хранил состояния; Bluetooth оно от этого не стало.
+        device = make_subdevice(FakeInterface({"1": True}), manual_dps="0")
+        device._schedule_empty_status_retry()
+        armed = pending()
+        self.assertTrue(armed, "устройство с «0» не переспрашивается")
+        fire(armed[-1])
+        self.assertEqual(device.dispatched, [{"1": True}])
 
 
 if __name__ == "__main__":

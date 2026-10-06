@@ -349,14 +349,6 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             e.get(CONF_PLATFORM) == Platform.REMOTE for e in entities
         )
 
-    @property
-    def is_write_only(self):
-        """Return if this sub-device is BLE. We uses 0 in manual dps as mark for BLE devices.
-
-        NOTE: this may not be the best way to detect if this device is BLE
-        """
-        return self.is_subdevice and "0" in self._device_config.manual_dps.split(",")
-
     def add_entities(self, entities):
         """Set the entities associated with this device."""
         self._entities.extend(entities)
@@ -675,8 +667,17 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 if self.is_subdevice:
                     self.subdevice_state_updated(SubdeviceState.ONLINE)
 
-                if not self._status and "0" in self._device_config.manual_dps.split(
-                    ","
+                # Устройство за хабом, о котором хаб ничего не знает, - показать
+                # последнее известное состояние. Хаб по сети отдаёт только то,
+                # что устройство сообщило ему с момента включения хаба, и давно
+                # не тронутый выключатель приходит пустым. Раньше так
+                # восстанавливались лишь устройства с «0» в ручных DP, а
+                # остальные стояли «неизвестно» (две молнии вместо
+                # переключателя) до первого нажатия. Собственный отчёт
+                # устройства поправит показ, как только придёт.
+                if not self._status and (
+                    self.is_subdevice
+                    or "0" in self._device_config.manual_dps.split(",")
                 ):
                     self.status_updated(RESTORE_STATES)
 
@@ -818,10 +819,12 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 # exception here triggers its rollback.
                 raise
             self._command_failures = 0
-            # bluetooth devices usually does not send updated status payload.
-            # NOTE: This will override the status if the BLE device fails to receive the signal.
-            if self.is_write_only:
-                self.status_updated(payload)
+            # Команда сама по себе не становится состоянием. Раньше «0» в ручных
+            # DP значил «Bluetooth» и подставлял отправленное в статус - но «0»
+            # вписывали, чтобы обойти проверку при добавлении (так на объекте
+            # заведены 55 Zigbee-устройств), и неисполненная команда
+            # показывалась исполненной. Показ сразу после нажатия даёт
+            # оптимистичный режим, а подтверждает - отчёт устройства.
         elif not self.connected:
             self.error(f"Device is not connected.")
 
@@ -1078,6 +1081,14 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             self._unsub_empty_status = None
         self._empty_status_delay = EMPTY_STATUS_RETRY_FIRST
 
+    def _has_reported(self) -> bool:
+        """Прислало ли устройство хоть один датапоинт.
+
+        Метка восстановления (RESTORE_STATES) - не ответ устройства: с ней
+        переспрашивать молчащее устройство всё равно нужно.
+        """
+        return any(dp != "0" for dp in self._status)
+
     @callback
     def _schedule_empty_status_retry(self) -> None:
         """Переспросить дочернее устройство, у которого нет ни одного датапоинта.
@@ -1096,14 +1107,14 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         if (
             self.is_closing
             or not self.is_subdevice
-            or self._status
+            or self._has_reported()
             or self._unsub_empty_status is not None
         ):
             return
 
         async def _retry(_now):
             self._unsub_empty_status = None
-            if self.is_closing or self._status or not self.connected:
+            if self.is_closing or self._has_reported() or not self.connected:
                 return
             interface = self._interface
             if interface is not None and interface.is_connected:
@@ -1569,7 +1580,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             self._task_shutdown_entities = None
         self._handle_event(self._status, status)
         self._status.update(status)
-        if self._status:
+        if self._has_reported():
             self._cancel_empty_status_retry()
 
         if self._unsub_status_verify is not None:

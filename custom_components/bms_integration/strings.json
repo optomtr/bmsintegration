@@ -14,6 +14,7 @@
       "address_in_use": "TCP port 6668 (used for discovery) is already in use. Check no other integration is using it.",
       "discovery_failed": "Something failed when discovering devices. See log for details. If problem persists, create a new issue (including debug logs).",
       "empty_dps": "Connection to device succeeded but no datapoints could be found. Please try set-up again. If problem persists, create a new issue (including debug logs).",
+      "subdevice_empty_dps": "The hub answered, but it holds no state for this device yet: the hub only keeps what a device has reported since the hub was switched on, and the Tuya cloud is not available to list its datapoints. Enter the device's DP numbers in the \"Manual DPS's\" field separated by commas (for example 1,2,3) - not 0.",
       "cloud_unreachable": "Cannot reach Tuya Cloud.\n{msg}"
     },
     "step": {
@@ -48,6 +49,7 @@
       "address_in_use": "TCP port 6668 (used for discovery) is already in use. Check no other integration is using it.",
       "discovery_failed": "Something failed when discovering devices. See log for details. If problem persists, create a new issue (including debug logs).",
       "empty_dps": "Connection to device succeeded but no datapoints could be found. Please try set-up again. If problem persists, create a new issue (including debug logs).",
+      "subdevice_empty_dps": "The hub answered, but it holds no state for this device yet: the hub only keeps what a device has reported since the hub was switched on, and the Tuya cloud is not available to list its datapoints. Enter the device's DP numbers in the \"Manual DPS's\" field separated by commas (for example 1,2,3) - not 0.",
       "cloud_unreachable": "Cannot reach Tuya Cloud.\n{msg}"
     },
     "step": {

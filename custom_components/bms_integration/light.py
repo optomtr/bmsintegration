@@ -135,24 +135,6 @@ SCENE_LIST_RGB_1000 = {
     + "0000000",
 }
 
-SCENE_LIST_RGBW_BLE = {
-    "Good Night": "AAAAAGQKQA==",
-    "Reading": "AQAAAGRkCA==",
-    "Work": "AgAAAGRkAQ==",
-    "Leisure": "AwAAAGQ8BA==",
-    "White Breath": "BgACADxkAYA=",
-    "White Flashing": "BwABADJkAYA=",
-    "Warm Breath": "BwABADJkAYA=",
-    "Warm Flashing": "CQABADJkQIA=",
-    "Rainbow": "CgACAUtkAQIEECAI",
-    "Blue & Green Gradient": "CwACAUtkAgQ=",
-    "Red & Green Gradient": "DAACAUtkAQQ=",
-    "Red & Blue Gradient": "DQACAUtkAQI=",
-    "Red & Blue & Green Gradient": "DgACATxkAYACgASA",
-    "Red Breath": "DwACATxkAYA=",
-    "Flash": "FAABATJkAQIEECAI",
-}
-
 
 @dataclass(frozen=True)
 class Mode:
@@ -229,9 +211,6 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
     ):
         """Initialize the Tuya light."""
         super().__init__(device, config_entry, lightid, _LOGGER, **kwargs)
-        # Light is an active device (mains powered). It should be able
-        # to respond at any time. But Tuya BLE bulbs are write-only.
-        self._write_only = self._device.is_write_only
 
         self._state = None
         self._color_temp = None
@@ -241,7 +220,7 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
         self._upper_brightness = int(
             self._config.get(CONF_BRIGHTNESS_UPPER, DEFAULT_UPPER_BRIGHTNESS)
         )
-        self._brightness = None if not self._write_only else self._upper_brightness
+        self._brightness = None
         self._upper_color_temp = self._upper_brightness
 
         self._color_temp_reverse = self._config.get(CONF_COLOR_TEMP_REVERSE, False)
@@ -250,7 +229,6 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
         self._effect = None
         self._effect_list = []
         self._scenes = DictSelector({})
-        self._cached_status = {}
 
         if self._config.get(CONF_MUSIC_MODE):
             self._effect_list.append(SCENE_MUSIC)
@@ -272,16 +250,13 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
     def connection_made(self):
         """The connection has made with the device and status retrieved, Configure the entity based on its reserved status."""
         super().connection_made()
-        is_write_only = self._write_only
 
         if self.has_config(CONF_SCENE):
             if (cf_scenes := self._config.get(CONF_SCENE_VALUES)) and len(cf_scenes):
                 scenes = {v: k for k, v in cf_scenes.items()}
             else:
                 scene_value = self.dp_value(CONF_SCENE)
-                if is_write_only and not scene_value:
-                    scenes = SCENE_LIST_RGBW_BLE
-                elif isinstance(scene_value, str) and 0 < len(scene_value) <= 20:
+                if isinstance(scene_value, str) and 0 < len(scene_value) <= 20:
                     scenes = SCENE_LIST_RGBW_255
                 elif self._config.get(CONF_BRIGHTNESS) is None:
                     scenes = SCENE_LIST_RGB_1000
@@ -293,19 +268,12 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
             self._effect_list = list(scenes.keys()) + self._effect_list
 
         if self.has_config(CONF_COLOR):
-            color_data = self.dp_value(CONF_COLOR)
             if self.__is_paint_colour():
                 self.__to_color = self.__to_color_paint
                 self.__from_color = self.__from_color_paint
-            elif is_write_only and not color_data:
-                self.__to_color = self.__to_color_raw
-                self.__from_color = self.__from_color_raw
             else:
                 self.__to_color = self.__to_color_common
                 self.__from_color = self.__from_color_common
-
-        if is_write_only and self._cached_status:
-            self._status.update(self._cached_status)
 
     @property
     def extra_state_attributes(self):
@@ -533,19 +501,6 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
         self._hs = [hue, sat / 10]
         self._brightness = val * self._upper_brightness / 1000
 
-    def __to_color_raw(self, hs, brightness):
-        return base64.b64encode(
-            # BASE64-encoded 4-byte value: HHSL
-            bytes(
-                [
-                    round(hs[0]) // 256,
-                    round(hs[0]) % 256,
-                    round(hs[1]),
-                    round(brightness * 100 / self._upper_brightness),
-                ]
-            )
-        ).decode("ascii")
-
     def __to_color_(self, hs, brightness):
         # https://developer.tuya.com/en/docs/iot/dj?id=K9i5ql3v98hn3#title-8-colour_data
         return "{:04x}{:02x}{:02x}".format(
@@ -578,15 +533,6 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
         else:
             return self.__to_color_v2(hs, brightness)
 
-    def __from_color_raw(self, color):
-        # BASE64-encoded 4-byte value: HHSL
-        hsl = int.from_bytes(base64.b64decode(color), byteorder="big", signed=False)
-        hue = hsl // 65536
-        sat = (hsl // 256) % 256
-        value = (hsl % 256) * self._upper_brightness / 100
-        self._hs = [hue, sat]
-        self._brightness = value
-
     def __from_color_(self, color):
         # https://developer.tuya.com/en/docs/iot/dj?id=K9i5ql3v98hn3#title-8-colour_data
         hue, sat, value = [int(value, 16) for value in textwrap.wrap(color, 4)]
@@ -613,7 +559,7 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
     async def async_turn_on(self, **kwargs):
         """Turn on or control the light."""
         states = {}
-        if not self.is_on or self._write_only:
+        if not self.is_on:
             states[self._dp_id] = True
         features = self.supported_features
         color_modes = self.supported_color_modes
@@ -779,22 +725,6 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
         if self.is_music_mode and supported & LightEntityFeature.EFFECT:
             self._effect = SCENE_MUSIC
-
-    def status_restored(self, stored_state) -> None:
-        """Device status was restored."""
-        # The base implementation is what populates _last_state from the
-        # stored attributes: without it _last_state was always None here.
-        super().status_restored(stored_state)
-
-        restore_attrs = (CONF_COLOR_MODE, CONF_COLOR, CONF_BRIGHTNESS, CONF_COLOR_TEMP)
-        if self._write_only:
-            for attr in restore_attrs:
-                dp = self._config.get(attr)
-                restored_value = stored_state.attributes.get(f"raw_{attr}")
-                if None in (dp, restored_value):
-                    continue
-                self._cached_status[dp] = restored_value
-            self._state = self._last_state
 
 
 async_setup_entry = partial(async_setup_entry, DOMAIN, LocalTuyaLight, flow_schema)

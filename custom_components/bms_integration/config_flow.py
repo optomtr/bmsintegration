@@ -588,6 +588,8 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
                 errors["base"] = "cannot_connect"
             except InvalidAuth:
                 errors["base"] = "invalid_auth"
+            except SubdeviceEmptyDps:
+                errors["base"] = "subdevice_empty_dps"
             except EmptyDpsList:
                 errors["base"] = "empty_dps"
             except (OSError, ValueError, pytuya.parser.DecodeError) as ex:
@@ -926,6 +928,10 @@ class InvalidAuth(exceptions.HomeAssistantError):
 
 class EmptyDpsList(exceptions.HomeAssistantError):
     """Error to indicate no datapoints found."""
+
+
+class SubdeviceEmptyDps(EmptyDpsList):
+    """Хаб на связи, но о датапоинтах устройства не знают ни он, ни облако."""
 
 
 async def setup_localtuya_devices(
@@ -1406,16 +1412,36 @@ async def validate_input(entry_runtime: HassLocalTuyaData, data):
         dev.device_config.get(CONF_GATEWAY_ID) == dev_id
         for dev in (d._device_config for d in localtuya_devices.values())
     )
+    # Устройство за хабом, о котором хаб пока ничего не хранит. Хаб по сети
+    # отдаёт только то, что устройство сообщило ему с момента включения хаба,
+    # и давно не тронутый выключатель приходит пустым - адрес и ключ при этом
+    # верны, хаб ответил. Раньше такое устройство не добавлялось, и проверку
+    # обходили, вписывая «0» в ручные DP, а «0» потом делал из него
+    # Bluetooth-устройство: на объекте так заведены 55 Zigbee-устройств.
+    # Датапоинты в этом случае берутся из облака или из ручного списка.
+    hub_answered = bool(cid) and error is None and interface is not None
     if not detected_dps_device and not (
-        (cloud_dp_codes or detected_dps) and bypass_handshake
+        (cloud_dp_codes or detected_dps) and (bypass_handshake or hub_answered)
     ):
+        if hub_answered:
+            raise SubdeviceEmptyDps
         if not (serves_subdevices and error is None):
             raise EmptyDpsList
         logger.info(
             "У шлюза нет собственных датапоинтов - это нормально, заводим как есть"
         )
+    elif not detected_dps_device and hub_answered and not bypass_handshake:
+        logger.info(
+            "Хаб пока не хранит состояния устройства - датапоинты из %s",
+            "облака" if cloud_dp_codes else "ручного списка",
+        )
 
     logger.info("Total DPS: %s", detected_dps)
+    if conf_protocol == "auto" and not close and interface is not None:
+        # Устройство за уже подключённым хабом говорит на версии хаба; общая
+        # версия «по умолчанию» ниже могла не совпасть с ней, а по первому
+        # устройству адреса строится соединение со всем хабом.
+        conf_protocol = str(interface.version)
     if conf_protocol == "auto":
         # Detection never settled on a version (e.g. the handshake was
         # bypassed). Storing the literal "auto" would break the runtime,

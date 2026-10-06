@@ -30,7 +30,6 @@ class _Light(light_mod.LocalTuyaLight):
     """Вычисляемые свойства подменяем на классе."""
 
     is_on = True
-    _write_only = False
     supported_features = 0
     supported_color_modes = {ColorMode.HS, ColorMode.COLOR_TEMP}
     min_color_temp_kelvin = 2700

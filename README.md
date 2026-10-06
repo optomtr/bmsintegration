@@ -117,6 +117,16 @@ the license text.
   was gone - and all 40 devices on the address were down, the healthy hub's
   included. A hub that announces itself later corrects the choice with one
   reload.
+- A device behind a hub can be added while the hub holds no state for it. A
+  hub only keeps what a device has reported since the hub was switched on, so
+  a switch nobody has touched comes back empty, and the setup refused it
+  ("no datapoints found"). Installers worked around that by typing 0 into the
+  manual DPS, and 0 then made the integration treat the device as Bluetooth:
+  every command was written into its state as if done (55 Zigbee devices on
+  one site). Now the datapoints come from the cloud or from the manual list,
+  with a plain message asking for the DP numbers when neither is there, and 0
+  no longer means Bluetooth. Every device behind a hub that comes back empty
+  shows its last known state until it reports, and is asked again.
 - Works again on Home Assistant older than 2026.9: those cores do not accept
   via_device_id, and every entity behind a gateway failed to load (121 of 136
   on one site). The integration now asks the core and uses via_device there.

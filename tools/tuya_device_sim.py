@@ -384,6 +384,7 @@ class Simulator:
         protocol: str = PROTOCOL,
         reply_delay: float = 0.0,
         corrupt_every: int = 0,
+        forgotten_cids: set[str] | None = None,
     ):
         self.devices = devices
         self.offline = offline
@@ -392,6 +393,11 @@ class Simulator:
         self.offline_cids = offline_cids or set()
         self.nearby_cids = nearby_cids or set()
         self.subdev_chunk = subdev_chunk
+        # Устройства, о которых хаб знает, но состояния не хранит: настоящий
+        # хаб отдаёт по сети только то, что устройство сообщило ему с момента
+        # включения хаба, а на запрос остального отвечает текстом
+        # "json obj data unvalid". Помнить он начинает с первого отчёта.
+        self.forgotten_cids = forgotten_cids or set()
         self.protocol = protocol
         # A real hub relays each command over Zigbee one at a time, so a burst
         # of commands queues up behind it. Without this the simulator answers
@@ -505,7 +511,10 @@ class Simulator:
         state = self._state_for(dev_id, cid)
 
         if msg.cmd in (CMDType.DP_QUERY, CMDType.DP_QUERY_NEW):
-            if state is None:
+            if cid and cid in self.forgotten_cids:
+                _LOGGER.info("status for forgotten %s -> data unvalid", cid)
+                writer.write(codec.frame_raw(msg.seqno, msg.cmd, b"json obj data unvalid"))
+            elif state is None:
                 _LOGGER.info("status for unknown %s/%s -> empty", dev_id, cid)
                 writer.write(codec.frame(msg.seqno, msg.cmd, {}))
             else:
@@ -524,6 +533,7 @@ class Simulator:
             dps = body.get("dps") or inner.get("dps") or {}
             if state is not None:
                 state.update(dps)
+                self.forgotten_cids.discard(cid)
                 _LOGGER.info("SET %s%s %s", dev_id, f"/{cid}" if cid else "", dps)
             # ACK first, then report the new state the way a device does.
             writer.write(codec.frame(msg.seqno, msg.cmd, None))
@@ -534,7 +544,9 @@ class Simulator:
             return dev_id
 
         if msg.cmd == CMDType.UPDATEDPS:
-            if state is not None:
+            # Как на объекте: просьбу обновить хаб принимает, но устройство,
+            # которого он «не помнит», так и не отвечает.
+            if state is not None and cid not in self.forgotten_cids:
                 await self._push_status(writer, dict(state), cid, codec)
             return dev_id
 
@@ -700,6 +712,13 @@ async def broadcast_presence(devices: dict, advertise_ip: str, stop: asyncio.Eve
 
 async def main_async(args):
     devices = build_scenario()
+    gateway = next(d for d in devices.values() if d.get("sub_devices"))
+    for cid in args.forgotten_cid or []:
+        # Устройство, ещё не заведённое в Home Assistant, - для проверки
+        # добавления: двухканальный выключатель за первым шлюзом.
+        gateway["sub_devices"].setdefault(
+            cid, {"name": "Выключатель, забытый хабом",
+                  "dps": {"1": False, "2": True, "14": "memory"}})
     sim = Simulator(
         devices,
         offline=set(args.offline or []),
@@ -709,6 +728,7 @@ async def main_async(args):
         protocol=args.protocol,
         reply_delay=args.reply_delay,
         corrupt_every=args.corrupt_every,
+        forgotten_cids=set(args.forgotten_cid or []),
     )
     server = await asyncio.start_server(sim.handle, args.host, args.port)
     stop = asyncio.Event()
@@ -746,6 +766,9 @@ def main():
                     help="sub-devices the hub reports as offline")
     ap.add_argument("--nearby-cid", nargs="*", metavar="CID",
                     help="sub-devices the hub reports only as nearby")
+    ap.add_argument("--forgotten-cid", nargs="*", metavar="CID",
+                    help="sub-devices whose state the hub does not hold: "
+                         "status answers 'json obj data unvalid' until a command")
     ap.add_argument("--subdev-chunk", type=int, default=0, metavar="N",
                     help="split the sub-device reply into frames of N children, "
                          "the way a busy hub does (0 = one frame)")

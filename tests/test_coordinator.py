@@ -922,6 +922,53 @@ class TestHubWithoutOwnStatus(Base):
             "must keep the shared session, not fail the handshake",
         )
 
+    async def test_a_silent_subdevice_shows_its_last_state_and_is_asked_again(self):
+        """С объекта: 20 Zigbee-выключателей «неизвестно» до первого нажатия.
+
+        Пустой статус от хаба - метка восстановления, чтобы сущности показали
+        последнее известное состояние; повторный запрос остаётся в силе.
+        """
+        gw = self.make_device(name="gw", dev_id="gw1", local_key="0123456789abcdef")
+        gw._interface = self.empty_status_interface()
+        sub = self.make_device(node_id="n1", name="sub", dev_id="sub1",
+                               local_key="0123456789abcdef")
+        sub.gateway = gw
+        gw.sub_devices["n1"] = sub
+        sub.dps_to_request = {"1": None}
+
+        await sub._make_connection()
+
+        self.assertEqual(sub._status, coordinator.RESTORE_STATES,
+                         "сущностям нечего восстанавливать - останется «неизвестно»")
+        self.assertIsNotNone(sub._unsub_empty_status,
+                             "метка восстановления отменила повторный запрос")
+
+
+class TestZeroIsNotBluetooth(Base):
+    """«0» в ручных DP вписывали, чтобы добавить устройство за хабом, у
+    которого хаб не хранит состояния. На объекте так заведены 55 Zigbee-
+    устройств - и все они считались Bluetooth: отправленная команда
+    записывалась в их состояние, будто устройство её исполнило."""
+
+    def make_zero_subdevice(self):
+        cfg = {**make_config(name="sub", node_id="n1", dev_id="sub1"),
+               "manual_dps_strings": "0"}
+        sub = TuyaDevice(self.hass, self.entry, cfg)
+        self._devices.append(sub)
+        sub._interface = FakeInterface()
+        return sub
+
+    async def test_a_sent_command_is_not_taken_for_the_state(self):
+        sub = self.make_zero_subdevice()
+        sub._status = {"1": False}
+        sub._pending_status = {"1": True}
+        await sub.set_status()
+        self.assertEqual(sub._status, {"1": False},
+                         "состояние меняет отчёт устройства, а не своя команда")
+
+    async def test_the_old_marker_is_gone(self):
+        self.assertFalse(hasattr(TuyaDevice, "is_write_only"))
+
 
 class TestOptimisticCache(Base):
     """Optimistic values must survive a partial confirmation from the device.
