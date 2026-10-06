@@ -722,6 +722,13 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
         if value is None or not self.min_temp <= value <= self.max_temp:
             value = self._target_fallback
         self.debug("Хаб не знает уставку - досылаем %s", value)
+        # Отчёт устройства приходит из потока протокола, не из цикла HA:
+        # задачу туда можно подкинуть только через call_soon_threadsafe
+        # (так же делает sensor.py). Прямой async_create_task отсюда HA
+        # отвергает с RuntimeError, и уставка не уходила.
+        self.hass.loop.call_soon_threadsafe(self._start_seed, value)
+
+    def _start_seed(self, value: float) -> None:
         self._seed_task = self.hass.async_create_task(self._async_seed_target(value))
 
     def _restored_target(self) -> float | None:

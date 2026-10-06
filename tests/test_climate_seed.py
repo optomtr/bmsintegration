@@ -36,6 +36,12 @@ class RecordingDevice:
 
 
 class Hass:
+    """Как настоящий hass: задача ставится в цикл через call_soon_threadsafe."""
+
+    @property
+    def loop(self):
+        return asyncio.get_running_loop()
+
     def async_create_task(self, coro):
         return asyncio.get_running_loop().create_task(coro)
 
@@ -78,6 +84,8 @@ def make_climate(dps, stored=None, fallback=24.0, precision_target=1.0, device=N
 
 
 async def settle(climate):
+    # call_soon_threadsafe ставит задачу на следующий оборот цикла.
+    await asyncio.sleep(0)
     if climate._seed_task is not None:
         await climate._seed_task
 
