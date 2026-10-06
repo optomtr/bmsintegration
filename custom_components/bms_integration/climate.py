@@ -39,6 +39,7 @@ from .const import (
     CONF_ECO_VALUE,
     CONF_HEURISTIC_ACTION,
     CONF_NUDGE_TARGET,
+    CONF_TARGET_FALLBACK,
     CONF_HVAC_ACTION_DP,
     CONF_HVAC_ACTION_SET,
     CONF_HVAC_MODE_DP,
@@ -66,6 +67,10 @@ from .const import (
 # отчётам устройства об уставке, чтобы на термостате не мигнуло чужое число.
 NUDGE_SETTLE_SECONDS = 1.0
 NUDGE_QUIET_SECONDS = 2.0
+
+# Уставка, которую дослать кондиционеру, если хаб её не знает, а Home Assistant
+# ничего не помнит. 0 выключает досылку.
+DEFAULT_TARGET_FALLBACK = 24
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -183,6 +188,9 @@ def flow_schema(dps):
         vol.Optional(CONF_TEMPERATURE_UNIT): col_to_select(SUPPORTED_TEMPERATURES),
         vol.Optional(CONF_HEURISTIC_ACTION): bool,
         vol.Optional(CONF_NUDGE_TARGET, default=False): bool,
+        vol.Optional(CONF_TARGET_FALLBACK, default=DEFAULT_TARGET_FALLBACK): vol.Coerce(
+            float
+        ),
     }
 
 
@@ -222,6 +230,10 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
         self._target_temperature = None
         self._target_temp_forced_to_celsius = None
         self._nudge_on_command = bool(self._config.get(CONF_NUDGE_TARGET, False))
+        self._target_fallback = float(
+            self._config.get(CONF_TARGET_FALLBACK, DEFAULT_TARGET_FALLBACK) or 0
+        )
+        self._seed_task: asyncio.Task | None = None
         self._nudge_lock = asyncio.Lock()
         self._nudge_task: asyncio.Task | None = None
         self._nudge_desired = None
@@ -684,6 +696,52 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
             case int() as v if not isinstance(v, bool) and v in (0, 1):
                 self._state_on = 1
                 self._state_off = 0
+
+        self._seed_target_if_missing()
+
+    def _seed_target_if_missing(self) -> None:
+        """Дослать уставку, если хаб её не знает.
+
+        Zigbee-хаб отвечает на запрос состояния ребёнка из своей памяти, а в
+        памяти лежат только датапоинты, которые ребёнок присылал после
+        перезагрузки хаба. Уставку кондиционер присылает лишь когда её меняют,
+        поэтому после перезагрузки хаба она пропадает из ответа, и термостат
+        в Home Assistant остаётся без цели. Хаб запоминает любую нашу запись:
+        одна команда с последней известной уставкой возвращает её на место.
+        Команда «поставь ту же цель» состояние кондиционера не меняет.
+
+        Берём то, что Home Assistant помнит с прошлого запуска; если не помнит
+        ничего - уставку по умолчанию из настроек сущности.
+        """
+        if not self.has_config(CONF_TARGET_TEMPERATURE_DP) or not self._target_fallback:
+            return
+        if self.dp_value(CONF_TARGET_TEMPERATURE_DP) is not None:
+            return
+
+        value = self._restored_target()
+        if value is None or not self.min_temp <= value <= self.max_temp:
+            value = self._target_fallback
+        self.debug("Хаб не знает уставку - досылаем %s", value)
+        self._seed_task = self.hass.async_create_task(self._async_seed_target(value))
+
+    def _restored_target(self) -> float | None:
+        """Уставка, с которой термостат остался в Home Assistant до перезапуска."""
+        stored = getattr(self, "_stored_states", None)
+        if stored is None:
+            return None
+        value = stored.attributes.get(ATTR_TEMPERATURE)
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    async def _async_seed_target(self, value: float) -> None:
+        try:
+            await self._async_send_target(value)
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # pylint: disable=broad-except
+            self.warning(f"Не удалось дослать уставку {value}: {ex}")
 
     def _set_target_temperature(self, value: float) -> None:
         """Принять уставку, только если она попадает в диапазон устройства.
