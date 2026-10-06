@@ -731,7 +731,14 @@ def _device_rows(
             device = running.get(f"{dev_id}_{node_id}" if node_id else dev_id)
 
             config_issue = ""
-            if device is None:
+            parked_for = (getattr(data, "parked", None) or {}).get(dev_id)
+            if device is None and parked_for:
+                config_issue = (
+                    f"адрес {config.get('host')} отдан хабу {parked_for} - этот "
+                    "хаб там не отвечает; устройство запустится, когда его хаб "
+                    "объявится по своему адресу"
+                )
+            elif device is None:
                 sharing = [
                     (configured[o].get("friendly_name") or o)
                     for o in by_host.get(config.get("host"), [])

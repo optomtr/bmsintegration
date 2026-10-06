@@ -149,6 +149,9 @@ class HassLocalTuyaData(NamedTuple):
     devices: dict[str, TuyaDevice]
     # Замки, которыми управляют только через облако (cloud_lock.CloudLocks).
     cloud_locks: Any = None
+    # Устройства, не запущенные из-за чужого хаба на их адресе: id -> id хаба,
+    # которому адрес отдан (см. __init__._host_owners).
+    parked: Any = None
 
 
 class TuyaDevice(TuyaListener, ContextualLogger):

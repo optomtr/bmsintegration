@@ -109,6 +109,14 @@ the license text.
   requests per opening. Refusals from the cloud are shown in plain words: no
   subscription, lock offline, remote unlock switched off in the app, isolation
   mode.
+- One address, two hubs: when devices of different hubs are configured on the
+  same address, the address goes to the hub that announces itself there (or,
+  right after start, to the one with more devices there), and the others are
+  parked with a plain reason in the panel. Before, the connection was built
+  from whichever device came first - on one site with the key of a hub that
+  was gone - and all 40 devices on the address were down, the healthy hub's
+  included. A hub that announces itself later corrects the choice with one
+  reload.
 - Works again on Home Assistant older than 2026.9: those cores do not accept
   via_device_id, and every entity behind a gateway failed to load (121 of 136
   on one site). The integration now asks the core and uses via_device there.

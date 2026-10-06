@@ -233,6 +233,38 @@ async def async_setup(hass: HomeAssistant, config: dict):
         _address_confirmations.pop(device_id, None)
         return True
 
+    def _start_parked_if_owner(entry: ConfigEntry, device_id: str, device_ip: str):
+        """Хаб объявил себя на адресе, где его устройства стоят незапущенными.
+
+        Сразу после запуска объявлений ещё нет, и адрес, на который записаны
+        устройства двух хабов, отдаётся тому, у кого их больше. Если объявился
+        другой - адрес его: один раз перезагружаем запись, и она это учтёт.
+        """
+        entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+        parked = getattr(entry_data, "parked", None)
+        if not parked:
+            return
+        configured = entry.data[CONF_DEVICES]
+        waiting = [
+            dev_id
+            for dev_id in parked
+            if (cfg := configured.get(dev_id))
+            and cfg.get(CONF_HOST) == device_ip
+            and device_id in (dev_id, cfg.get(CONF_GATEWAY_ID))
+        ]
+        key = (entry.entry_id, device_id, device_ip)
+        if not waiting or key in _owner_reloads:
+            return
+        _owner_reloads.add(key)
+        _LOGGER.warning(
+            "По адресу %s отвечает %s: перезапускаю запись, чтобы запустить его "
+            "%d устройств",
+            device_ip,
+            device_id,
+            len(waiting),
+        )
+        hass.async_create_task(hass.config_entries.async_reload(entry.entry_id))
+
     def _device_discovered(device: dict):
         """Update address of device if it has changed."""
         device_ip = device["ip"]
@@ -293,6 +325,7 @@ async def async_setup(hass: HomeAssistant, config: dict):
         # so no need to connect in that case.
         if not changes:
             _address_confirmations.pop(device_id, None)
+            _start_parked_if_owner(entry, device_id, device_ip)
             return
 
         if any(CONF_HOST in c for c in changes.values()) and not _address_change_ok(
@@ -510,6 +543,53 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry):
     return True
 
 
+# Перезагрузки записи, уже сделанные ради хаба, объявившего себя на спорном
+# адресе: по одной на (запись, хаб, адрес), чтобы не перезагружаться по кругу.
+_owner_reloads: set[tuple[str, str, str]] = set()
+
+
+def _announced_hosts(hass: HomeAssistant) -> dict[str, str]:
+    """Адрес -> id устройства, которое сейчас объявляет себя там."""
+    discovery = (hass.data.get(DOMAIN) or {}).get(DATA_DISCOVERY)
+    found = getattr(discovery, "devices", None) or {}
+    return {
+        str(info["ip"]): str(dev_id)
+        for dev_id, info in found.items()
+        if isinstance(info, dict) and info.get("ip")
+    }
+
+
+def _host_owners(devices: dict, announced: dict[str, str]) -> dict[str, str]:
+    """Кому отдать адрес, на который записаны устройства разных хабов.
+
+    Соединение одно на адрес, и строится оно по ключу того, кто на адресе.
+    С объекта: на 192.168.20.254 остались 17 устройств хаба, которого в сети
+    больше нет, рядом с 23 устройствами хаба, который там живёт. Соединение
+    строилось по первому в списке - по ключу пропавшего, - и не работали все
+    40, в том числе тёплый пол исправного хаба.
+
+    Адрес получает тот, кто на нём объявил себя; без объявлений (сразу после
+    запуска) - тот, у кого там больше устройств. Возвращаются только спорные
+    адреса.
+    """
+    claims: dict[str, dict[str, int]] = {}
+    for dev_id, cfg in devices.items():
+        host = cfg.get(CONF_HOST)
+        if cfg.get(CONF_NODE_ID):
+            if gateway := cfg.get(CONF_GATEWAY_ID):
+                by_owner = claims.setdefault(host, {})
+                by_owner[gateway] = by_owner.get(gateway, 0) + 1
+        else:
+            claims.setdefault(host, {}).setdefault(dev_id, 0)
+    owners: dict[str, str] = {}
+    for host, by_owner in claims.items():
+        if len(by_owner) < 2:
+            continue
+        heard = announced.get(host)
+        owners[host] = heard if heard in by_owner else max(by_owner, key=by_owner.get)
+    return owners
+
+
 def _entry_platforms(hass: HomeAssistant) -> list:
     """Платформы записи.
 
@@ -646,7 +726,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     cloud_locks = None
     if not no_cloud and (locks := entry.data.get(CONF_CLOUD_LOCKS)):
         cloud_locks = CloudLocks(entry.entry_id, tuya_api, locks)
-    hass_localtuya = HassLocalTuyaData(tuya_api, {}, cloud_locks)
+    hass_localtuya = HassLocalTuyaData(tuya_api, {}, cloud_locks, {})
     hass.data[DOMAIN][entry.entry_id] = hass_localtuya
 
     # Отладка всей интеграции одним переключателем из панели: иначе её
@@ -669,12 +749,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 entry_devices.items(), key=lambda k: 1 if k[1].get(CONF_NODE_ID) else 0
             )
         )
+        owners = _host_owners(entry_devices, _announced_hosts(hass))
+        parked: dict[str, str] = hass_localtuya.parked
 
         for dev_id, config in sorted_devices.items():
             if check_if_device_disabled(hass, entry, dev_id):
                 continue
 
             host = config.get(CONF_HOST)
+            claim = config.get(CONF_GATEWAY_ID) if config.get(CONF_NODE_ID) else dev_id
+            if claim and (owner := owners.get(host)) is not None and claim != owner:
+                parked[dev_id] = owner
+                continue
 
             # Parent Devices.
             if not (node_id := config.get(CONF_NODE_ID)):
@@ -709,6 +795,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             sub_dev.gateway = gateway
             gateway.sub_devices[node_id] = sub_dev
 
+        for host, owner in owners.items():
+            idle = [d for d, o in parked.items() if o == owner
+                    and entry_devices[d].get(CONF_HOST) == host]
+            if idle:
+                _LOGGER.error(
+                    "На адрес %s записаны устройства разных хабов. Адрес отдан "
+                    "%s; ещё %d устройств на нём не запущены - их хаб там не "
+                    "отвечает. Когда он объявится по своему адресу, интеграция "
+                    "перенесёт их сама.",
+                    host,
+                    owner,
+                    len(idle),
+                )
         return connect_to_devices
 
     connect_to_devices = _setup_devices(entry.data[CONF_DEVICES])
