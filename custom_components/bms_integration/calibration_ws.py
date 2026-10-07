@@ -1,0 +1,320 @@
+"""Команды панели для калибровки цвета ленты камерой телефона.
+
+Экран калибровки (panel/calibration.js) снимает камерой свет ленты и шлёт сюда
+средние по кадру; расчёт - в core/color_calibration.py. Здесь только связь:
+показать цвет на ленте, посчитать, проверить, сохранить, вернуть ленту как
+была.
+"""
+
+from __future__ import annotations
+
+import copy
+import logging
+import time
+from typing import Any
+
+import voluptuous as vol
+from homeassistant.components import websocket_api
+from homeassistant.const import CONF_DEVICES, CONF_ENTITIES, CONF_ID
+from homeassistant.core import HomeAssistant
+
+from homeassistant.const import CONF_BRIGHTNESS, CONF_COLOR_TEMP
+
+from .const import ATTR_UPDATED_AT, CONF_COLOR, CONF_COLOR_CALIBRATION, DOMAIN
+from .core import color_calibration as cc
+
+_LOGGER = logging.getLogger(__name__)
+
+# Состояние ленты до калибровки: entity_id -> сырые датапоинты. Живёт, пока
+# идёт калибровка; «end» возвращает ленту и забывает снимок.
+_snapshots: dict[str, dict] = {}
+
+_RGB = vol.All([vol.Coerce(float)], vol.Length(min=3, max=3))
+_HS = vol.All([vol.Coerce(float)], vol.Length(min=2, max=2))
+
+
+def _samples(entity) -> list[dict]:
+    """Что показать для замера: белый режим - только у ламп, где он есть."""
+    items = [{"key": k, "hs": list(hs), "label": label} for k, hs, label in cc.SAMPLES]
+    if entity is not None and (
+        entity.has_config(CONF_BRIGHTNESS) or entity.has_config(CONF_COLOR_TEMP)
+    ):
+        key, _hs, label = cc.WHITE_MODE
+        items.append({"key": key, "hs": None, "label": label})
+    return items
+
+
+def _light(hass: HomeAssistant, entity_id: str):
+    """Живая сущность нашей ленты или None."""
+    from .light import LocalTuyaLight
+
+    component = hass.data.get("light")
+    entity = component.get_entity(entity_id) if component is not None else None
+    return entity if isinstance(entity, LocalTuyaLight) else None
+
+
+def _calibration(data) -> cc.Calibration | None:
+    return None if data is None else cc.Calibration.from_dict(data)
+
+
+def _fail(connection, msg, err: Exception) -> None:
+    code = "bad_measurement" if isinstance(err, cc.CalibrationError) else "failed"
+    connection.send_error(msg["id"], code, str(err))
+
+
+def _unsupported_reason(entity) -> str | None:
+    if entity is None:
+        return "Это не лента интеграции BMS или она сейчас не загружена."
+    if not entity.has_config(CONF_COLOR):
+        return "У этого светильника нет цветного режима."
+    if not entity.available:
+        return "Лента сейчас недоступна - калибровать нечего."
+    return None
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): f"{DOMAIN}/color_calibration/info", vol.Required("entity_id"): str}
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_info(hass: HomeAssistant, connection, msg: dict) -> None:
+    entity = _light(hass, msg["entity_id"])
+    reason = _unsupported_reason(entity)
+    stored = (entity._config.get(CONF_COLOR_CALIBRATION) or {}) if entity else {}
+    connection.send_result(
+        msg["id"],
+        {
+            "entity_id": msg["entity_id"],
+            "name": entity.name if entity else None,
+            "supported": reason is None,
+            "reason": reason,
+            "calibrated": bool(entity and entity.calibration),
+            "calibrated_at": stored.get("calibrated_at"),
+            "method": stored.get("method"),
+            "samples": _samples(entity),
+            "checks": [{"key": k, "hs": list(hs), "label": label} for k, hs, label in cc.CHECKS],
+        },
+    )
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): f"{DOMAIN}/color_calibration/begin", vol.Required("entity_id"): str}
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_begin(hass: HomeAssistant, connection, msg: dict) -> None:
+    entity = _light(hass, msg["entity_id"])
+    if (reason := _unsupported_reason(entity)) is not None:
+        connection.send_error(msg["id"], "not_supported", reason)
+        return
+    # Повторный «begin» (человек нажал «Повторить») снимок не перезаписывает:
+    # иначе вернули бы ленту к цвету замера, а не к тому, что было до него.
+    _snapshots.setdefault(msg["entity_id"], entity.calibration_snapshot())
+    connection.send_result(msg["id"], {"ok": True})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/color_calibration/show",
+        vol.Required("entity_id"): str,
+        # None - собственный белый режим лампы.
+        vol.Required("hs"): vol.Any(None, _HS),
+        vol.Optional("calibration"): vol.Any(None, dict),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_show(hass: HomeAssistant, connection, msg: dict) -> None:
+    entity = _light(hass, msg["entity_id"])
+    if (reason := _unsupported_reason(entity)) is not None:
+        connection.send_error(msg["id"], "not_supported", reason)
+        return
+    try:
+        if msg["hs"] is None:
+            await entity.async_show_calibration_white()
+            connection.send_result(msg["id"], {"sent_hs": None})
+            return
+        sent = await entity.async_show_calibration_colour(
+            msg["hs"], _calibration(msg.get("calibration"))
+        )
+    except Exception as err:  # noqa: BLE001
+        _fail(connection, msg, err)
+        return
+    connection.send_result(msg["id"], {"sent_hs": [round(sent[0], 2), round(sent[1], 2)]})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/color_calibration/fit",
+        vol.Required("samples"): {str: _RGB},
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_fit(hass: HomeAssistant, connection, msg: dict) -> None:
+    try:
+        calibration, quality = cc.fit(msg["samples"])
+    except cc.CalibrationError as err:
+        _fail(connection, msg, err)
+        return
+    before = quality["white_before"]
+    connection.send_result(
+        msg["id"],
+        {
+            "calibration": calibration.as_dict(),
+            "white_before": {"delta": before, "words": cc.words_for(before)},
+        },
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/color_calibration/refine_white",
+        vol.Required("calibration"): dict,
+        vol.Required("measured"): _RGB,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_refine_white(hass: HomeAssistant, connection, msg: dict) -> None:
+    try:
+        refined = cc.refine_white(_calibration(msg["calibration"]), msg["measured"])
+    except cc.CalibrationError as err:
+        _fail(connection, msg, err)
+        return
+    connection.send_result(msg["id"], {"calibration": refined.as_dict()})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/color_calibration/evaluate",
+        vol.Required("calibration"): dict,
+        vol.Required("measured"): {str: _RGB},
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_evaluate(hass: HomeAssistant, connection, msg: dict) -> None:
+    try:
+        _calibration(msg["calibration"])  # проверять можно только годную
+        result = cc.evaluate(msg["measured"])
+    except cc.CalibrationError as err:
+        _fail(connection, msg, err)
+        return
+    connection.send_result(msg["id"], result)
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/color_calibration/save",
+        vol.Required("entity_id"): str,
+        vol.Required("calibration"): vol.Any(None, dict),
+        vol.Optional("method"): vol.Any(None, vol.In(["6500k", "reference"])),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_save(hass: HomeAssistant, connection, msg: dict) -> None:
+    entity = _light(hass, msg["entity_id"])
+    if entity is None:
+        connection.send_error(msg["id"], "not_found", "Лента не найдена")
+        return
+    try:
+        calibration = _calibration(msg["calibration"])
+    except cc.CalibrationError as err:
+        _fail(connection, msg, err)
+        return
+    stored = None
+    if calibration is not None:
+        stored = {
+            **calibration.as_dict(),
+            "method": msg.get("method"),
+            "calibrated_at": time.strftime("%Y-%m-%d %H:%M"),
+        }
+    try:
+        await _async_store(hass, entity, stored)
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.exception("Не удалось сохранить калибровку %s", msg["entity_id"])
+        _fail(connection, msg, err)
+        return
+    _LOGGER.warning(
+        "Калибровка цвета %s %s (пользователь %s)",
+        msg["entity_id"],
+        "сохранена" if stored else "сброшена",
+        connection.user.name if connection.user else "?",
+    )
+    connection.send_result(msg["id"], {"ok": True})
+
+
+async def _async_store(hass: HomeAssistant, entity, stored: dict | None) -> None:
+    """Записать поправку в настройки сущности и применить её на ходу.
+
+    Перезагрузка записи ради одной ленты уронила бы связь со всем домом на
+    минуту, поэтому поправка ставится на живую сущность, а запись помечается
+    как уже применённая.
+    """
+    from . import _applied_without_reload
+    from .replace import _CONFIG_LOCK
+
+    entry = entity.platform.config_entry if entity.platform else None
+    if entry is None:
+        raise RuntimeError("Запись конфигурации ленты не найдена")
+    dev_id = entity._device_config.id
+    async with _CONFIG_LOCK:
+        new_data = copy.deepcopy(dict(entry.data))
+        device = (new_data.get(CONF_DEVICES) or {}).get(dev_id)
+        if device is None:
+            raise RuntimeError("Устройство ленты не найдено в настройках")
+        item = next(
+            (e for e in device.get(CONF_ENTITIES) or [] if str(e.get(CONF_ID)) == str(entity._dp_id)),
+            None,
+        )
+        if item is None:
+            raise RuntimeError("Сущность ленты не найдена в настройках")
+        if stored is None:
+            item.pop(CONF_COLOR_CALIBRATION, None)
+        else:
+            item[CONF_COLOR_CALIBRATION] = stored
+        stamp = str(int(time.time() * 1000))
+        new_data[ATTR_UPDATED_AT] = stamp
+        _applied_without_reload[entry.entry_id] = stamp
+        hass.config_entries.async_update_entry(entry, data=new_data)
+    # Та же поправка, что записана: сущность читает её из своих настроек.
+    if stored is None:
+        entity._config.pop(CONF_COLOR_CALIBRATION, None)
+    else:
+        entity._config[CONF_COLOR_CALIBRATION] = stored
+    entity.set_calibration(cc.Calibration.load(stored))
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/color_calibration/end",
+        vol.Required("entity_id"): str,
+        vol.Optional("restore", default=True): bool,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_end(hass: HomeAssistant, connection, msg: dict) -> None:
+    snapshot = _snapshots.pop(msg["entity_id"], None)
+    entity = _light(hass, msg["entity_id"])
+    if msg["restore"] and snapshot and entity is not None:
+        try:
+            await entity.async_set_dps(snapshot)
+        except Exception as err:  # noqa: BLE001
+            _fail(connection, msg, err)
+            return
+    connection.send_result(msg["id"], {"ok": True})
+
+
+COMMANDS: tuple[Any, ...] = (
+    ws_info,
+    ws_begin,
+    ws_show,
+    ws_fit,
+    ws_refine_white,
+    ws_evaluate,
+    ws_save,
+    ws_end,
+)

@@ -250,5 +250,38 @@ class PanelFrontend(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class CalibrationCommandsRequireAdmin(unittest.TestCase):
+    """Калибровка цвета включает ленту и пишет настройки - только администратор."""
+
+    def setUp(self):
+        self.module = tree("calibration_ws.py")
+        self.functions = {
+            node.name: node
+            for node in ast.walk(self.module)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        listing = next(
+            node for node in self.module.body
+            if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", "") == "COMMANDS"
+        )
+        self.commands = [element.id for element in listing.value.elts]
+
+    def test_every_command_requires_admin(self):
+        self.assertGreaterEqual(len(self.commands), 8)
+        for name in self.commands:
+            found = decorators(self.functions[name])
+            self.assertIn("require_admin", found, name)
+            self.assertIn("websocket_command", found, name)
+
+    def test_every_command_is_listed(self):
+        defined = {n for n in self.functions if n.startswith("ws_")}
+        self.assertEqual(defined, set(self.commands))
+
+    def test_they_are_registered(self):
+        body = source("websocket.py")
+        register = body[body.index("def async_register_websocket_api"):]
+        self.assertIn("*calibration_ws.COMMANDS", register[: register.index("DATA_WS_REGISTERED] = True")])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -48,6 +48,7 @@ from .core import pytuya
 from .core.cloud_api import TUYA_ENDPOINTS, TuyaCloudApi
 from .core.helpers import templates, get_gateway_by_deviceid, gen_localtuya_entities
 from .const import (
+    CONF_COLOR_CALIBRATION,
     ATTR_UPDATED_AT,
     CONF_ADD_CLOUD_LOCK,
     CONF_ADD_DEVICE,
@@ -803,6 +804,10 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
                 entity[CONF_ID] = self.current_entity[CONF_ID]
                 entity[CONF_PLATFORM] = self.current_entity[CONF_PLATFORM]
                 entity[CONF_ICON] = self.current_entity.get(CONF_ICON, "")
+                # Поправку цвета пишет панель, в форме её нет: без переноса
+                # любая правка сущности стирала бы калибровку ленты.
+                if CONF_COLOR_CALIBRATION in self.current_entity:
+                    entity[CONF_COLOR_CALIBRATION] = self.current_entity[CONF_COLOR_CALIBRATION]
                 self.device_data[CONF_ENTITIES].append(entity)
                 if len(self.entities) == len(self.device_data[CONF_ENTITIES]):
                     # finished editing device. Let's store the new config entry....

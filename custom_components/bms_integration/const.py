@@ -104,6 +104,9 @@ CONF_COLOR_TEMP_MIN_KELVIN = "color_temp_min_kelvin"
 CONF_COLOR_TEMP_MAX_KELVIN = "color_temp_max_kelvin"
 CONF_COLOR_TEMP_REVERSE = "color_temp_reverse"
 CONF_MUSIC_MODE = "music_mode"
+# Поправка цвета ленты по замеру камерой телефона (core/color_calibration.py).
+# В форме сущности её нет - пишет её панель, а правка сущности переносит как есть.
+CONF_COLOR_CALIBRATION = "color_calibration"
 CONF_SCENE_VALUES = "scene_values"
 CONF_SCENE_VALUES_FRIENDLY = "scene_values_friendly"
 

@@ -117,6 +117,21 @@ the license text.
   was gone - and all 40 devices on the address were down, the healthy hub's
   included. A hub that announces itself later corrects the choice with one
   reload.
+- Colour calibration of RGB strips with a phone camera, the way Apple TV
+  balances a TV with an iPhone. Controllers and LEDs differ: the same command
+  gives a greenish white on one strip and a red "orange" on another. In the
+  BMS panel a colour light gets **Калибровка цвета**: in a dark room the phone's
+  rear camera looks at a wall lit by the strip, the strip shows red, green,
+  blue, white and a few mixes, and the integration computes a correction for
+  that strip - the strength of each channel, the firmware's own curve, and
+  whether the lamp's own white mode is daylight white. From then on every
+  colour goes out corrected and Home Assistant shows the colour that was
+  chosen; a check pass reports in plain words how close the result is.
+  Works on Android (Chrome fixes the camera's white balance at 6500 K) and on
+  iPhone (Safari can only freeze it, so it is frozen on a white laptop/TV
+  screen first). Needs the https address of the site: browsers give a page
+  the camera only over a secure connection. Saving does not reload the
+  integration, and the strip is put back the way it was afterwards.
 - A device behind a hub can be added while the hub holds no state for it. A
   hub only keeps what a device has reported since the hub was switched on, so
   a switch nobody has touched comes back empty, and the setup refused it
