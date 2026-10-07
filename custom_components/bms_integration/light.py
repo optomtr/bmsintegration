@@ -21,6 +21,7 @@ from homeassistant.components.light import (
     LightEntityFeature,
 )
 from homeassistant.const import CONF_BRIGHTNESS, CONF_COLOR_TEMP, CONF_SCENE
+from homeassistant.exceptions import HomeAssistantError
 
 from .config_flow import col_to_select
 from .core.color_calibration import Calibration
@@ -727,18 +728,40 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
         }
         if mode_dp := self._config.get(CONF_COLOR_MODE):
             states[mode_dp] = self._modes.color
-        await self.async_set_dps(states)
+        await self.async_send_calibration_dps(states)
         return sent
 
     async def async_show_calibration_white(self) -> None:
         """Собственный белый режим лампы в полную яркость - его тоже меряют."""
-        if ColorMode.COLOR_TEMP in self.supported_color_modes:
-            await self.async_turn_on(
-                brightness=255,
-                color_temp_kelvin=min(6500, self.max_color_temp_kelvin),
+        states = {self._dp_id: True}
+        if mode_dp := self._config.get(CONF_COLOR_MODE):
+            states[mode_dp] = self._modes.white
+        if (bright_dp := self._config.get(CONF_BRIGHTNESS)) is not None:
+            states[bright_dp] = self._upper_brightness
+        if (temp_dp := self._config.get(CONF_COLOR_TEMP)) is not None:
+            # Самый холодный белый лампы, но не холоднее дневного - так же,
+            # как его пересчитывает обычное управление температурой.
+            states[temp_dp] = map_range(
+                min(6500, self.max_color_temp_kelvin),
+                self.min_color_temp_kelvin,
+                self.max_color_temp_kelvin,
+                self._lower_brightness,
+                self._upper_color_temp,
+                self._color_temp_reverse,
             )
-        else:
-            await self.async_turn_on(brightness=255, white=255)
+        await self.async_send_calibration_dps(states)
+
+    async def async_send_calibration_dps(self, states: dict) -> None:
+        """Команда для замера обязана дойти до ленты.
+
+        Обычное управление светом шлёт команду в фоне и при неудаче тихо
+        откатывает показ - для замера это ложь: экран мерил бы прежний цвет,
+        считая его новым. Здесь ответ - только после того, как лента приняла
+        команду, а отказ доходит до экрана калибровки.
+        """
+        if not self._device.connected:
+            raise HomeAssistantError("Лента сейчас не на связи - замер невозможен.")
+        await self._device.set_dps(states)
 
     async def async_turn_off(self, **kwargs):
         """Turn Tuya light off."""

@@ -257,6 +257,7 @@ SWITCH, MODE, COLOUR = "20", "21", "24"
 
 class _Light(light_mod.LocalTuyaLight):
     is_on = True
+    available = True
     supported_features = 0
     supported_color_modes = {ColorMode.HS}
 
@@ -294,6 +295,18 @@ def make_light(calibration=None, paint=False):
         ent._status.update(states)
 
     ent.async_set_dps = capture
+
+    class Device:
+        """Отправка с подтверждением (калибровка) - мимо фоновой очереди."""
+
+        connected = True
+
+        async def set_dps(self, states):
+            ent.confirmed.append(dict(states))
+            await capture(states)
+
+    ent.confirmed = []
+    ent._device = Device()
     return ent
 
 
@@ -341,6 +354,7 @@ class InHomeAssistant(unittest.TestCase):
     def test_calibration_colour_is_shown_raw_or_with_the_candidate(self):
         ent = make_light(self.calibration)
         asyncio.run(ent.async_show_calibration_colour((120, 100)))
+        self.assertEqual(ent.confirmed, ent.sent, "показ для замера - только с подтверждением")
         self.assertEqual([round(x) for x in sent_hs(ent)], [120, 100])
         self.assertEqual(ent.sent[-1][SWITCH], True)
         self.assertEqual(ent.sent[-1][MODE], ent._modes.color)
@@ -362,6 +376,21 @@ class InHomeAssistant(unittest.TestCase):
                 self.assertNotEqual(ent.sent[-1].get(MODE), ent._modes.white)
             else:
                 self.assertEqual(ent.sent[-1][MODE], ent._modes.white)
+
+    def test_a_disconnected_strip_is_an_error_not_a_silent_success(self):
+        ent = make_light()
+        ent._device.connected = False
+        with self.assertRaises(Exception) as caught:
+            asyncio.run(ent.async_show_calibration_colour((0, 100)))
+        self.assertIn("не на связи", str(caught.exception))
+        self.assertEqual(ent.sent, [])
+
+    def test_lamp_white_mode_for_the_measurement(self):
+        ent = make_light()
+        ent._config.update({"brightness": "22", "color_temp": "23"})
+        ent.min_color_temp_kelvin, ent.max_color_temp_kelvin = 2700, 6500
+        asyncio.run(ent.async_show_calibration_white())
+        self.assertEqual(ent.confirmed[-1], {SWITCH: True, MODE: ent._modes.white, "22": 1000, "23": 1000})
 
     def test_snapshot_holds_what_calibration_touches(self):
         ent = make_light()
@@ -463,6 +492,73 @@ class WhatToMeasure(unittest.TestCase):
         self.assertNotIn("white_mode", rgb_only)
         self.assertEqual(with_white[-1], "white_mode")
         self.assertEqual(with_white[:-1], rgb_only)
+
+
+class AbandonedCalibrationPutsTheStripBack(unittest.TestCase):
+    """Телефон выключили посреди замера - лента не остаётся на пробном цвете."""
+
+    def setUp(self):
+        self.ws, _ = load_calibration_ws()
+        self.ws._snapshots.clear()
+        self.ws._watchdogs.clear()
+        timers = self.timers = []
+
+        class Handle:
+            def __init__(self, delay, fn):
+                self.delay, self.fn, self.cancelled = delay, fn, False
+
+            def cancel(self):
+                self.cancelled = True
+
+        class Loop:
+            def call_later(self, delay, fn):
+                timers.append(Handle(delay, fn))
+                return timers[-1]
+
+        light = self.light = make_light()
+        light._status["24"] = "000003e803e8"
+        tasks = self.tasks = []
+        component = type("C", (), {"get_entity": lambda self_, eid: light})()
+        self.hass = type("H", (), {
+            "data": {"light": component}, "loop": Loop(),
+            "async_create_task": lambda self_, coro: tasks.append(coro),
+        })()
+
+        class Conn:
+            def __init__(self):
+                self.results, self.errors = [], []
+
+            def send_result(self, _id, payload):
+                self.results.append(payload)
+
+            def send_error(self, _id, code, text):
+                self.errors.append((code, text))
+
+        self.conn = Conn()
+
+    def call(self, handler, **msg):
+        asyncio.run(handler(self.hass, self.conn, {"id": 1, "entity_id": "light.x", **msg}))
+
+    def live(self):
+        return [t for t in self.timers if not t.cancelled]
+
+    def test_silence_restores_the_strip(self):
+        self.call(self.ws.ws_begin)
+        self.assertEqual(len(self.live()), 1, "телефон могут выключить сразу после начала")
+        self.call(self.ws.ws_show, hs=[120, 100])
+        self.assertEqual(len(self.live()), 1, "показ должен продлевать ожидание, а не копить таймеры")
+        self.assertEqual(self.live()[0].delay, self.ws.ABANDONED_AFTER)
+        self.live()[0].fn()
+        self.assertEqual(len(self.tasks), 1)
+        asyncio.run(self.tasks[0])
+        self.assertEqual(self.light.sent[-1], {SWITCH: True, MODE: self.light._modes.color, COLOUR: "000003e803e8"})
+        self.assertNotIn("light.x", self.ws._snapshots)
+
+    def test_a_normal_end_disarms_it(self):
+        self.call(self.ws.ws_begin)
+        self.call(self.ws.ws_end, restore=True)
+        self.assertEqual(self.live(), [])
+        self.assertEqual(self.conn.errors, [])
 
 
 class EditingTheEntityKeepsTheCalibration(unittest.TestCase):

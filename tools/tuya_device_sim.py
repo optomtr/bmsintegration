@@ -457,7 +457,7 @@ class Simulator:
                     except Exception as ex:  # noqa: BLE001
                         _LOGGER.debug("undecodable frame: %s", ex)
                         continue
-                    seen = await self._respond(writer, msg, codec) or seen
+                    seen = await self._respond(writer, msg, codec, seen) or seen
         except (ConnectionResetError, asyncio.IncompleteReadError):
             pass
         except Exception:  # noqa: BLE001 - a simulator bug must be visible
@@ -475,7 +475,7 @@ class Simulator:
         b"\x17\x03\x03\x00\x2a" + bytes.fromhex("000055aa") + b"\x99" * 11,
     )
 
-    async def _respond(self, writer, msg, codec: "Codec") -> str | None:
+    async def _respond(self, writer, msg, codec: "Codec", seen: str | None = None) -> str | None:
         if self.corrupt_every:
             self._reply_counter += 1
             if self._reply_counter % self.corrupt_every == 0:
@@ -494,7 +494,12 @@ class Simulator:
         # looked at the top level silently accepted the command and changed
         # nothing - which is worse than refusing it.
         inner = body.get("data") if isinstance(body.get("data"), dict) else {}
-        dev_id = body.get("devId") or body.get("gwId") or inner.get("devId")
+        # Команда 3.4/3.5 Wi-Fi устройству не несёт его номера вовсе: настоящее
+        # устройство знает себя само. Эмулятор узнаёт его по соединению - по
+        # номеру из прежних запросов. Без этого команда молча подтверждалась
+        # и ничего не меняла, а «состояние» после неё было лишь ожиданием
+        # самого Home Assistant.
+        dev_id = body.get("devId") or body.get("gwId") or inner.get("devId") or seen
         cid = body.get("cid") or inner.get("cid")
 
         # The offline gate has to come first. Answering heartbeats while

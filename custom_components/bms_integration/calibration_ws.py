@@ -29,6 +29,32 @@ _LOGGER = logging.getLogger(__name__)
 # идёт калибровка; «end» возвращает ленту и забывает снимок.
 _snapshots: dict[str, dict] = {}
 
+# Телефон могут выключить или закрыть посреди замера, и «end» тогда не придёт:
+# лента осталась бы на пробном цвете. Если от экрана калибровки тихо дольше
+# этого, лента возвращается сама.
+ABANDONED_AFTER = 600
+_watchdogs: dict[str, Any] = {}
+
+
+def _arm_watchdog(hass: HomeAssistant, entity_id: str) -> None:
+    if (handle := _watchdogs.pop(entity_id, None)) is not None:
+        handle.cancel()
+
+    def _abandoned() -> None:
+        _watchdogs.pop(entity_id, None)
+        snapshot = _snapshots.pop(entity_id, None)
+        entity = _light(hass, entity_id)
+        if snapshot and entity is not None:
+            _LOGGER.warning("Калибровка %s брошена - лента возвращена как была", entity_id)
+            hass.async_create_task(entity.async_send_calibration_dps(snapshot))
+
+    _watchdogs[entity_id] = hass.loop.call_later(ABANDONED_AFTER, _abandoned)
+
+
+def _disarm_watchdog(entity_id: str) -> None:
+    if (handle := _watchdogs.pop(entity_id, None)) is not None:
+        handle.cancel()
+
 _RGB = vol.All([vol.Coerce(float)], vol.Length(min=3, max=3))
 _HS = vol.All([vol.Coerce(float)], vol.Length(min=2, max=2))
 
@@ -110,6 +136,7 @@ async def ws_begin(hass: HomeAssistant, connection, msg: dict) -> None:
     # Повторный «begin» (человек нажал «Повторить») снимок не перезаписывает:
     # иначе вернули бы ленту к цвету замера, а не к тому, что было до него.
     _snapshots.setdefault(msg["entity_id"], entity.calibration_snapshot())
+    _arm_watchdog(hass, msg["entity_id"])
     connection.send_result(msg["id"], {"ok": True})
 
 
@@ -129,6 +156,8 @@ async def ws_show(hass: HomeAssistant, connection, msg: dict) -> None:
     if (reason := _unsupported_reason(entity)) is not None:
         connection.send_error(msg["id"], "not_supported", reason)
         return
+    if msg["entity_id"] in _snapshots:
+        _arm_watchdog(hass, msg["entity_id"])
     try:
         if msg["hs"] is None:
             await entity.async_show_calibration_white()
@@ -229,7 +258,7 @@ async def ws_save(hass: HomeAssistant, connection, msg: dict) -> None:
         stored = {
             **calibration.as_dict(),
             "method": msg.get("method"),
-            "calibrated_at": time.strftime("%Y-%m-%d %H:%M"),
+            "calibrated_at": time.strftime("%Y-%m-%dT%H:%M"),
         }
     try:
         await _async_store(hass, entity, stored)
@@ -297,11 +326,12 @@ async def _async_store(hass: HomeAssistant, entity, stored: dict | None) -> None
 @websocket_api.require_admin
 @websocket_api.async_response
 async def ws_end(hass: HomeAssistant, connection, msg: dict) -> None:
+    _disarm_watchdog(msg["entity_id"])
     snapshot = _snapshots.pop(msg["entity_id"], None)
     entity = _light(hass, msg["entity_id"])
     if msg["restore"] and snapshot and entity is not None:
         try:
-            await entity.async_set_dps(snapshot)
+            await entity.async_send_calibration_dps(snapshot)
         except Exception as err:  # noqa: BLE001
             _fail(connection, msg, err)
             return

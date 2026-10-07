@@ -27,6 +27,18 @@ const C = {
 };
 const MONO = "ui-monospace,'SF Mono',Menlo,monospace";
 
+// Калибровка цвета грузится лениво и с тем же ?v=, что у самой панели:
+// иначе вчерашний calibration.js из кэша браузера пережил бы выпуск.
+// import.meta.url здесь нельзя: тесты исполняют panel.js обычным скриптом
+// (vm), а там это синтаксическая ошибка. Адрес модуля берём из стека - в нём
+// тот же URL вместе с ?v=.
+const moduleUrlFrom = (stack) =>
+  (/https?:\/\/[^\s()]+?\/panel\.js(?:\?[^\s():]*)?/.exec(String(stack || "")) || [""])[0];
+const SELF_URL = (() => { try { throw new Error(); } catch (err) { return moduleUrlFrom(err.stack); } })();
+const calibrationUrl = (self = SELF_URL) => self
+  ? new URL(`calibration.js${new URL(self).search}`, self).href
+  : `/bms_integration_panel/calibration.js?t=${Date.now()}`;
+
 // Состояния из брифа: явный текст + цвет + иконка, никогда только цвет.
 const ST = {
   online:       { label: "Онлайн",          color: C.ok,    icon: "i-check" },
@@ -189,6 +201,8 @@ class BmsControlCenter extends HTMLElement {
     this.d = { overview: null, topology: null, device: null, logs: null, report: null,
                discovered: null, areas: null, settings: null, replace: null };
     this._err = null;
+    // entity_id света -> { info } | { pending } | { failed: время }.
+    this._calibInfo = {};
   }
 
   set hass(hass) {
@@ -222,6 +236,10 @@ class BmsControlCenter extends HTMLElement {
   disconnectedCallback() {
     clearInterval(this._timer);
     document.removeEventListener("visibilitychange", this._onVisibility);
+    // Калибровка лежит поверх всей страницы. Ушли с панели («назад») -
+    // закрываем её, иначе камера и лента остались бы в замере. С задержкой:
+    // временное переподключение элемента - ещё не уход.
+    setTimeout(() => { if (!this.isConnected) this._calib?.close(); }, 1000);
   }
 
   reclaimProperty(name) {
@@ -285,7 +303,7 @@ class BmsControlCenter extends HTMLElement {
         }));
       if (sc === "device" && devId)
         jobs.push(this.ws("device", { device_id: devId })
-          .then((r) => { if (this.s.deviceId === devId) this.d.device = r; })
+          .then((r) => { if (this.s.deviceId === devId) { this.d.device = r; this.loadCalibInfo(r); } })
           .catch(() => { if (this.s.deviceId === devId) this.d.device = null; }));
       if (sc === "add") {
         jobs.push(this.ws("discovered").then((r) => { if (onScreen()) this.d.discovered = r; }));
@@ -1019,6 +1037,7 @@ class BmsControlCenter extends HTMLElement {
 
     return `<div class="row14">
       <div style="flex:1 1 420px;min-width:300px" class="col14">
+        ${this.calibCard(d)}
         ${cardOpen("Соединение")}<div style="padding:14px">${kv(conn)}</div>${cardClose}
         ${kids}
       </div>
@@ -1034,6 +1053,65 @@ class BmsControlCenter extends HTMLElement {
             : `<span class="small mut">Действий пока не было. Кнопки сверху пишут сюда результат.</span>`}
         </div>${cardClose}
       </div></div>`;
+  }
+
+  // ------------------------------------------------- калибровка цвета --
+  // Есть ли у света цветовой датапоинт, карточка устройства не говорит
+  // (в mapping только *_dp), - это знает сервер. Спрашиваем по разу на
+  // сущность; неудачу повторяем не чаще раза в минуту.
+  loadCalibInfo(d) {
+    for (const e of d?.device?.entities || []) {
+      if (e.domain !== "light" || e.disabled) continue;
+      const c = this._calibInfo[e.entity_id];
+      if (c && !(c.failed && Date.now() - c.failed > 60000)) continue;
+      this._calibInfo[e.entity_id] = { pending: true };
+      this.ws("color_calibration/info", { entity_id: e.entity_id })
+        .then((info) => { this._calibInfo[e.entity_id] = { info }; })
+        // Сервер без калибровки или сбой - кнопки просто нет.
+        .catch(() => { this._calibInfo[e.entity_id] = { failed: Date.now() }; })
+        .finally(() => { if (this.s.screen === "device") this.paint(true); });
+    }
+  }
+
+  calibCard(d) {
+    const lights = (d.device.entities || []).filter((e) =>
+      e.domain === "light" && this._calibInfo[e.entity_id]?.info?.supported);
+    if (!lights.length) return "";
+    return `${cardOpen("Цвет ленты")}
+      <div>${lights.map((e) => {
+        const info = this._calibInfo[e.entity_id].info;
+        const when = info.calibrated_at ? new Date(info.calibrated_at) : null;
+        const status = !info.calibrated ? "Не откалибрована"
+          : when && !Number.isNaN(when.getTime()) ? `Откалибрована ${when.toLocaleDateString("ru-RU")}` : "Откалибрована";
+        return `<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 16px;border-bottom:1px solid ${C.div}">
+          <span style="flex:1 1 160px;min-width:0"><span style="display:block;font-size:13px;font-weight:600;color:${C.ink}">${esc(e.name)}</span>
+            <span class="small" style="color:${info.calibrated ? C.ok : C.mut2}">${status}</span></span>
+          ${btn("Калибровка цвета", { act: "calib-open", data: `data-eid="${esc(e.entity_id)}"`, primary: true, ico: "i-eye" })}
+        </div>`;
+      }).join("")}</div>${cardClose}`;
+  }
+
+  async openCalibration(entityId) {
+    if (this._calib) return;
+    const ent = (this.d.device?.device?.entities || []).find((e) => e.entity_id === entityId);
+    try {
+      this._calibMod ||= import(calibrationUrl());
+      const mod = await this._calibMod;
+      this._calib = mod.openCalibration({
+        entityId, name: ent?.name || entityId, info: this._calibInfo[entityId]?.info || null,
+        ws: (type, payload) => this.ws(type, payload),
+        toast: (text, bad) => this.toast(text, bad),
+        onClose: (changed) => {
+          this._calib = null;
+          if (!changed) return;
+          delete this._calibInfo[entityId];
+          if (this.d.device) this.loadCalibInfo(this.d.device);
+        },
+      });
+    } catch (err) {
+      this._calibMod = null;
+      this.toast(`Не удалось открыть калибровку: ${err?.message || err}`, true);
+    }
   }
 
   dvEntities(d) {
@@ -1637,6 +1715,7 @@ class BmsControlCenter extends HTMLElement {
 
     if (a === "nav") return this.go(el.dataset.nav);
     if (a === "dtab") { this.s.deviceTab = el.dataset.tab; return this.paint(); }
+    if (a === "calib-open") return this.openCalibration(el.dataset.eid);
     if (a === "refresh") return this.refresh();
     if (a === "expert") { this.s.expert = !this.s.expert; return this.paint(); }
     if (a === "feed-clear" || a === "feed-restore") {

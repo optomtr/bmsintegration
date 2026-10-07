@@ -92,10 +92,15 @@ async def async_setup_panel(hass: HomeAssistant) -> None:
         # panel that keeps serving yesterday's JavaScript is indistinguishable
         # from a panel that is broken.
         def _asset_stamp() -> str:
-            try:
-                return str(int(os.path.getmtime(os.path.join(panel_dir, "panel.js"))))
-            except OSError:
-                return "0"
+            # calibration.js грузится с той же меткой, что и панель: правка в
+            # нём одном тоже обязана сбросить кэш браузера.
+            stamps = []
+            for name in ("panel.js", "calibration.js"):
+                try:
+                    stamps.append(int(os.path.getmtime(os.path.join(panel_dir, name))))
+                except OSError:
+                    pass
+            return str(max(stamps, default=0))
 
         stamp = await hass.async_add_executor_job(_asset_stamp)
 
