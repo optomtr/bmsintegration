@@ -214,13 +214,17 @@ async def ws_fit(hass: HomeAssistant, connection, msg: dict) -> None:
         _fail(connection, msg, err)
         return
     before = quality["white_before"]
-    connection.send_result(
-        msg["id"],
-        {
-            "calibration": calibration.as_dict(),
-            "white_before": {"delta": before, "words": cc.words_for(before)},
-        },
-    )
+    result = {
+        "calibration": calibration.as_dict(),
+        "white_before": {"delta": before, "words": cc.words_for(before)},
+    }
+    if before > cc.STRONG_CORRECTION:
+        result["warning"] = (
+            "Белый на стене очень сильно окрашен. Если камера смотрела на дерево "
+            "или цветную стену - положите белый лист бумаги и повторите: "
+            "поверхность окрашивает свет, и поправка подогнала бы ленту под её цвет."
+        )
+    connection.send_result(msg["id"], result)
 
 
 @websocket_api.websocket_command(

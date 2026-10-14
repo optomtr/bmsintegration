@@ -114,9 +114,13 @@ export async function measureUntilSettled(sampleFn, opts = {}) {
            coverage: n ? cov / n : 0, used: n, last };
 }
 
+// Доля пересвеченных точек, при которой в рамке светится сама лента. С
+// объекта: камеру держали так, что светящийся профиль шёл через весь кадр.
+export const STRIP_IN_FRAME = 0.03;
+
 export function exposureState(res, okCoverage = 0.5) {
   if (!res || (!res.coverage && !res.clipped && !res.dark)) return "none";
-  if (res.coverage >= okCoverage) return "ok";
+  if (res.coverage >= okCoverage) return res.clipped > STRIP_IN_FRAME ? "strip" : "ok";
   return res.clipped > res.dark ? "bright" : "dark";
 }
 
@@ -395,7 +399,8 @@ const METER = {
   pending: "Включаю белый свет ленты…",
   none: "Нет изображения с камеры",
   dark: "Слишком темно — наведите на место, ярче освещённое лентой",
-  bright: "Пересвет — наведите на стену, а не на саму ленту",
+  bright: "Пересвет — наведите на бумагу, а не на саму ленту",
+  strip: "В кадре светится сама лента — наведите камеру на бумагу так, чтобы ленты не было видно",
   ok: "Хорошо — можно измерять",
   measuring: "Кадр хороший",
 };
@@ -646,7 +651,7 @@ function defineOverlay() {
           <p>Камера телефона измерит, как лента показывает цвета, и интеграция поправит их — белый станет нейтральным дневным. Займёт около минуты; потом лента вернётся как была.</p>
           <ol>
             <li>Выключите остальной свет и задёрните шторы.</li>
-            <li>Наведите основную (заднюю) камеру на белую стену или лист бумаги, освещённые лентой, с 30–50 см.</li>
+            <li>Положите белый лист бумаги в 10–20 см от ленты и наведите основную (заднюю) камеру на бумагу так, чтобы самой ленты в кадре не было. Дерево и цветные стены окрашивают свет — калибровка подгонит ленту под их цвет.</li>
             <li>Держите телефон неподвижно, пока идёт замер.</li>
             <li>Отверните экран телефона от стены — его свет портит замер.</li>
           </ol>
@@ -683,7 +688,7 @@ function defineOverlay() {
       }
       if (s === "aim") {
         return `${head("Наведите на стену")}
-          <p>Лента светит белым. Наведите камеру на освещённую стену или лист бумаги так, чтобы рамка была заполнена светом.</p>
+          <p>Лента светит белым. Наведите камеру на белый лист бумаги, освещённый лентой, так, чтобы рамка была заполнена светом, а самой ленты в кадре не было.</p>
           ${this.front ? `<p class="note">Включилась фронтальная камера. Для замера нужна основная (задняя) камера телефона.</p>` : ""}
           ${this.wbNote ? `<p class="mut">${esc(this.wbNote)}.</p>` : ""}
           <div class="acts">${btn("Измерить", "measure", "pri", "disabled")}${btn("Всё равно измерить", "measure", "", "hidden data-force=\"1\"")}${btn("Отмена", "close")}</div>`;
@@ -723,6 +728,7 @@ function defineOverlay() {
         ${whiteBefore || whiteAfter ? `<div class="card"><div class="row"><span class="sw" style="background:#fff"></span><div class="grow">
           ${whiteBefore ? `<div>Белый до калибровки: <b>${esc(whiteBefore.words)}</b></div>` : ""}
           ${whiteAfter ? `<div>Белый после: <b>${esc(whiteAfter.words)}</b></div>` : ""}</div></div></div>` : ""}
+        ${this.result.warning ? `<p class="note">${esc(this.result.warning)}</p>` : ""}
         ${this.result.adjusted ? `<p class="note">Белый подстроен вручную — оценка проверки была до подстройки.</p>` : ""}
         ${rows ? `<div class="card"><div class="lh">Проверка цветов</div>${rows}</div>` : ""}
         ${ev.verdict === "poor" ? `<p class="note">Результат слабый. Проверьте, что в комнате темно, стена белая и телефон неподвижен, и нажмите «Повторить».</p>` : ""}
@@ -1295,6 +1301,7 @@ function defineOverlay() {
         this.progress(total, total, "Оцениваю результат…");
         const ev = await this.call("color_calibration/evaluate", { calibration, measured }, token);
         this.result = { calibration, method, ev, whiteBefore: fit.white_before || null,
+                        warning: fit.warning || null,
                         unsteady: this.unsteady > 0, adjusted: null };
         // Лента остаётся на белом с поправкой: результат видно глазами, а
         // переключатели ниже дают сравнить с тем, что было.

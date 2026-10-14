@@ -189,8 +189,11 @@ await test("changedFrom: цвет так и не сменился - ждём cha
 
 console.log("exposureState");
 await test("хорошо / пересвет / темно / нет кадра", () => {
-  eq(cal.exposureState({ rgb: A, coverage: 0.8, clipped: 0.1, dark: 0.1 }), "ok");
-  eq(cal.exposureState({ rgb: A, coverage: 0.5, clipped: 0.5, dark: 0 }), "ok", "граница 0.5:");
+  eq(cal.exposureState({ rgb: A, coverage: 0.8, clipped: 0.01, dark: 0.1 }), "ok");
+  eq(cal.exposureState({ rgb: A, coverage: 0.5, clipped: 0.02, dark: 0 }), "ok", "граница 0.5:");
+  // Светящийся профиль ленты через кадр: точки вокруг годятся, но лента в рамке.
+  eq(cal.exposureState({ rgb: A, coverage: 0.6, clipped: 0.2, dark: 0 }), "strip");
+  eq(cal.exposureState({ rgb: A, coverage: 0.8, clipped: 0.1, dark: 0.1 }), "strip");
   eq(cal.exposureState({ rgb: A, coverage: 0.2, clipped: 0.7, dark: 0.1 }), "bright");
   eq(cal.exposureState({ rgb: A, coverage: 0.2, clipped: 0.1, dark: 0.7 }), "dark");
   eq(cal.exposureState({ rgb: null, coverage: 0, clipped: 0, dark: 0 }), "none");

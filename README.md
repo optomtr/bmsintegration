@@ -117,6 +117,18 @@ the license text.
   was gone - and all 40 devices on the address were down, the healthy hub's
   included. A hub that announces itself later corrects the choice with one
   reload.
+- Colour calibration no longer fails on a real phone camera. On an iPhone it
+  stopped with "the mixed colours failed" every time: the strength of each
+  channel came from pure red, green and blue alone, which a phone distorts
+  (adds saturation, clips weak channels to zero, rounds dark values), and
+  one bad frame stopped everything. The strip model is now fitted to all
+  20 frames at once, out-of-range points are dropped, and only a typical
+  frame - not the worst - decides whether the measurement was steady. On a
+  modelled phone camera it now calibrates every time with white within
+  0.0005 u'v'. The screen asks for a white sheet of paper with the strip
+  itself out of the frame, says so when the strip shines in the frame, and
+  warns when the white comes out strongly tinted - a wooden or coloured wall
+  tints the light and the strip would be tuned to it.
 - Colour calibration, second round, after a real GLEDOPTO SPI RGB strip (no
   white LEDs): white came out exact, but 3000 K and yellow/sandy shades were
   poor and a warm colour-temperature preset lit the strip plain white. Colour

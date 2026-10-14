@@ -92,6 +92,11 @@ WHITE_RANGE = {
 WHITE_DEFAULT = {"kelvin": DEFAULT_KELVIN, "tint": DEFAULT_TINT}
 
 MIN_SPREAD = 0.06
+MAX_MISFIT = 0.02
+# Белый ленты на стене дальше этого от дневного - подозрительно: обычно это
+# не лента, а цветная поверхность (дерево, бежевая стена), которая окрашивает
+# свет, и поправка подогнала бы ленту под её цвет.
+STRONG_CORRECTION = 0.04
 _LEVEL_MIN, _LEVEL_MAX = 0.002, 0.998
 _MAX_KNOTS = 24
 
@@ -352,12 +357,73 @@ class Calibration:
             return None
 
 
+def _solve(a, b) -> list[float]:
+    """Решить a·x = b методом Гаусса с выбором главного элемента."""
+    n = len(b)
+    m = [list(row) + [b[i]] for i, row in enumerate(a)]
+    for col in range(n):
+        piv = max(range(col, n), key=lambda r: abs(m[r][col]))
+        if abs(m[piv][col]) < 1e-300:
+            raise CalibrationError(
+                "Каналы ленты в кадре неразличимы - камера видит не ленту, а посторонний свет."
+            )
+        m[col], m[piv] = m[piv], m[col]
+        for r in range(n):
+            if r != col and m[r][col]:
+                f = m[r][col] / m[col][col]
+                for c in range(col, n + 1):
+                    m[r][c] -= f * m[col][c]
+    return [m[i][n] / m[i][i] for i in range(n)]
+
+
+def _fit_matrix(unit: dict, curves, start) -> list[list[float]]:
+    """Вклад каналов по всем кадрам сразу: M · e(d) параллельно кадру.
+
+    С объекта (iPhone, GLEDOPTO SPI): по одним чистым красному, зелёному и
+    синему расчёт отказывал почти каждый раз - их телефон искажает и
+    обрезает. По всем двадцати кадрам ошибка одного кадра тонет в остальных.
+
+    Яркость кадра неизвестна (автоэкспозиция), поэтому условие - векторное
+    произведение кадра и M · e(d) равно нулю; оно линейно по M, и M - вектор
+    наименьшего собственного числа суммы этих уравнений (обратная итерация).
+    """
+    ata = [[0.0] * 9 for _ in range(9)]
+    for name, hs, _label in SAMPLES:
+        m = unit[name]
+        p = [_level(k, d) for k, d in zip(curves, hs_to_rgb(hs))]
+        rows = ([0.0] * 9, [0.0] * 9, [0.0] * 9)
+        for j in range(3):
+            rows[0][6 + j] += m[1] * p[j]
+            rows[0][3 + j] -= m[2] * p[j]
+            rows[1][j] += m[2] * p[j]
+            rows[1][6 + j] -= m[0] * p[j]
+            rows[2][3 + j] += m[0] * p[j]
+            rows[2][j] -= m[1] * p[j]
+        for r in rows:
+            for a in range(9):
+                if r[a]:
+                    for b in range(9):
+                        ata[a][b] += r[a] * r[b]
+    shift = 1e-9 * (sum(ata[i][i] for i in range(9)) or 1.0)
+    shifted = [[ata[i][j] + (shift if i == j else 0.0) for j in range(9)] for i in range(9)]
+    x = [v for row in start for v in row]
+    for _ in range(40):
+        norm = math.sqrt(sum(v * v for v in x)) or 1.0
+        x = _solve(shifted, [v / norm for v in x])
+    norm = math.sqrt(sum(v * v for v in x)) or 1.0
+    x = [v / norm for v in x]
+    if x[0] + x[4] + x[8] < 0:
+        x = [-v for v in x]
+    return [x[0:3], x[3:6], x[6:9]]
+
+
 def _curves_from(matrix, unit: dict) -> tuple:
     """Точки кривых каналов по всем замерам, где один канал на полную.
 
     В кадре с командой d свет = M · e(d); M известна, значит M⁻¹ · кадр даёт
     e по каналам с точностью до общего множителя - а он снимается каналом,
-    который на полную (e = 1).
+    который на полную (e = 1). Точка, которую шум или обрезка камеры увели за
+    разумные пределы, отбрасывается, а не роняет всю калибровку.
     """
     inverse = _inv(matrix)
     knots: list[list[tuple[float, float]]] = [[], [], []]
@@ -368,26 +434,39 @@ def _curves_from(matrix, unit: dict) -> tuple:
             continue
         power = _mul(inverse, unit[name])
         if power[full] <= 0:
-            raise CalibrationError("Замер смешанных цветов не удался - повторите.")
+            continue
         for ch in range(3):
             if 0.05 < drive[ch] < 0.999:
                 level = power[ch] / power[full]
-                if not 0.0 < level < 1.3:
-                    raise CalibrationError("Замер смешанных цветов не удался - повторите.")
-                knots[ch].append((drive[ch], min(max(level, _LEVEL_MIN), _LEVEL_MAX)))
+                if 0.01 < level < 1.2:
+                    knots[ch].append((drive[ch], min(level, _LEVEL_MAX)))
     curves = []
     for ch in range(3):
         if not knots[ch]:
-            raise CalibrationError("Замер неполный - повторите калибровку.")
-        smooth = _monotone(knots[ch])
-        # Две точки с одной долей после сглаживания склеиваются в одну.
+            curves.append(_gamma_knots(2.2))  # точек нет - обычная кривая
+            continue
         curve = []
-        for d, e in smooth:
+        for d, e in _monotone(knots[ch]):
+            # Две точки с одной долей после сглаживания склеиваются в одну.
             if curve and (d <= curve[-1][0] or e <= curve[-1][1]):
                 continue
             curve.append((d, e))
         curves.append(tuple(curve))
     return tuple(curves)
+
+
+def _first_matrix(unit: dict):
+    """Начальное приближение: чистые цвета, сложенные в белый; не вышло - sRGB."""
+    try:
+        weights = _mul(_inv(_columns(unit["red"], unit["green"], unit["blue"])), unit["white"])
+    except CalibrationError:
+        weights = [-1.0]
+    if min(weights) <= 0:
+        return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    return _columns(*(
+        [weights[c] * unit[name][i] for i in range(3)]
+        for c, name in enumerate(("red", "green", "blue"))
+    ))
 
 
 def fit(samples: dict) -> tuple[Calibration, dict]:
@@ -407,21 +486,15 @@ def fit(samples: dict) -> tuple[Calibration, dict]:
     if _spread(unit["red"], unit["green"], unit["blue"]) < MIN_SPREAD:
         raise CalibrationError(
             "Камера видит в основном посторонний свет, а не ленту. Выключите "
-            "другой свет, задёрните шторы и поднесите телефон ближе к стене."
+            "другой свет, задёрните шторы и наведите камеру на белую бумагу."
         )
 
-    primaries = _columns(unit["red"], unit["green"], unit["blue"])
-    weights = _mul(_inv(primaries), unit["white"])
-    if min(weights) <= 0:
-        raise CalibrationError(
-            "Белый не складывается из трёх цветов ленты: в кадр попадает "
-            "посторонний свет или он пересвечен. Выключите другой свет и "
-            "отодвиньте телефон."
-        )
-    matrix = _columns(*(
-        [weights[c] * unit[name][i] for i in range(3)]
-        for c, name in enumerate(("red", "green", "blue"))
-    ))
+    # Вклад каналов и их кривые зависят друг от друга - уточняются по очереди,
+    # начиная с чистых цветов: на чистом замере они дают ответ сразу.
+    matrix = _first_matrix(unit)
+    for _ in range(8):
+        curves = _curves_from(matrix, unit)
+        matrix = _fit_matrix(unit, curves, matrix)
     curves = _curves_from(matrix, unit)
 
     white_mode = same_as_rgb = None
@@ -438,9 +511,18 @@ def fit(samples: dict) -> tuple[Calibration, dict]:
     )
 
     # Модель обязана объяснять сам замер: иначе он испорчен (свет мигал,
-    # телефон сдвинули) и поправка по нему навредит.
-    misfit = max(_delta(calibration.predict(hs), unit[name]) for name, hs, _l in SAMPLES)
-    if misfit > 0.03:
+    # телефон сдвинули) и поправка по нему навредит. Смотрим на типичный
+    # кадр, а не на худший: насыщенные цвета телефон искажает всегда, и по
+    # худшему кадру калибровка отказывала бы на любом телефоне.
+    def _miss(hs, seen) -> float:
+        try:
+            return delta_uv(calibration.predict(hs), seen)
+        except ColourError:  # модель не даёт света вовсе - худшее несовпадение
+            return 1.0
+
+    deltas = sorted(_miss(hs, unit[name]) for name, hs, _l in SAMPLES)
+    misfit = deltas[len(deltas) // 2]
+    if misfit > MAX_MISFIT:
         raise CalibrationError(
             "Замер неустойчив: цвета в кадре менялись. Держите телефон "
             "неподвижно и повторите."

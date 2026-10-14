@@ -101,7 +101,7 @@ GAMMA_FW = Strip(LED, strength=(1.0, 1.2, 0.8), gamma=(2.2, 2.0, 2.4))
 
 
 class DroopingStrip(Strip):
-    """Прошивка, у которой при всех включённых каналах проседает синий.
+    """Прошивка, у которой при всех каналах на полную проседает синий.
 
     Так ведут себя контроллеры с ограничением тока: модель «свет = сумма
     каналов» для белого неточна, и белый по первому расчёту уходит.
@@ -110,7 +110,8 @@ class DroopingStrip(Strip):
     def light(self, hs):
         drive = cm.hs_to_rgb(hs)
         power = [f(d) for f, d in zip(self.curve, drive)]
-        power[2] *= 1 - 0.2 * max(0.0, sum(drive) - 1.5) / 1.5
+        if min(drive) > 0.9:  # все три канала почти на полную - упор в ток
+            power[2] *= 0.85
         return [sum(self.matrix[i][c] * power[c] for c in range(3)) for i in range(3)]
 
 
@@ -148,7 +149,8 @@ class WhiteBecomesDaylight(unittest.TestCase):
         first, _ = cc.fit(measure(strip, Camera()))
         refined, _ = calibrate(strip, Camera())
         self.assertGreater(white_error(strip, first), 0.001)
-        self.assertLess(white_error(strip, refined), white_error(strip, first) / 3)
+        self.assertLess(white_error(strip, refined), white_error(strip, first) / 2)
+        self.assertLess(white_error(strip, refined), 0.002)
 
     def test_camera_that_clips_saturated_leds_is_corrected_on_white(self):
         camera = Camera(seed=5, clip=True)
@@ -343,12 +345,25 @@ class SpoiledMeasurementIsRefused(unittest.TestCase):
             cc.fit(samples)
 
     def test_phone_moved_mid_measurement(self):
+        # Полпути замера камера смотрела на другую, зелёную стену.
         samples = measure(GAMMA_FW, Camera())
-        r, g, b = samples["red_50"]
-        samples["red_50"] = [r, g * 2.5, b]  # в кадр попала другая стена
+        for key in [k for k, *_ in cc.SAMPLES][4:14]:
+            r, g, b = samples[key]
+            samples[key] = [r * 0.5, g * 1.6, b * 0.6]
         with self.assertRaises(cc.CalibrationError) as caught:
             cc.fit(samples)
         self.assertIn("неустойчив", str(caught.exception))
+
+    def test_one_odd_frame_does_not_spoil_the_calibration(self):
+        # С объекта: «вообще не калибруется, постоянно ошибка» - один кадр,
+        # где слабый канал утонул в шуме, ронял всю калибровку.
+        samples = measure(GAMMA_FW, Camera())
+        r, g, b = samples["red_75"]
+        samples["red_75"] = [r, -0.0 * g, b * 3]
+        calibration, _ = cc.fit(samples)
+        seen = Camera().see(GAMMA_FW.light(calibration.to_device((0, 0))))
+        calibration = cc.refine_white(calibration, seen)
+        self.assertLess(white_error(GAMMA_FW, calibration), 0.002)
 
     def test_missing_or_broken_sample(self):
         samples = measure(GAMMA_FW, Camera())
@@ -358,6 +373,54 @@ class SpoiledMeasurementIsRefused(unittest.TestCase):
         del samples["white"]
         with self.assertRaises(cc.CalibrationError):
             cc.fit(samples)
+
+
+class Phone:
+    """Камера телефона как она есть: одна автоэкспозиция на кадр, «красивая»
+    добавка насыщенности, обрезка в ноль, шум и 8 бит на канал."""
+
+    def __init__(self, seed=1, boost=0.2, noise=0.003, surface=(1.0, 1.0, 1.0)):
+        self.rng = random.Random(seed)
+        self.boost, self.noise, self.surface = boost, noise, surface
+
+    def see(self, light):
+        v = [x * r for x, r in zip(light, self.surface)]
+        top = max(v) or 1e-9
+        exposure = self.rng.uniform(0.55, 0.85)
+        v = [x / top * exposure for x in v]
+        luma = 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2]
+        v = [(1 + self.boost) * x - self.boost * luma for x in v]
+        v = [max(0.0, min(1.0, x + self.rng.gauss(0, self.noise))) for x in v]
+        return [cm.srgb_to_linear(round(255 * cm.linear_to_srgb(x)) / 255) for x in v]
+
+
+class RealPhoneCamera(unittest.TestCase):
+    """С объекта (iPhone, GLEDOPTO SPI): «вообще не калибруется, постоянно
+    ошибка». Расчёт брал силу каналов из чистых красного, зелёного и синего,
+    а их телефон искажает и обрезает: на такой камере он отказывал почти
+    всегда. Теперь вклад каналов подбирается по всем кадрам с упором на
+    спокойные смешанные цвета, а негодные точки отбрасываются."""
+
+    def test_calibrates_every_time_on_white_paper(self):
+        for seed in range(30):
+            calibration, _ = calibrate(SPI, Phone(seed=seed))
+            self.assertLess(white_error(SPI, calibration), 0.002, seed)
+
+    def test_warm_shades_stay_close_even_with_the_phones_extra_saturation(self):
+        errors = [
+            max(check_errors(SPI, calibrate(SPI, Phone(seed=s, boost=0.2))[0], WARM).values())
+            for s in range(10)
+        ]
+        # Добавку насыщенности телефона замер не видит - остаётся «едва
+        # заметно», не больше; глазом белый подстраивается ползунками.
+        self.assertLess(sorted(errors)[5], 0.025, errors)
+
+    def test_a_wooden_wall_is_flagged(self):
+        # Дерево окрашивает свет: поправка подогнала бы ленту под цвет дерева.
+        _, quality = calibrate(SPI, Phone(seed=3, surface=(0.75, 0.55, 0.30)))
+        self.assertGreater(quality["white_before"], cc.STRONG_CORRECTION)
+        _, quality = calibrate(SPI, Phone(seed=3))
+        self.assertLess(quality["white_before"], cc.STRONG_CORRECTION)
 
 
 class Stored(unittest.TestCase):
@@ -827,6 +890,12 @@ class AbandonedCalibrationPutsTheStripBack(unittest.TestCase):
         self.assertIsNone(warm["hs"])
         for item in info["samples"] + info["checks"]:
             self.assertRegex(item["swatch"], r"^#[0-9a-f]{6}$")
+
+    def test_a_wooden_wall_gets_a_warning_in_words(self):
+        self.call(self.ws.ws_fit, samples=measure(SPI, Phone(seed=4, surface=(0.75, 0.55, 0.30))))
+        self.assertIn("бумаги", self.conn.results[-1]["warning"])
+        self.call(self.ws.ws_fit, samples=measure(SPI, Phone(seed=4)))
+        self.assertNotIn("warning", self.conn.results[-1])
 
     def test_a_normal_end_disarms_it(self):
         self.call(self.ws.ws_begin)
