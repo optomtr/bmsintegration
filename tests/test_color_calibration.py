@@ -9,36 +9,50 @@
 """
 
 import asyncio
-import importlib.util
+import importlib
+import math
 import os
 import random
 import sys
+import types
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-PATH = os.path.join(
-    os.path.dirname(HERE), "custom_components", "bms_integration", "core", "color_calibration.py"
-)
-spec = importlib.util.spec_from_file_location("color_calibration_under_test", PATH)
-cc = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = cc
-spec.loader.exec_module(cc)
+CORE = os.path.join(os.path.dirname(HERE), "custom_components", "bms_integration", "core")
+# Расчёт - отдельный пакет без Home Assistant: модули тянут друг друга
+# относительным импортом, поэтому грузятся как пакет, а не по одному файлу.
+_pkg = types.ModuleType("calibration_core_under_test")
+_pkg.__path__ = [CORE]
+sys.modules[_pkg.__name__] = _pkg
+cc = importlib.import_module(f"{_pkg.__name__}.color_calibration")
+cm = importlib.import_module(f"{_pkg.__name__}.colour_math")
+D65 = (1.0, 1.0, 1.0)
 
 
 class Strip:
-    """Лента: свет = M · (доли каналов ** γ)."""
+    """Лента: свет = M · кривая(доли каналов).
+
+    gamma - число (степень) или функция доли канала -> свет канала.
+    """
 
     def __init__(self, primaries, strength, gamma):
         # primaries - цвет каждого канала в линейном sRGB, strength - его сила.
         self.matrix = [[primaries[c][i] * strength[c] for c in range(3)] for i in range(3)]
         self.gamma = gamma
+        self.curve = [g if callable(g) else (lambda d, g=g: d ** g) for g in gamma]
 
     def light(self, hs):
-        drive = cc.hs_to_rgb(hs)
-        power = [d ** g for d, g in zip(drive, self.gamma)]
+        drive = cm.hs_to_rgb(hs)
+        power = [f(d) for f, d in zip(self.curve, drive)]
         return [sum(self.matrix[i][c] * power[c] for c in range(3)) for i in range(3)]
+
+
+def exp_curve(k):
+    """Кривая диммирования «экспонентой», как у части SPI-контроллеров: на
+    половине она похожа на степень 2,7, а на 75% расходится с ней на 14%."""
+    return lambda d: (math.exp(k * d) - 1) / (math.exp(k) - 1)
 
 
 class Camera:
@@ -62,11 +76,21 @@ class Camera:
         return [max(0.0, x * exposure * (1 + self.rng.gauss(0, self.noise))) for x in values]
 
 
+def command_for(calibration, hs=None, kelvin=None):
+    if kelvin is not None:
+        if calibration:
+            return calibration.to_device_kelvin(kelvin)
+        # Без поправки температуру шлют как цвет того же вида на колесе.
+        return cm.rgb_to_hs([cm.linear_to_srgb(x) for x in cm.kelvin_target(kelvin)])
+    return calibration.to_device(hs) if calibration else hs
+
+
 def measure(strip, camera, calibration=None, which=cc.SAMPLES):
     out = {}
-    for key, hs, *_ in which:
-        command = calibration.to_device(hs) if calibration else hs
-        out[key] = camera.see(strip.light(command))
+    for item in which:
+        key, hs = item[0], item[1]
+        kelvin = item[2] if len(item) == 4 else None
+        out[key] = camera.see(strip.light(command_for(calibration, hs, kelvin)))
     return out
 
 
@@ -84,15 +108,15 @@ class DroopingStrip(Strip):
     """
 
     def light(self, hs):
-        drive = cc.hs_to_rgb(hs)
-        power = [d ** g for d, g in zip(drive, self.gamma)]
+        drive = cm.hs_to_rgb(hs)
+        power = [f(d) for f, d in zip(self.curve, drive)]
         power[2] *= 1 - 0.2 * max(0.0, sum(drive) - 1.5) / 1.5
         return [sum(self.matrix[i][c] * power[c] for c in range(3)) for i in range(3)]
 
 
 def white_error(strip, calibration):
     command = calibration.to_device((0, 0)) if calibration else (0, 0)
-    return cc.delta_uv(strip.light(command), cc.D65_WHITE)
+    return cm.delta_uv(strip.light(command), D65)
 
 
 def calibrate(strip, camera):
@@ -110,8 +134,9 @@ class WhiteBecomesDaylight(unittest.TestCase):
 
     def test_firmware_with_its_own_gamma(self):
         calibration, _ = calibrate(GAMMA_FW, Camera(seed=3))
-        for got, want in zip(calibration.gamma, GAMMA_FW.gamma):
-            self.assertAlmostEqual(got, want, delta=0.05)
+        for curve, g in zip(calibration.curves, GAMMA_FW.gamma):
+            for d in (0.3, 0.5, 0.8):
+                self.assertAlmostEqual(cc._level(curve, d), d ** g, delta=0.01)
         self.assertLess(white_error(GAMMA_FW, calibration), 0.002)
 
     def test_noise_and_exposure_of_a_real_phone(self):
@@ -122,8 +147,8 @@ class WhiteBecomesDaylight(unittest.TestCase):
         strip = DroopingStrip(LED, (1.0, 1.2, 0.8), (2.2, 2.0, 2.4))
         first, _ = cc.fit(measure(strip, Camera()))
         refined, _ = calibrate(strip, Camera())
-        self.assertGreater(white_error(strip, first), 0.0015)
-        self.assertLess(white_error(strip, refined), 0.0005)
+        self.assertGreater(white_error(strip, first), 0.001)
+        self.assertLess(white_error(strip, refined), white_error(strip, first) / 3)
 
     def test_camera_that_clips_saturated_leds_is_corrected_on_white(self):
         camera = Camera(seed=5, clip=True)
@@ -185,11 +210,114 @@ class TheLampsOwnWhite(unittest.TestCase):
         calibration, _ = cc.fit(self.samples(GREENISH, [1.0, 1.0, 1.02]))
         self.assertFalse(calibration.white_via_colour)
 
+    def test_rgb_strip_without_white_leds_goes_through_the_colour_even_if_near_daylight(self):
+        # С объекта: «у меня лента RGB, белых светодиодов нет». Её белый режим -
+        # те же три цвета; даже если он вышел почти дневным, температуры
+        # прошивка собирает по-своему (тёплый пресет горел белым).
+        balanced = Strip(([1, 0, 0], [0, 1, 0], [0, 0, 1]), (1.0, 1.0, 1.0), (2.2, 2.2, 2.2))
+        calibration, _ = cc.fit(self.samples(balanced, balanced.light((0, 0))))
+        self.assertTrue(calibration.white_via_colour)
+
     def test_the_choice_survives_saving_and_refining(self):
         calibration, _ = cc.fit(self.samples(GREENISH, GREENISH.light((0, 0))))
         self.assertTrue(cc.Calibration.from_dict(calibration.as_dict()).white_via_colour)
         refined = cc.refine_white(calibration, Camera().see(GREENISH.light(calibration.to_device((0, 0)))))
         self.assertTrue(refined.white_via_colour)
+
+
+SPI = Strip(LED, strength=(1.0, 1.25, 0.75), gamma=(exp_curve(3.5), exp_curve(3.0), exp_curve(4.0)))
+WARM = ("sand", "yellow", "orange", "warm_3000")
+
+
+def check_errors(strip, calibration, keys=None):
+    out = {}
+    for key, hs, kelvin, _label in cc.CHECKS:
+        if keys and key not in keys:
+            continue
+        target = calibration.target(hs, kelvin) if calibration else (
+            cm.kelvin_target(kelvin) if kelvin is not None else cm.hs_target(hs))
+        out[key] = cm.delta_uv(strip.light(command_for(calibration, hs, kelvin)), target)
+    return out
+
+
+class WarmWhitesAndYellows(unittest.TestCase):
+    """С объекта: белый точно, а 3000 K и жёлтые/песочные - плохо.
+
+    Жёлтым и тёплым нужны каналы на 70-90%. Кривая SPI-контроллера там не
+    повторяет степень, снятую на половине, - нужны точки кривой на нескольких
+    долях, а температура должна идти через ту же поправку.
+    """
+
+    def setUp(self):
+        self.calibration, _ = calibrate(SPI, Camera(seed=21))
+
+    def test_warm_and_yellow_checks_hit_their_targets(self):
+        errors = check_errors(SPI, self.calibration, WARM)
+        for key, delta in errors.items():
+            self.assertLess(delta, 0.005, (key, errors))
+
+    def test_one_point_per_channel_was_not_enough(self):
+        # Та же поправка, но кривая каждого канала - по одной точке на
+        # половине, как было до этого выпуска.
+        single = cc.Calibration(
+            self.calibration.matrix,
+            tuple(tuple(p for p in k if abs(p[0] - 0.5) < 1e-6) for k in self.calibration.curves),
+            self.calibration.white_via_colour,
+        )
+        errors = check_errors(SPI, single, ("sand", "yellow", "warm_3000"))
+        self.assertGreater(max(errors.values()), 0.008, errors)
+
+    def test_colour_temperature_through_the_correction(self):
+        for kelvin in (2700, 3000, 4000, 5000):
+            light = SPI.light(self.calibration.to_device_kelvin(kelvin))
+            self.assertLess(cm.delta_uv(light, cm.kelvin_target(kelvin)), 0.005, kelvin)
+
+    def test_uncorrected_warm_white_is_visibly_off(self):
+        self.assertGreater(max(check_errors(SPI, None, WARM).values()), 0.012)
+
+
+class WhiteTunedByEye(unittest.TestCase):
+    """«Чтоб я мог настроить баланс белого» - подстройка ложится на всё."""
+
+    def setUp(self):
+        self.calibration, _ = calibrate(GAMMA_FW, Camera(seed=31))
+
+    def white_light(self, calibration):
+        return GAMMA_FW.light(calibration.to_device((0, 0)))
+
+    def test_default_is_daylight(self):
+        self.assertLess(cm.delta_uv(self.white_light(self.calibration), D65), 0.002)
+
+    def test_warmer_and_greener(self):
+        warmer = self.calibration.with_white(5000, cm.DEFAULT_TINT)
+        self.assertLess(cm.delta_uv(self.white_light(warmer), cm.kelvin_target(5000, cm.DEFAULT_TINT)), 0.002)
+        greener = self.calibration.with_white(6500, cm.DEFAULT_TINT + 0.01)
+        light = self.white_light(greener)
+        self.assertLess(cm.delta_uv(light, cm.kelvin_target(6500, cm.DEFAULT_TINT + 0.01)), 0.002)
+        self.assertGreater(cm.delta_uv(light, D65), 0.008)
+
+    def test_the_tuning_moves_temperatures_and_colours_the_same_way(self):
+        tuned = self.calibration.with_white(6000, 0.008)
+        errors = check_errors(GAMMA_FW, tuned)
+        for key, delta in errors.items():
+            # Насыщенный зелёный и жёлтый со сдвигом к зелёному этой ленте
+            # уже на краю того, что она может; спокойные цвета - точно.
+            limit = 0.01 if key in ("green", "yellow") else 0.003
+            self.assertLess(delta, limit, (key, errors))
+        back = tuned.from_device(tuned.to_device((200, 60)))
+        self.assertAlmostEqual(back[0], 200, delta=0.6)
+        self.assertAlmostEqual(back[1], 60, delta=0.6)
+
+    def test_it_is_saved(self):
+        tuned = self.calibration.with_white(5400, 0.006)
+        again = cc.Calibration.from_dict(tuned.as_dict())
+        self.assertEqual((again.white_kelvin, again.white_tint), (5400, 0.006))
+
+    def test_evaluation_measures_against_the_tuned_white(self):
+        tuned = self.calibration.with_white(5000, 0.003)
+        measured = measure(GAMMA_FW, Camera(seed=32), tuned, cc.CHECKS)
+        self.assertEqual(cc.evaluate(measured, tuned)["verdict"], "excellent")
+        self.assertNotEqual(cc.evaluate(measured)["verdict"], "excellent")
 
 
 class SpoiledMeasurementIsRefused(unittest.TestCase):
@@ -210,14 +338,14 @@ class SpoiledMeasurementIsRefused(unittest.TestCase):
 
     def test_strip_changing_colour_mid_measurement(self):
         samples = measure(GAMMA_FW, Camera())
-        samples["green_soft"] = samples["blue"]
+        samples["green_50"] = samples["blue"]
         with self.assertRaises(cc.CalibrationError):
             cc.fit(samples)
 
     def test_phone_moved_mid_measurement(self):
         samples = measure(GAMMA_FW, Camera())
-        r, g, b = samples["red_soft"]
-        samples["red_soft"] = [r, g * 2.5, b]  # в кадр попала другая стена
+        r, g, b = samples["red_50"]
+        samples["red_50"] = [r, g * 2.5, b]  # в кадр попала другая стена
         with self.assertRaises(cc.CalibrationError) as caught:
             cc.fit(samples)
         self.assertIn("неустойчив", str(caught.exception))
@@ -243,6 +371,22 @@ class Stored(unittest.TestCase):
         self.assertIsNone(cc.Calibration.load({"version": 1, "matrix": [[1, 0, 0]] * 3, "gamma": [1, 1, 1]}))
         self.assertIsNone(cc.Calibration.load({"version": 1, "matrix": "x", "gamma": [1, 1, 1]}))
         self.assertIsNone(cc.Calibration.load({"version": 2}))
+        good = calibrate(GAMMA_FW, Camera())[0].as_dict()
+        for broken in (
+            dict(good, curves=[[[0.5, 0.2], [0.4, 0.3]]] * 3),  # доли не по порядку
+            dict(good, curves=[[[0.5, 1.5]]] * 3),              # света больше полного
+            dict(good, white={"kelvin": 100, "tint": 0}),
+        ):
+            self.assertIsNone(cc.Calibration.load(broken), broken)
+
+    def test_calibration_saved_by_the_first_version_still_works(self):
+        old = {"version": 1, "matrix": [[0.9, 0.1, 0.0], [0.03, 1.2, 0.05], [0.0, 0.1, 0.7]],
+               "gamma": [2.2, 2.0, 2.4], "white_via_colour": True}
+        calibration = cc.Calibration.load(old)
+        self.assertIsNotNone(calibration)
+        self.assertTrue(calibration.white_via_colour)
+        self.assertAlmostEqual(cc._level(calibration.curves[0], 0.5), 0.5 ** 2.2, delta=0.002)
+        self.assertEqual(calibration.as_dict()["white"], {"kelvin": 6500, "tint": 0.0032})
 
 
 # --------------------------------------------------------------------------- #
@@ -319,6 +463,108 @@ def sent_hs(ent, colour_dp=COLOUR):
 
 
 CLEAN = Strip(([1, 0, 0], [0, 1, 0], [0, 0, 1]), (0.8, 1.3, 0.6), (2.2, 1.0, 1.8))
+CT, BRIGHT = "23", "22"
+
+
+class _LightCT(_Light):
+    """Лента с белым режимом и температурой, как GLEDOPTO SPI в Home Assistant."""
+
+    supported_color_modes = {ColorMode.HS, ColorMode.COLOR_TEMP}
+    min_color_temp_kelvin = 2700
+    max_color_temp_kelvin = 6500
+
+
+def make_ct_light(calibration, stored=None):
+    ent = make_light(calibration)
+    ent.__class__ = _LightCT
+    ent._config.update({"brightness": BRIGHT, "color_temp": CT})
+    # Лента в своём белом режиме - так она стоит до выбора температуры.
+    ent._status.update({BRIGHT: 1000, CT: 1000, MODE: ent._modes.white})
+    ent._color_temp = None
+    ent._stored_states = stored
+    return ent
+
+
+class ColourTemperatureOnAnRgbStrip(unittest.TestCase):
+    """С объекта: «у меня лента RGB, белых светодиодов нет» - тёплый пресет
+    горел белым. Температура такой ленты идёт исправленным цветом, а Home
+    Assistant видит режим температуры."""
+
+    def setUp(self):
+        base, _ = calibrate(CLEAN, Camera(seed=41))
+        self.rgb_only = cc.Calibration(base.matrix, base.curves, True)
+        self.white_leds = cc.Calibration(base.matrix, base.curves, False)
+
+    def test_temperature_goes_out_as_the_corrected_colour(self):
+        ent = make_ct_light(self.rgb_only)
+        asyncio.run(ent.async_turn_on(color_temp_kelvin=3000))
+        states = ent.sent[-1]
+        self.assertNotIn(CT, states, "белый режим прошивки - мимо поправки")
+        want = self.rgb_only.to_device_kelvin(3000)
+        got = sent_hs(ent)
+        self.assertAlmostEqual(got[0], want[0], delta=1.0)
+        self.assertAlmostEqual(got[1], want[1], delta=0.2)
+        self.assertEqual(states[MODE], ent._modes.color)
+        ent.status_updated()
+        self.assertEqual(ent.color_mode, ColorMode.COLOR_TEMP)
+        self.assertEqual(ent.color_temp_kelvin, 3000)
+        self.assertIsNone(ent.hs_color)
+
+    def test_dimming_keeps_the_temperature(self):
+        ent = make_ct_light(self.rgb_only)
+        asyncio.run(ent.async_turn_on(color_temp_kelvin=3000))
+        first = ent.sent[-1][COLOUR]
+        ent.status_updated()
+        for level in (80, 200, 30, 255):
+            asyncio.run(ent.async_turn_on(brightness=level))
+            ent.status_updated()
+            # Ровно та же команда цвета: пересчёт туда-обратно мог бы уводить
+            # оттенок по градусу на каждую смену яркости.
+            self.assertEqual(ent.sent[-1][COLOUR][:8], first[:8], level)
+        self.assertEqual(ent.color_mode, ColorMode.COLOR_TEMP)
+        self.assertEqual(ent.color_temp_kelvin, 3000)
+        self.assertLess(int(ent.sent[-2][COLOUR][8:12], 16), 1000)
+
+    def test_a_colour_afterwards_leaves_the_temperature(self):
+        ent = make_ct_light(self.rgb_only)
+        asyncio.run(ent.async_turn_on(color_temp_kelvin=3000))
+        ent.status_updated()
+        asyncio.run(ent.async_turn_on(hs_color=(200, 70)))
+        ent.status_updated()
+        self.assertEqual(ent.color_mode, ColorMode.HS)
+        self.assertIsNone(ent._ct_active)
+
+    def test_real_white_leds_keep_their_own_temperature(self):
+        ent = make_ct_light(self.white_leds)
+        asyncio.run(ent.async_turn_on(color_temp_kelvin=3000))
+        self.assertIn(CT, ent.sent[-1])
+        self.assertNotIn(COLOUR, ent.sent[-1])
+
+    def test_after_a_restart_the_temperature_is_recognised(self):
+        sent = self.rgb_only.to_device_kelvin(3000)
+        stored = type("State", (), {"attributes": {"color_mode": "color_temp", "color_temp_kelvin": 3000}})()
+        ent = make_ct_light(self.rgb_only, stored)
+        ent._status[MODE] = ent._modes.color  # лента горит цветом - исправленной температурой
+        ent._status[COLOUR] = ent._LocalTuyaLight__to_color(sent, 1000)
+        ent.status_updated()
+        self.assertEqual(ent.color_mode, ColorMode.COLOR_TEMP)
+        self.assertEqual(ent.color_temp_kelvin, 3000)
+        # Пока Home Assistant стоял, ленту перекрасили из приложения - это цвет.
+        other = make_ct_light(self.rgb_only, stored)
+        other._status[MODE] = other._modes.color
+        other._status[COLOUR] = other._LocalTuyaLight__to_color((200, 70), 1000)
+        other.status_updated()
+        self.assertEqual(other.color_mode, ColorMode.HS)
+
+    def test_comparison_shows_the_lamp_as_it_was_and_corrected(self):
+        ent = make_ct_light(self.rgb_only)
+        asyncio.run(ent.async_show_calibration_kelvin(3000))
+        self.assertEqual(ent.confirmed[-1][MODE], ent._modes.white)
+        self.assertIn(CT, ent.confirmed[-1])
+        asyncio.run(ent.async_show_calibration_kelvin(3000, self.rgb_only))
+        want = self.rgb_only.to_device_kelvin(3000)
+        self.assertAlmostEqual(sent_hs(ent)[0], want[0], delta=1.0)
+        self.assertEqual(ent.confirmed[-1][MODE], ent._modes.color)
 
 
 class InHomeAssistant(unittest.TestCase):
@@ -365,7 +611,7 @@ class InHomeAssistant(unittest.TestCase):
 
     def test_white_goes_to_white_mode_unless_the_calibration_says_otherwise(self):
         for via_colour, expect_colour in ((False, False), (True, True)):
-            calibration = cc.Calibration(self.calibration.matrix, self.calibration.gamma, via_colour)
+            calibration = cc.Calibration(self.calibration.matrix, self.calibration.curves, via_colour)
             ent = make_light(calibration)
             ent._config["brightness"] = "22"
             asyncio.run(ent.async_turn_on(hs_color=(0, 0)))
@@ -412,7 +658,7 @@ def load_calibration_ws():
     sys.modules["homeassistant.components.websocket_api"] = ws
     sys.modules["homeassistant.components"].websocket_api = ws
     vol = sys.modules["voluptuous"]
-    for name in ("All", "Any", "Coerce", "In", "Length", "Optional", "Required"):
+    for name in ("All", "Any", "Coerce", "In", "Length", "Optional", "Range", "Required"):
         if not hasattr(vol, name):
             setattr(vol, name, lambda *a, **k: None)
     pkg = sys.modules["custom_components.bms_integration"]
@@ -462,7 +708,7 @@ class SavingDoesNotReloadTheHouse(unittest.TestCase):
         self.assertEqual(light["color_calibration"], self.stored)
         self.assertNotIn("color_calibration", self.written[-1]["devices"]["dev1"]["entities"][0])
         self.assertEqual(self.pkg._applied_without_reload["E1"], self.written[-1]["updated_at"])
-        self.assertEqual(self.applied[-1].as_dict()["gamma"], self.stored["gamma"])
+        self.assertEqual(self.applied[-1].as_dict()["curves"], self.stored["curves"])
 
     def test_reset_removes_it(self):
         self.store(self.stored)
@@ -553,6 +799,34 @@ class AbandonedCalibrationPutsTheStripBack(unittest.TestCase):
         asyncio.run(self.tasks[0])
         self.assertEqual(self.light.sent[-1], {SWITCH: True, MODE: self.light._modes.color, COLOUR: "000003e803e8"})
         self.assertNotIn("light.x", self.ws._snapshots)
+
+    def test_show_takes_exactly_one_colour(self):
+        self.call(self.ws.ws_show, hs=[0, 0], kelvin=3000)
+        self.call(self.ws.ws_show)
+        self.assertEqual([c for c, _t in self.conn.errors], ["invalid", "invalid"])
+        self.assertEqual(self.light.sent, [])
+
+    def test_show_a_temperature_corrected_or_as_the_lamp_does_it(self):
+        calibration, _ = calibrate(CLEAN, Camera(seed=51))
+        self.call(self.ws.ws_show, kelvin=3000, calibration=calibration.as_dict())
+        want = calibration.to_device_kelvin(3000)
+        self.assertAlmostEqual(self.conn.results[-1]["sent_hs"][0], want[0], delta=0.01)
+        self.call(self.ws.ws_show, kelvin=3000)  # лампа без белого режима - цвет без поправки
+        self.assertEqual(self.conn.errors, [])
+        self.assertIsNotNone(self.conn.results[-1]["sent_hs"])
+
+    def test_info_gives_the_screen_what_tuning_needs(self):
+        calibration, _ = calibrate(CLEAN, Camera(seed=52))
+        self.light._calibration = calibration
+        self.call(self.ws.ws_info)
+        info = self.conn.results[-1]
+        self.assertEqual(info["calibration"], calibration.as_dict())
+        self.assertEqual(info["white_default"], {"kelvin": 6500, "tint": 0.0032})
+        self.assertLessEqual(info["white_range"]["kelvin"]["min"], 2700)
+        warm = next(c for c in info["checks"] if c["kelvin"] == 3000)
+        self.assertIsNone(warm["hs"])
+        for item in info["samples"] + info["checks"]:
+            self.assertRegex(item["swatch"], r"^#[0-9a-f]{6}$")
 
     def test_a_normal_end_disarms_it(self):
         self.call(self.ws.ws_begin)

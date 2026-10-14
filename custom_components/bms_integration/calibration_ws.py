@@ -22,6 +22,7 @@ from homeassistant.const import CONF_BRIGHTNESS, CONF_COLOR_TEMP
 
 from .const import ATTR_UPDATED_AT, CONF_COLOR, CONF_COLOR_CALIBRATION, DOMAIN
 from .core import color_calibration as cc
+from .core.colour_math import hs_target, kelvin_target, swatch
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -59,14 +60,28 @@ _RGB = vol.All([vol.Coerce(float)], vol.Length(min=3, max=3))
 _HS = vol.All([vol.Coerce(float)], vol.Length(min=2, max=2))
 
 
+def _item(key, hs, kelvin, label) -> dict:
+    """Один цвет замера или проверки - с кружком для экрана."""
+    rgb = kelvin_target(kelvin) if kelvin is not None else (
+        hs_target(hs) if hs is not None else [1.0, 1.0, 1.0]
+    )
+    return {
+        "key": key,
+        "hs": list(hs) if hs is not None else None,
+        "kelvin": kelvin,
+        "label": label,
+        "swatch": swatch(rgb),
+    }
+
+
 def _samples(entity) -> list[dict]:
     """Что показать для замера: белый режим - только у ламп, где он есть."""
-    items = [{"key": k, "hs": list(hs), "label": label} for k, hs, label in cc.SAMPLES]
+    items = [_item(k, hs, None, label) for k, hs, label in cc.SAMPLES]
     if entity is not None and (
         entity.has_config(CONF_BRIGHTNESS) or entity.has_config(CONF_COLOR_TEMP)
     ):
         key, _hs, label = cc.WHITE_MODE
-        items.append({"key": key, "hs": None, "label": label})
+        items.append(_item(key, None, None, label))
     return items
 
 
@@ -118,7 +133,11 @@ async def ws_info(hass: HomeAssistant, connection, msg: dict) -> None:
             "calibrated_at": stored.get("calibrated_at"),
             "method": stored.get("method"),
             "samples": _samples(entity),
-            "checks": [{"key": k, "hs": list(hs), "label": label} for k, hs, label in cc.CHECKS],
+            "checks": [_item(k, hs, kelvin, label) for k, hs, kelvin, label in cc.CHECKS],
+            # Сохранённая поправка - для подстройки белого без нового замера.
+            "calibration": entity.calibration.as_dict() if entity and entity.calibration else None,
+            "white_default": dict(cc.WHITE_DEFAULT),
+            "white_range": {k: dict(v) for k, v in cc.WHITE_RANGE.items()},
         },
     )
 
@@ -144,8 +163,10 @@ async def ws_begin(hass: HomeAssistant, connection, msg: dict) -> None:
     {
         vol.Required("type"): f"{DOMAIN}/color_calibration/show",
         vol.Required("entity_id"): str,
-        # None - собственный белый режим лампы.
-        vol.Required("hs"): vol.Any(None, _HS),
+        # hs None - собственный белый режим лампы; kelvin - температура белого
+        # (с поправкой - исправленным цветом, без неё - как лампа сама).
+        vol.Optional("hs"): vol.Any(None, _HS),
+        vol.Optional("kelvin"): vol.All(vol.Coerce(int), vol.Range(min=1500, max=10000)),
         vol.Optional("calibration"): vol.Any(None, dict),
     }
 )
@@ -158,18 +179,24 @@ async def ws_show(hass: HomeAssistant, connection, msg: dict) -> None:
         return
     if msg["entity_id"] in _snapshots:
         _arm_watchdog(hass, msg["entity_id"])
+    if ("hs" in msg) == ("kelvin" in msg):
+        connection.send_error(msg["id"], "invalid", "Нужен ровно один цвет: hs или kelvin.")
+        return
     try:
-        if msg["hs"] is None:
+        calibration = _calibration(msg.get("calibration"))
+        if "kelvin" in msg:
+            sent = await entity.async_show_calibration_kelvin(msg["kelvin"], calibration)
+        elif msg["hs"] is None:
             await entity.async_show_calibration_white()
-            connection.send_result(msg["id"], {"sent_hs": None})
-            return
-        sent = await entity.async_show_calibration_colour(
-            msg["hs"], _calibration(msg.get("calibration"))
-        )
+            sent = None
+        else:
+            sent = await entity.async_show_calibration_colour(msg["hs"], calibration)
     except Exception as err:  # noqa: BLE001
         _fail(connection, msg, err)
         return
-    connection.send_result(msg["id"], {"sent_hs": [round(sent[0], 2), round(sent[1], 2)]})
+    connection.send_result(
+        msg["id"], {"sent_hs": None if sent is None else [round(sent[0], 2), round(sent[1], 2)]}
+    )
 
 
 @websocket_api.websocket_command(
@@ -225,8 +252,8 @@ async def ws_refine_white(hass: HomeAssistant, connection, msg: dict) -> None:
 @websocket_api.async_response
 async def ws_evaluate(hass: HomeAssistant, connection, msg: dict) -> None:
     try:
-        _calibration(msg["calibration"])  # проверять можно только годную
-        result = cc.evaluate(msg["measured"])
+        # Цель проверки - с подстройкой белого, что в этой поправке.
+        result = cc.evaluate(msg["measured"], _calibration(msg["calibration"]))
     except cc.CalibrationError as err:
         _fail(connection, msg, err)
         return

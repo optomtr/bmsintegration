@@ -24,6 +24,7 @@ from homeassistant.const import CONF_BRIGHTNESS, CONF_COLOR_TEMP, CONF_SCENE
 from homeassistant.exceptions import HomeAssistantError
 
 from .config_flow import col_to_select
+from .core import colour_math
 from .core.color_calibration import Calibration
 from .entity import LocalTuyaEntity, async_setup_entry
 from .const import (
@@ -205,6 +206,14 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
     # Яркость, цвет, температура - состояния: из пачки команд важна последняя.
     _latest_command_wins = True
     _calibration: Calibration | None = None
+    # Температура белого, исполненная исправленным цветом: (кельвины, команда
+    # ленте). У RGB-ленты без белых светодиодов «белый режим» с температурой
+    # собирает прошивка из тех же трёх цветов мимо поправки - на объекте
+    # тёплый пресет горел белым. Пока лента показывает ровно эту команду,
+    # Home Assistant видит режим температуры, а не цвет.
+    _ct_emulated: tuple[int, tuple[float, float]] | None = None
+    _ct_active: int | None = None
+    _ct_restore_checked = False
 
     def __init__(
         self,
@@ -315,6 +324,8 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
     @property
     def hs_color(self):
         """Return the hs color value."""
+        if self._ct_active is not None:
+            return None
         if self.is_color_mode:
             return self._hs
         if (
@@ -327,6 +338,8 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
     @property
     def color_temp_kelvin(self):
         """Return the color_temp of the light."""
+        if self._ct_active is not None:
+            return self._ct_active
         if self._color_temp is not None:
             return map_range(
                 self._color_temp,
@@ -414,6 +427,8 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
         if len(self.supported_color_modes) == 1:
             return next(iter(self.supported_color_modes))
 
+        if self._ct_active is not None and ColorMode.COLOR_TEMP in self.supported_color_modes:
+            return ColorMode.COLOR_TEMP
         if self.is_color_mode:
             return ColorMode.HS
         if self.is_white_mode:
@@ -650,10 +665,24 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
                     self.__device_hs(hs), brightness
                 )
                 color_mode = self._modes.color
+            self._ct_emulated = None
 
-        if ATTR_COLOR_TEMP_KELVIN in kwargs and ColorMode.COLOR_TEMP in color_modes:
+        if ATTR_COLOR_TEMP_KELVIN in kwargs and ColorMode.COLOR_TEMP in color_modes and (
+            self.__ct_by_colour()
+        ):
             if brightness is None:
                 brightness = self._brightness
+            kelvin = int(kwargs[ATTR_COLOR_TEMP_KELVIN])
+            sent = self._calibration.to_device_kelvin(kelvin)
+            states[self._config.get(CONF_COLOR)] = self.__to_color(
+                sent, self._upper_brightness if brightness is None else brightness
+            )
+            color_mode = self._modes.color
+            self._ct_emulated = (kelvin, sent)
+        elif ATTR_COLOR_TEMP_KELVIN in kwargs and ColorMode.COLOR_TEMP in color_modes:
+            if brightness is None:
+                brightness = self._brightness
+            self._ct_emulated = None
 
             color_temp = map_range(
                 int(kwargs[ATTR_COLOR_TEMP_KELVIN]),
@@ -691,6 +720,37 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
                 states[mode_dp] = color_mode
 
         await self.async_set_dps(states)
+
+    def __ct_by_colour(self) -> bool:
+        """Температуру исполнять исправленным цветом, а не белым режимом лампы."""
+        return bool(
+            self._calibration
+            and self._calibration.white_via_colour
+            and self.has_config(CONF_COLOR)
+        )
+
+    def __ct_shown(self, device_hs) -> int | None:
+        """Какую температуру лента показывает этой командой цвета, если какую-то.
+
+        После перезапуска Home Assistant своей команды мы не помним - её
+        восстанавливают по последнему состоянию: была температура K и лента
+        горит ровно её исправленным цветом - значит, она и есть.
+        """
+        if not self.__ct_by_colour():
+            return None
+        if self._ct_emulated is None:
+            if self._ct_restore_checked:
+                return None
+            # Последнее состояние - только один раз, при первом отчёте ленты.
+            self._ct_restore_checked = True
+            last = getattr(self, "_stored_states", None)
+            kelvin = last and last.attributes.get("color_temp_kelvin")
+            if not (kelvin and last.attributes.get("color_mode") == "color_temp"):
+                return None
+            self._ct_emulated = (int(kelvin), self._calibration.to_device_kelvin(kelvin))
+        kelvin, sent = self._ct_emulated
+        dh = abs((device_hs[0] - sent[0] + 180) % 360 - 180)
+        return kelvin if dh <= 1.0 and abs(device_hs[1] - sent[1]) <= 0.6 else None
 
     def __device_hs(self, hs):
         """Выбранный цвет -> команда ленте, с поправкой, если она есть."""
@@ -731,18 +791,21 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
         await self.async_send_calibration_dps(states)
         return sent
 
-    async def async_show_calibration_white(self) -> None:
-        """Собственный белый режим лампы в полную яркость - его тоже меряют."""
+    async def async_show_calibration_white(self, kelvin: int | None = None) -> None:
+        """Собственный белый режим лампы в полную яркость - его тоже меряют.
+
+        Без температуры - самый холодный белый лампы, но не холоднее дневного.
+        """
         states = {self._dp_id: True}
         if mode_dp := self._config.get(CONF_COLOR_MODE):
             states[mode_dp] = self._modes.white
         if (bright_dp := self._config.get(CONF_BRIGHTNESS)) is not None:
             states[bright_dp] = self._upper_brightness
         if (temp_dp := self._config.get(CONF_COLOR_TEMP)) is not None:
-            # Самый холодный белый лампы, но не холоднее дневного - так же,
-            # как его пересчитывает обычное управление температурой.
+            wanted = min(6500, self.max_color_temp_kelvin) if kelvin is None else kelvin
+            # Так же, как температуру пересчитывает обычное управление.
             states[temp_dp] = map_range(
-                min(6500, self.max_color_temp_kelvin),
+                min(max(wanted, self.min_color_temp_kelvin), self.max_color_temp_kelvin),
                 self.min_color_temp_kelvin,
                 self.max_color_temp_kelvin,
                 self._lower_brightness,
@@ -750,6 +813,23 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
                 self._color_temp_reverse,
             )
         await self.async_send_calibration_dps(states)
+
+    async def async_show_calibration_kelvin(self, kelvin: int, calibration=None):
+        """Температура белого для замера и сравнения «как было / с поправкой».
+
+        С поправкой - исправленным цветом. Без неё - как лампа делает сама:
+        своим белым режимом, а если его нет - тем же цветом без поправки.
+        """
+        if calibration is not None:
+            sent = calibration.to_device_kelvin(kelvin)
+            return await self.async_show_calibration_colour(sent)
+        if self.has_config(CONF_COLOR_TEMP):
+            await self.async_show_calibration_white(kelvin)
+            return None
+        raw = colour_math.rgb_to_hs(
+            [colour_math.linear_to_srgb(x) for x in colour_math.kelvin_target(kelvin)]
+        )
+        return await self.async_show_calibration_colour(raw)
 
     async def async_send_calibration_dps(self, states: dict) -> None:
         """Команда для замера обязана дойти до ленты.
@@ -778,6 +858,7 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
         if (brightness_dp_value := self.dp_value(CONF_BRIGHTNESS)) is not None:
             self._brightness = brightness_dp_value
 
+        self._ct_active = None
         if ColorMode.HS in self.supported_color_modes:
             color = self.dp_value(CONF_COLOR)
             if color is not None and not self.is_white_mode:
@@ -787,6 +868,7 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
                     # Разбор мог и не тронуть цвет (белый режим адресной
                     # ленты) - тогда пересчитывать нечего, он уже наш.
                     if self._calibration and self._hs is not decoded_before:
+                        self._ct_active = self.__ct_shown(self._hs)
                         self._hs = list(self._calibration.from_device(self._hs))
                 except (TypeError, ValueError, IndexError) as ex:
                     # The colour datapoint is decoded with int(..., 16) over
