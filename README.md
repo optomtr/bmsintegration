@@ -117,6 +117,19 @@ the license text.
   was gone - and all 40 devices on the address were down, the healthy hub's
   included. A hub that announces itself later corrects the choice with one
   reload.
+- Colour calibration, second round, after a real GLEDOPTO SPI RGB strip (no
+  white LEDs): white came out exact, but 3000 K and yellow/sandy shades were
+  poor and a warm colour-temperature preset lit the strip plain white. Colour
+  temperatures now go through the correction too (the lamp's own white mode
+  is the firmware's mix of the same LEDs), and Home Assistant keeps showing
+  the colour-temperature mode. The measurement grows to 20 colours - each
+  channel at three levels plus yellow, amber, orange, sand and cream - so
+  the channel curves are right where warm shades need them; the check pass
+  adds 3000 K, sand and yellow. The white can be tuned by eye with two
+  sliders (warmer/cooler, pinker/greener), live on the strip and saved with
+  the calibration; a saved calibration can be tuned without measuring
+  again. Like Apple TV's colour balance, the result screen switches the
+  strip between "as it was" and "corrected", for white and for 3000 K.
 - Colour calibration of RGB strips with a phone camera, the way Apple TV
   balances a TV with an iPhone. Controllers and LEDs differ: the same command
   gives a greenish white on one strip and a red "orange" on another. In the

@@ -251,6 +251,262 @@ await test("colourName: по ключу, по оттенку, белый реж�
     ["синий", "оранжевый", "светло-розовый", "белый"]);
 });
 
+console.log("что показать на ленте");
+await test("itemTarget: kelvin, hs и белый режим лампы", () => {
+  eq(cal.itemTarget({ key: "warm_3000", hs: null, kelvin: 3000 }), { kelvin: 3000 });
+  eq(cal.itemTarget({ key: "orange", hs: [30, 85], kelvin: null }), { hs: [30, 85] });
+  eq(cal.itemTarget({ key: "white_mode", hs: null, kelvin: null }), { hs: null }, "белый режим:");
+  eq(cal.itemTarget({ key: "old", hs: [0, 0] }), { hs: [0, 0] }, "старый сервер без kelvin:");
+  eq(cal.itemTarget({ hs: [10, 20], kelvin: 0 }), { hs: [10, 20] }, "kelvin 0 - не температура:");
+});
+await test("showPayload: ровно одно из hs / kelvin, поправка только если есть", () => {
+  const C = { version: 1 };
+  eq(cal.showPayload("light.l", { hs: [0, 0] }), { entity_id: "light.l", hs: [0, 0] });
+  eq(cal.showPayload("light.l", { hs: null }), { entity_id: "light.l", hs: null }, "белый режим:");
+  eq(cal.showPayload("light.l", { kelvin: 3000 }, C), { entity_id: "light.l", kelvin: 3000, calibration: C });
+  eq(cal.showPayload("light.l", { kelvin: 3000 }, null), { entity_id: "light.l", kelvin: 3000 }, "сырые 3000 K:");
+  for (const t of [{ hs: [1, 2] }, { kelvin: 2700 }, { hs: null }, { hs: [1, 2], kelvin: 2700 }]) {
+    const p = cal.showPayload("light.l", t);
+    ok(("hs" in p) !== ("kelvin" in p), `оба или ни одного: ${JSON.stringify(p)}`);
+  }
+});
+await test("previewPayload: «как было» / «с поправкой» × белый / 3000 K", () => {
+  const C = { version: 1, white: { kelvin: 6500, tint: 0 } };
+  const pv = (corrected, warm, whiteMode) => cal.previewPayload("light.l", { corrected, warm }, { calibration: C, whiteMode });
+  eq(pv(false, false, true), { entity_id: "light.l", hs: null }, "как было, белый, есть белый режим:");
+  eq(pv(false, false, false), { entity_id: "light.l", hs: [0, 0] }, "как было, белый, без белого режима:");
+  eq(pv(false, true, true), { entity_id: "light.l", kelvin: 3000 }, "как было, 3000 K:");
+  eq(pv(true, false, true), { entity_id: "light.l", hs: [0, 0], calibration: C }, "с поправкой, белый:");
+  eq(pv(true, true, false), { entity_id: "light.l", kelvin: 3000, calibration: C }, "с поправкой, 3000 K:");
+  eq(cal.WARM_KELVIN, 3000);
+});
+await test("sameTarget: температура и цвет не путаются", () => {
+  ok(cal.sameTarget({ kelvin: 3000 }, { kelvin: 3000 }) && !cal.sameTarget({ kelvin: 3000 }, { kelvin: 4000 }), "kelvin");
+  ok(!cal.sameTarget({ kelvin: 3000 }, { hs: [30, 60] }) && !cal.sameTarget({ hs: null }, { kelvin: 3000 }), "kelvin против hs");
+  ok(cal.sameTarget({ hs: null }, { hs: null }) && !cal.sameTarget({ hs: null }, { hs: [0, 0] }), "белый режим");
+  ok(cal.sameTarget({ hs: [0, 0] }, { hs: [0.2, 0.2] }) && !cal.sameTarget(null, { hs: [0, 0] }), "hs");
+});
+await test("swatchOf: образец от сервера только как #rrggbb", () => {
+  eq(cal.swatchOf({ hs: null, kelvin: 3000, swatch: "#FFB46B" }), "#FFB46B");
+  eq(cal.swatchOf({ hs: [240, 100], swatch: "red;background:url(x)" }), "rgb(0,0,255)", "не #rrggbb:");
+  eq(cal.swatchOf({ hs: [0, 0] }), "rgb(255,255,255)"); eq(cal.swatchOf(undefined), "rgb(255,255,255)");
+});
+
+console.log("подстройка белого");
+// Те же числа, что шлёт сервер (core/color_calibration.py WHITE_RANGE / WHITE_DEFAULT):
+// оттенок по умолчанию 0,0032 нарочно не на сетке ползунка с шагом 0,001.
+const RANGE = { kelvin: { min: 2700, max: 9000, step: 50 }, tint: { min: -0.012, max: 0.018, step: 0.001 } };
+const DEF = { kelvin: 6500, tint: 0.0032 };
+const INFO = { white_default: DEF, white_range: RANGE };
+await test("whiteRange: без диапазонов от сервера подстройки нет", () => {
+  eq(cal.whiteRange(INFO), RANGE);
+  eq(cal.whiteRange({}), null, "старый сервер:");
+  eq(cal.whiteRange({ white_range: { kelvin: RANGE.kelvin } }), null, "только kelvin:");
+  eq(cal.whiteRange({ white_range: { kelvin: { min: 7000, max: 5000 }, tint: RANGE.tint } }), null, "max < min:");
+  eq(cal.whiteRange({ white_range: { kelvin: { min: 5000, max: 8000 }, tint: RANGE.tint } }).kelvin.step, 0, "без шага:");
+});
+await test("fitRange (кнопки «‹ ›»): края и шаг, мелкий шаг не округляется до тысячных", () => {
+  eq(cal.fitRange(6512, RANGE.kelvin), 6500); eq(cal.fitRange(9500, RANGE.kelvin), 9000); eq(cal.fitRange(10, RANGE.kelvin), 2700);
+  eq(cal.fitRange(0.00126, RANGE.tint), 0.001, "сетка от min:");
+  eq(cal.fitRange(0.00126, { min: -0.02, max: 0.02, step: 0.0005 }), 0.0015, "шаг 0,0005:");
+  eq(cal.fitRange(6530, { min: 6000, max: 6520, step: 300 }), 6300, "шаг за максимум:");
+  eq([cal.fitRange(NaN, RANGE.kelvin), cal.fitRange(1, null)], [null, null]);
+});
+await test("clampRange: только в пределы, без привязки к шагу", () => {
+  eq([cal.clampRange(0.0032, RANGE.tint), cal.clampRange(-1, RANGE.tint), cal.clampRange(12000, RANGE.kelvin)],
+    [0.0032, -0.012, 9000]);
+  eq([cal.clampRange("x", RANGE.tint), cal.clampRange(1, { min: 2, max: 1 })], [null, null]);
+});
+await test("whiteDefault / whiteOf: от сервера как есть, иначе 6500 K без оттенка", () => {
+  eq(cal.whiteDefault(INFO), DEF, "оттенок по умолчанию привязан к сетке ползунка:");
+  eq(cal.whiteDefault({ white_range: RANGE }), { kelvin: 6500, tint: 0 }, "без white_default:");
+  eq(cal.whiteDefault({ white_default: { kelvin: 9500, tint: 0 }, white_range: RANGE }), { kelvin: 9000, tint: 0 }, "за краем:");
+  eq(cal.whiteOf({ white: { kelvin: 6100, tint: 0.004 } }, DEF), { kelvin: 6100, tint: 0.004 });
+  eq(cal.whiteOf({ matrix: [] }, DEF), DEF, "без white:");
+  eq(cal.whiteOf(null, DEF), DEF);
+});
+await test("withWhite: копия; ответ сервера не тронут; меняется только white", () => {
+  const server = { version: 2, matrix: [[1, 0, 0], [0, 1, 0], [0, 0, 1]], curves: [[0, 0], [1, 1]], white_via_colour: true,
+                   white: { kelvin: 6500, tint: 0.0032 } };
+  const frozen = JSON.stringify(server);
+  const adj = cal.withWhite(server, { kelvin: 6123, tint: 0.0042 }, RANGE);
+  eq(JSON.stringify(server), frozen, "исходник изменён:");
+  eq(adj.white, { kelvin: 6123, tint: 0.0042 }, "значение изменено сверх пределов:");
+  eq(cal.withWhite(server, { kelvin: 12000, tint: -1 }, RANGE).white, { kelvin: 9000, tint: -0.012 }, "за пределы - сервер откажет:");
+  const { white: _a, ...restAdj } = adj, { white: _b, ...restServer } = server;
+  eq(restAdj, restServer, "поменялось не только white:");
+  adj.matrix[0][0] = 9;
+  eq(server.matrix[0][0], 1, "копия неглубокая:");
+  eq(cal.withWhite({ version: 1 }, { kelvin: 6000, tint: 0 }, null).white, { kelvin: 6000, tint: 0 }, "без диапазона:");
+});
+await test("nudge: около двадцати касаний на ход, по сетке и не за край", () => {
+  eq(cal.nudge(6500, -1, RANGE.kelvin), 6200); eq(cal.nudge(6500, 1, RANGE.kelvin), 6800);
+  eq(cal.nudge(8950, 1, RANGE.kelvin), 9000); eq(cal.nudge(2700, -1, RANGE.kelvin), 2700);
+  eq(cal.nudge(0.0032, 1, RANGE.tint), 0.005, "с оттенка по умолчанию - на сетку:");
+  let v = RANGE.kelvin.min, taps = 0;
+  while (v < RANGE.kelvin.max && taps < 100) { v = cal.nudge(v, 1, RANGE.kelvin); taps++; }
+  ok(taps >= 15 && taps <= 25, `касаний на весь ход: ${taps}`);
+});
+await test("whiteWords: словами от белого по умолчанию, теплее - меньше кельвинов", () => {
+  const w = (kelvin, tint) => cal.whiteWords({ kelvin, tint }, DEF, RANGE);
+  eq(w(6500, 0.0032), { kelvin: "Нейтральный", tint: "Без оттенка" });
+  eq(w(6500, 0.003).tint, "Без оттенка", "ближайшая к умолчанию точка ползунка:");
+  eq(w(6450, 0.0042), { kelvin: "Чуть теплее", tint: "Чуть зеленее" }, "один шаг:");
+  eq([w(4600, 0).kelvin, w(2700, 0).kelvin, w(7000, 0).kelvin, w(9000, 0).kelvin],
+    ["Теплее", "Намного теплее", "Чуть холоднее", "Намного холоднее"]);
+  eq([w(6500, -0.004).tint, w(6500, -0.012).tint], ["Розовее", "Намного розовее"]);
+});
+
+console.log("latestWins (таймеры подставные)");
+const tick = () => new Promise((r) => setImmediate(r));
+function timers() {
+  let t = 0, seq = 0;
+  const q = [];
+  return {
+    setTimer: (fn, ms) => { const h = ++seq; q.push({ h, at: t + ms, fn }); return h; },
+    clearTimer: (h) => { const i = q.findIndex((x) => x.h === h); if (i >= 0) q.splice(i, 1); },
+    async advance(ms) {
+      const end = t + ms;
+      for (;;) {
+        q.sort((a, b) => a.at - b.at);
+        if (!q.length || q[0].at > end) break;
+        const x = q.shift();
+        t = x.at; x.fn(); await tick();
+      }
+      t = end; await tick();
+    },
+  };
+}
+// Лента «отвечает», когда тест скажет: так видно, что уходит, пока команда в пути.
+function strip() {
+  const calls = [];
+  let active = 0, max = 0;
+  const send = (value, live) => new Promise((resolve, reject) => {
+    active++; max = Math.max(max, active);
+    calls.push({ value, live, resolve: () => { active--; resolve(); }, reject: (e) => { active--; reject(e); } });
+  });
+  return { send, calls, sent: () => calls.map((c) => c.value), get max() { return max; } };
+}
+function wins(extra = {}) {
+  const k = timers(), s = strip(), log = { sent: [], errors: [], states: [] };
+  const lw = cal.latestWins(s.send, { delay: 250, setTimer: k.setTimer, clearTimer: k.clearTimer,
+    onSent: (v) => log.sent.push(v), onError: (e, v) => log.errors.push([e.message, v]),
+    onState: (st) => log.states.push(st), ...extra });
+  return { k, s, lw, log };
+}
+
+await test("дребезг: из серии значений уходит одно, последнее", async () => {
+  const { k, s, lw } = wins();
+  lw.schedule(1); await k.advance(100); lw.schedule(2); await k.advance(100); lw.schedule(3);
+  await k.advance(249);
+  eq(s.sent(), [], "ушло раньше дребезга:");
+  await k.advance(1);
+  eq(s.sent(), [3]);
+});
+await test("в пути одна команда; ждёт только самое новое, промежуточные выброшены", async () => {
+  const { k, s, lw, log } = wins();
+  lw.now("A"); await tick();
+  lw.schedule("B"); await k.advance(300);
+  lw.schedule("C"); await k.advance(300);
+  lw.now("D"); await tick();
+  eq(s.sent(), ["A"], "вторая команда, пока первая в пути:");
+  s.calls[0].resolve(); await tick();
+  eq(s.sent(), ["A", "D"]);
+  s.calls[1].resolve(); await k.advance(1000);
+  eq(s.sent(), ["A", "D"], "старое значение догнало новое:");
+  eq(s.max, 1, "две команды в пути одновременно:");
+  eq(log.sent, ["A", "D"]);
+});
+await test("ответ пришёл, пока новое значение в дребезге, - ждём дребезг до конца", async () => {
+  const { k, s, lw } = wins();
+  lw.now("A"); await tick();
+  lw.schedule("B"); await k.advance(100);
+  s.calls[0].resolve(); await tick();
+  eq(s.sent(), ["A"], "дребезг сорван ответом:");
+  await k.advance(150);
+  eq(s.sent(), ["A", "B"]);
+  // Готовое к отправке значение, которое перебили новым, не уходит вовсе.
+  lw.now("C"); lw.schedule("D"); await tick();
+  s.calls[1].resolve(); await tick();
+  eq(s.sent(), ["A", "B"], "перебитое значение ушло или новое - без дребезга:");
+  await k.advance(250);
+  eq(s.sent(), ["A", "B", "D"]);
+});
+await test("now - сразу, без дребезга, и отменяет ждущий дребезг", async () => {
+  const { k, s, lw } = wins();
+  lw.schedule("slow"); lw.now("fast"); await tick();
+  eq(s.sent(), ["fast"]);
+  s.calls[0].resolve(); await k.advance(1000);
+  eq(s.sent(), ["fast"], "выброшенное значение ушло позже:");
+});
+await test("то же, что уже на ленте или в пути, повторно не шлётся", async () => {
+  const { k, s, lw } = wins({ equals: cal.samePayload });
+  lw.now({ hs: [0, 0] }); await tick(); s.calls[0].resolve(); await tick();
+  lw.schedule({ hs: [0, 0] }); await k.advance(300);
+  eq(s.sent().length, 1, "повтор показанного:");
+  lw.now({ kelvin: 3000 }); await tick();
+  lw.schedule({ hs: [5, 5] }); lw.now({ kelvin: 3000 }); await tick();
+  s.calls[1].resolve(); await k.advance(300);
+  eq(s.sent(), [{ hs: [0, 0] }, { kelvin: 3000 }], "вернулись к тому, что в пути, - а ушло ещё:");
+});
+await test("ошибка: onError со значением; ждущее уходит; лента после ошибки «неизвестна»", async () => {
+  const { s, lw, log } = wins();
+  lw.now("A"); await tick(); s.calls[0].resolve(); await tick();
+  lw.now("B"); await tick();
+  lw.now("C"); s.calls[1].reject(new Error("нет связи")); await tick();
+  eq(log.errors, [["нет связи", "B"]]);
+  eq(s.sent(), ["A", "B", "C"], "после ошибки ждущее не ушло:");
+  s.calls[2].reject(new Error("снова")); await tick();
+  // На ленте может быть что угодно - «A» надо послать, хоть он и был показан.
+  lw.now("A"); await tick();
+  eq(s.sent(), ["A", "B", "C", "A"], "после ошибки показанное раньше считается всё ещё на ленте:");
+  s.calls[3].resolve(); await tick();
+  eq(log.sent, ["A", "A"]);
+  // Та же команда, что в пути и не дошла, повторяется, когда её снова выбрали.
+  lw.now("B"); await tick(); lw.now("A"); lw.now("B"); s.calls[4].reject(new Error("сбой")); await tick();
+  eq(s.sent().slice(4), ["B", "B"], "повтор не дошедшей команды выброшен:");
+});
+await test("cancel: ждущее выброшено, ответ отменённой не засчитан, промис ждёт её", async () => {
+  const { k, s, lw, log } = wins();
+  lw.now("A"); await tick();
+  lw.schedule("B");
+  ok(s.calls[0].live(), "живая отправка помечена отменённой");
+  let waited = false;
+  lw.cancel().then(() => { waited = true; });
+  ok(!s.calls[0].live(), "отменённая отправка не знает, что её отменили");
+  await tick();
+  eq(waited, false, "cancel не дождался команды в пути:");
+  s.calls[0].resolve(); await tick();
+  eq(waited, true, "cancel так и не дождался:");
+  await k.advance(1000);
+  eq(s.sent(), ["A"], "выброшенное ушло:"); eq(log.sent, [], "отменённая засчитана как показанная:");
+  lw.now("A"); await tick(); s.calls[1].resolve(); await tick();
+  eq(log.sent, ["A"]);
+  // cancel перед «end»: лента вернётся как была, показанное уже не на ней.
+  lw.cancel();
+  lw.now("A"); await tick();
+  eq(s.sent(), ["A", "A", "A"], "после cancel лента считается всё ещё показывающей прежнее:");
+});
+await test("после cancel новое ждёт, пока вернётся отменённая: двух в пути не бывает", async () => {
+  const { s, lw } = wins();
+  lw.now("A"); await tick();
+  lw.cancel(); lw.now("B"); await tick();
+  eq(s.sent(), ["A"]);
+  s.calls[0].resolve(); await tick();
+  eq(s.sent(), ["A", "B"]); eq(s.max, 1);
+});
+await test("onState: «отправляю» и «ждёт» для подписи на экране", async () => {
+  const { k, s, lw, log } = wins();
+  eq(lw.state, { sending: false, waiting: false });
+  lw.schedule(1);
+  eq(lw.state, { sending: false, waiting: true });
+  await k.advance(250);
+  eq(lw.state, { sending: true, waiting: false });
+  s.calls[0].resolve(); await tick();
+  eq(lw.state, { sending: false, waiting: false });
+  eq(log.states[log.states.length - 1], { sending: false, waiting: false }, "последнее состояние не сообщено:");
+});
+
 // ------------------------------------------------ крючок в panel.js --
 console.log("panel.js: кнопка «Калибровка цвета»");
 class FakeElement {

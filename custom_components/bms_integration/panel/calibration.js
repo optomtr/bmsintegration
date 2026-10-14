@@ -178,6 +178,215 @@ export function colourName(key, hs) {
   return s < 70 ? `светло-${name}` : name;
 }
 
+// Образец цвета приходит от сервера готовым; попадает в style - поэтому
+// только строгий #rrggbb, остальное рисуем сами.
+const HEX = /^#[0-9a-f]{6}$/i;
+export function swatchOf(item) {
+  return HEX.test(item?.swatch || "") ? item.swatch : hsToCss(item?.hs);
+}
+
+// ------------------------------------------- что показать на ленте --
+// Тёплый белый, по которому владелец заметил беду: пресет 3000 K выходил белым.
+export const WARM_KELVIN = 3000;
+
+/** Цвет замера или проверки -> что показать: {kelvin} или {hs}; hs null - белый режим лампы. */
+export function itemTarget(item) {
+  const k = item?.kelvin;
+  if (k !== null && k !== undefined && Number.isFinite(Number(k)) && Number(k) > 0) return { kelvin: Number(k) };
+  return { hs: Array.isArray(item?.hs) ? [Number(item.hs[0]) || 0, Number(item.hs[1]) || 0] : null };
+}
+
+/** Команда «show»: ровно одно из hs / kelvin - сервер отказывает, если оба. */
+export function showPayload(entityId, target, calibration = null) {
+  const payload = { entity_id: entityId };
+  if (target?.kelvin !== null && target?.kelvin !== undefined) payload.kelvin = target.kelvin;
+  else payload.hs = target?.hs ?? null;
+  if (calibration) payload.calibration = calibration;
+  return payload;
+}
+
+const sameHs = (a, b) => (a === null && b === null)
+  || (!!a && !!b && Math.abs(a[0] - b[0]) < 0.5 && Math.abs(a[1] - b[1]) < 0.5);
+
+export function sameTarget(a, b) {
+  if (!a || !b) return false;
+  const ka = a.kelvin ?? null, kb = b.kelvin ?? null;
+  if (ka !== null || kb !== null) return ka !== null && kb !== null && Math.abs(ka - kb) < 1;
+  return sameHs(a.hs ?? null, b.hs ?? null);
+}
+
+/**
+ * Сравнение, как у Apple TV («Оригинал» / «Сбалансированный»): человек
+ * переключает и смотрит на стену. «Как было» - то, что лента делает сама:
+ * белый - её белый режим, если он есть, иначе белый из трёх цветов без
+ * поправки; тёплый - её собственные 3000 K.
+ */
+export function previewPayload(entityId, { corrected, warm }, { calibration = null, whiteMode = false } = {}) {
+  const cal = corrected ? calibration : null;
+  if (warm) return showPayload(entityId, { kelvin: WARM_KELVIN }, cal);
+  if (corrected) return showPayload(entityId, { hs: [0, 0] }, cal);
+  return showPayload(entityId, { hs: whiteMode ? null : [0, 0] }, null);
+}
+
+export const samePayload = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+// -------------------------------------------- подстройка белого на глаз --
+const isRange = (r) => !!r && Number.isFinite(r.min) && Number.isFinite(r.max) && r.max > r.min;
+
+/** Диапазоны ползунков от сервера; нет их (старый сервер) - нет и подстройки. */
+export function whiteRange(info) {
+  const r = info?.white_range;
+  if (!isRange(r?.kelvin) || !isRange(r?.tint)) return null;
+  const one = (x) => ({ min: x.min, max: x.max, step: x.step > 0 ? x.step : 0 });
+  return { kelvin: one(r.kelvin), tint: one(r.tint) };
+}
+
+/** Только в пределы. Белый по умолчанию бывает не на сетке ползунка
+ *  (оттенок 0,0032 при шаге 0,001): привязка к шагу тихо меняла бы его. */
+export function clampRange(value, range) {
+  const v = Number(value);
+  if (!isRange(range) || !Number.isFinite(v)) return null;
+  return Math.min(range.max, Math.max(range.min, v));
+}
+
+/** Как snapToRange, но без округления до тысячных: шаг оттенка бывает мельче. */
+export function fitRange(value, range) {
+  const v0 = Number(value);
+  if (!isRange(range) || !Number.isFinite(v0)) return null;
+  let v = Math.min(range.max, Math.max(range.min, v0));
+  if (range.step > 0) {
+    v = range.min + Math.round((v - range.min) / range.step) * range.step;
+    if (v > range.max + 1e-9) v -= range.step;
+  }
+  return Math.round(v * 1e9) / 1e9;
+}
+
+const finiteWhite = (w) => !!w && Number.isFinite(w.kelvin) && Number.isFinite(w.tint);
+
+export function whiteDefault(info, range = whiteRange(info)) {
+  const d = finiteWhite(info?.white_default) ? info.white_default : { kelvin: 6500, tint: 0 };
+  if (!range) return { kelvin: d.kelvin, tint: d.tint };
+  return { kelvin: clampRange(d.kelvin, range.kelvin), tint: clampRange(d.tint, range.tint) };
+}
+
+export function whiteOf(calibration, fallback) {
+  const w = calibration?.white;
+  return finiteWhite(w) ? { kelvin: w.kelvin, tint: w.tint } : { ...fallback };
+}
+
+/** Копия поправки с другим белым. Ответ сервера не трогаем: «Отмена» и
+ *  «Сбросить» должны вернуть ровно то, что он прислал. */
+export function withWhite(calibration, white, range) {
+  const copy = JSON.parse(JSON.stringify(calibration));
+  copy.white = range
+    ? { kelvin: clampRange(white.kelvin, range.kelvin), tint: clampRange(white.tint, range.tint) }
+    : { kelvin: white.kelvin, tint: white.tint };
+  return copy;
+}
+
+export const sameWhite = (a, b) => !!a && !!b
+  && Math.abs(a.kelvin - b.kelvin) < 0.5 && Math.abs(a.tint - b.tint) < 1e-6;
+
+/** Кнопки «‹ ›» у ползунка: около двадцати касаний на весь ход. */
+export function nudge(value, dir, range) {
+  if (!isRange(range)) return value;
+  const span = range.max - range.min;
+  const step = range.step > 0 ? range.step : span / 100;
+  const big = Math.max(step, step * Math.round(span / 20 / step));
+  return fitRange(Number(value) + Math.sign(dir) * big, range);
+}
+
+function shiftWords(value, centre, range, less, more, neutral) {
+  const half = (range.step > 0 ? range.step : (range.max - range.min) / 1000) / 2;
+  if (Math.abs(value - centre) <= half) return neutral;
+  const span = value < centre ? centre - range.min : range.max - centre;
+  const f = span > 0 ? Math.abs(value - centre) / span : 1;
+  const word = value < centre ? less : more;
+  if (f < 0.34) return `Чуть ${word}`;
+  if (f < 0.67) return word[0].toUpperCase() + word.slice(1);
+  return `Намного ${word}`;
+}
+
+/** Положение ползунков словами - от белого по умолчанию (нейтрального). */
+export function whiteWords(white, def, range) {
+  return {
+    kelvin: shiftWords(white.kelvin, def.kelvin, range.kelvin, "теплее", "холоднее", "Нейтральный"),
+    tint: shiftWords(white.tint, def.tint, range.tint, "розовее", "зеленее", "Без оттенка"),
+  };
+}
+
+/**
+ * Предпросмотр на ленте: последнее значение побеждает.
+ *
+ * Ползунок присылает десятки значений в секунду, а лента отвечает за сотни
+ * миллисекунд. Очередь команд проигрывала бы на стене всю историю движения
+ * пальца с опозданием в секунды. Поэтому: дребезг delay мс, в пути не больше
+ * одной команды, а ждёт только самое новое значение - промежуточные
+ * выбрасываются. Таймеры подставляются, чтобы проверять без часов.
+ *
+ * schedule(v) - после дребезга; now(v) - сразу (кнопки); cancel() - забыть
+ * ждущее и вернуть промис команды, что уже в пути: «end» должен идти после неё.
+ * send(v, live) получает live(): false - отправку отменили, пока она ждала.
+ */
+export function latestWins(send, opts = {}) {
+  const {
+    delay = 250, equals = (a, b) => a === b,
+    onState = () => {}, onSent = () => {}, onError = () => {},
+    setTimer = (fn, ms) => setTimeout(fn, ms), clearTimer = (h) => clearTimeout(h),
+  } = opts;
+  let timer = null, latest, has = false, ready = false;
+  let flying = null, shown, hasShown = false, epoch = 0;
+
+  const report = () => onState({ sending: !!flying, waiting: has });
+  const drop = () => {
+    if (timer !== null) { clearTimer(timer); timer = null; }
+    latest = undefined; has = false; ready = false;
+  };
+
+  function pump() {
+    if (flying || !has || !ready) return;
+    const value = latest;
+    drop();
+    // То же, что уже на ленте, не шлём. После ошибки лента «неизвестна» -
+    // и повтор того же значения уходит.
+    if (hasShown && equals(value, shown)) return;
+    const mine = epoch;
+    // live() - не отменили ли отправку, пока она ждала своей очереди.
+    const promise = Promise.resolve().then(() => send(value, () => mine === epoch));
+    flying = promise;
+    promise.then(
+      () => { if (mine === epoch) { shown = value; hasShown = true; onSent(value); } },
+      (err) => { if (mine === epoch) { hasShown = false; onError(err, value); } },
+    ).finally(() => {
+      if (flying === promise) flying = null;
+      pump();
+      report();
+    });
+  }
+
+  function put(value, immediate) {
+    drop();
+    latest = value; has = true;
+    if (immediate || !(delay > 0)) ready = true;
+    else timer = setTimer(() => { timer = null; ready = true; pump(); report(); }, delay);
+    pump();
+    report();
+  }
+
+  return {
+    schedule: (value) => put(value, false),
+    now: (value) => put(value, true),
+    cancel() {
+      epoch++;
+      drop();
+      hasShown = false;
+      report();
+      return flying ? flying.then(() => {}, () => {}) : Promise.resolve();
+    },
+    get state() { return { sending: !!flying, waiting: has }; },
+  };
+}
+
 // =========================================================== интерфейс ==
 const TAG = "bms-color-calibration";
 const EMPTY = Object.freeze({ rgb: null, coverage: 0, clipped: 0, dark: 0 });
@@ -198,10 +407,19 @@ const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const btn = (label, act, kind = "", extra = "") =>
   `<button type="button" class="b ${kind}" data-act="${act}" ${extra}>${label}</button>`;
-const sameHs = (a, b) => (a === null && b === null)
-  || (!!a && !!b && Math.abs(a[0] - b[0]) < 0.5 && Math.abs(a[1] - b[1]) < 0.5);
+// Сегменты - кнопки-переключатели (aria-pressed) в группе: каждая в Tab,
+// пробел и Enter работают сами, и считыватель экрана называет выбранную.
+const seg = (label, group, options, value, off) =>
+  `<div class="seg" role="group" aria-label="${esc(label)}">${options.map(([v, text]) =>
+    `<button type="button" data-act="seg" data-g="${group}" data-v="${v}" aria-pressed="${v === value}" ${off}>${text}</button>`).join("")}</div>`;
+const METHODS = ["6500k", "reference"];
 // «Оранжевый» -> «оранжевый» внутри фразы, но «RGB» остаётся «RGB».
 const lower1 = (t) => (/^\p{Lu}\p{Ll}/u.test(t) ? t[0].toLowerCase() + t.slice(1) : t);
+// «3000 K» не рвётся между числом и единицей: на узком телефоне «K»
+// уезжала на отдельную строку.
+const NB = "\u00a0";
+const nbK = (t) => String(t ?? "").replace(/(\d) (K|К)(?!\p{L})/gu, `$1${NB}$2`);
+const WARM = `Тёплый ${WARM_KELVIN}${NB}K`;
 
 function errorText(err) {
   if (err?.code === "unknown_command") {
@@ -269,7 +487,7 @@ ol li::before{content:counter(s);flex:none;width:26px;height:26px;border-radius:
 .b.dan{background:transparent;border-color:#6A2B35;color:#FF8592}
 .b.link{background:transparent;border-color:transparent;color:#8DBBFF;min-height:44px}
 .b:disabled{opacity:.45;cursor:not-allowed}.b[hidden]{display:none}
-button:focus-visible,[tabindex="0"]:focus-visible{outline:3px solid #8DBBFF;outline-offset:2px}
+button:focus-visible,input:focus-visible,[tabindex="0"]:focus-visible{outline:3px solid #8DBBFF;outline-offset:2px}
 .card{background:#141C25;border:1px solid #222D39;border-radius:14px;padding:14px;display:flex;flex-direction:column;gap:10px}
 .row{display:flex;align-items:center;gap:12px;min-width:0}.grow{flex:1;min-width:0}
 .chk .grow{min-width:auto}.chk .mut{flex:0 1 auto;min-width:0;text-align:right}
@@ -280,6 +498,30 @@ button:focus-visible,[tabindex="0"]:focus-visible{outline:3px solid #8DBBFF;outl
 .err{border-left:3px solid #FF5A6A;padding:2px 0 2px 10px;color:#FFB3BB;font-size:14px}
 .ok{color:#2BC275}.warn{color:#F0B429}.bad{color:#FF5A6A}
 .lh{font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#9AA7B4}
+.seg{display:flex;gap:4px;padding:4px;border-radius:14px;background:#0D1319;border:1px solid #222D39}
+.seg button{flex:1 1 0;min-width:0;min-height:44px;padding:6px 8px;border:0;border-radius:10px;background:transparent;color:#C9D3DD;
+  font:inherit;font-size:15px;font-weight:600;line-height:1.2;cursor:pointer;touch-action:manipulation}
+.seg button[aria-pressed=true]{background:#2B3744;color:#fff;box-shadow:0 1px 3px rgba(0,0,0,.45)}
+.seg button:disabled{opacity:.45;cursor:not-allowed}
+.sl{display:flex;flex-direction:column;gap:4px}
+.sl .val{font-weight:650}
+.slr{display:flex;align-items:center;gap:6px}
+.nb{width:48px;height:48px;flex:none;border-radius:12px;border:1px solid #2B3744;background:#18212B;color:#EEF2F6;
+  display:grid;place-items:center;cursor:pointer;touch-action:manipulation;padding:0}
+.nb:disabled{opacity:.45;cursor:not-allowed}
+.ends{display:flex;justify-content:space-between;padding:0 54px;font-size:13px;color:#9AA7B4}
+input[type=range]{-webkit-appearance:none;appearance:none;flex:1;min-width:0;height:48px;margin:0;background:transparent;cursor:pointer}
+input[type=range]:disabled{opacity:.45;cursor:not-allowed}
+input[type=range]::-webkit-slider-runnable-track{height:12px;border-radius:6px;background:var(--track)}
+input[type=range]::-moz-range-track{height:12px;border-radius:6px;background:var(--track)}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:32px;height:32px;margin-top:-10px;border-radius:50%;
+  background:#fff;border:3px solid #006FFF;box-shadow:0 1px 4px rgba(0,0,0,.55)}
+input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;background:#fff;border:3px solid #006FFF}
+.rng.k{--track:linear-gradient(90deg,#FFB061,#FFF3E3 var(--mid,50%),#C4D9FF)}
+.rng.t{--track:linear-gradient(90deg,#FFADD5,#F3F3F3 var(--mid,50%),#B4EFBE)}
+.pv{display:flex;align-items:center;gap:10px;min-height:24px}
+.pv .mut{flex:1}
+.pv .b.link{width:auto;flex:none;padding:6px 10px}
 .white{position:fixed;inset:0;z-index:2;background:#fff;display:flex;align-items:flex-end;justify-content:center;
   padding-bottom:calc(28px + env(safe-area-inset-bottom));cursor:pointer;outline:none}
 .white[hidden]{display:none}.white span{color:#BDBDBD;font:13px -apple-system,Roboto,sans-serif;transition:opacity .6s}
@@ -316,9 +558,29 @@ function defineOverlay() {
       this.id = o.entityId;
       this.info = o.info || null;
       this.step = this.info ? "intro" : "loading";
-      Object.assign(this, { method: null, stream: null, track: null, begun: false, token: null, inflight: null,
-        stopping: null, changed: false, result: null, aim: "pending", aimReady: false, err: "", note: "" });
+      Object.assign(this, { method: null, stream: null, track: null, begun: false, begunOk: false, token: null, inflight: null,
+        stopping: null, changed: false, result: null, aim: "pending", aimReady: false, err: "", note: "",
+        adj: null, ab: { corrected: true, warm: false }, pv: { sending: false, waiting: false }, pvErr: "", paused: false });
+      // Один предпросмотр на окно: подстройка и сравнение «как было / с
+      // поправкой» шлют на ленту через него, и в пути всегда не больше одной команды.
+      this.preview = latestWins((payload, live) => this.previewSend(payload, live), {
+        delay: 250, equals: samePayload,
+        onState: (st) => { this.pv = st; this.paintPreview(); },
+        onSent: () => { this.pvErr = ""; this.paused = false; this.paintPreview(); },
+        onError: (err) => {
+          if (err instanceof Cancelled || this.closed) return;
+          console.warn("BMS калибровка: предпросмотр", err);
+          this.pvErr = `Лента не ответила: ${errorText(err)}`;
+          if (this.shadowRoot) this.$("sr").textContent = this.pvErr;
+          this.paintPreview();
+        },
+      });
     }
+
+    get wr() { return whiteRange(this.info); }
+    get whiteDef() { return whiteDefault(this.info, this.wr); }
+    hasWhiteMode() { return (this.info?.samples || []).some((s) => s.key === "white_mode"); }
+    resultCal() { return this.result ? this.result.adjusted || this.result.calibration : null; }
 
     connectedCallback() {
       if (this.shadowRoot) return;
@@ -333,6 +595,7 @@ function defineOverlay() {
       // по-прежнему совпадать с центральной половиной кадра.
       video.addEventListener("resize", () => this.fitStage());
       root.addEventListener("click", (e) => this.onClick(e));
+      root.addEventListener("input", (e) => this.onInput(e));
       root.addEventListener("keydown", (e) => this.onKey(e));
       this._onVis = () => { if (document.visibilityState === "hidden") this.interrupt(); };
       this._onHide = () => this.interrupt();
@@ -354,9 +617,14 @@ function defineOverlay() {
       this.$("stage").hidden = !live;
       if (live) this.$("v").play?.()?.catch?.(() => {});
       this.$("meter").hidden = this.step !== "aim" && this.step !== "measuring";
-      if (focus) this.$("c").querySelector("h2")?.focus();
+      if (focus === true) this.$("c").querySelector("h2")?.focus();
+      // Перерисовка по месту (ошибка сохранения и т. п.): фокус возвращается
+      // на ту же кнопку, а не теряется на странице под окном.
+      else if (focus) this.$("c").querySelector(focus)?.focus();
       if (this.step === "aim" || this.step === "measuring") this.paintMeter();
       if (this.step === "measuring") this.paintProgress();
+      if (this.step === "adjust") this.paintAdjust();
+      if (this.step === "result" || this.step === "adjust") this.paintPreview();
     }
 
     view() {
@@ -375,7 +643,7 @@ function defineOverlay() {
           return `${head("Калибровка недоступна")}<p>Сервер не прислал цвета для замера — обновите интеграцию BMS.</p><div class="acts">${close}</div>`;
         }
         return `${head("Подстроим цвет ленты под настоящий белый")}
-          <p>Камера телефона измерит, как лента показывает цвета, и интеграция поправит их — белый станет нейтральным дневным. Займёт около 40 секунд; потом лента вернётся как была.</p>
+          <p>Камера телефона измерит, как лента показывает цвета, и интеграция поправит их — белый станет нейтральным дневным. Займёт около минуты; потом лента вернётся как была.</p>
           <ol>
             <li>Выключите остальной свет и задёрните шторы.</li>
             <li>Наведите основную (заднюю) камеру на белую стену или лист бумаги, освещённые лентой, с 30–50 см.</li>
@@ -383,11 +651,15 @@ function defineOverlay() {
             <li>Отверните экран телефона от стены — его свет портит замер.</li>
           </ol>
           <p class="mut">На iPhone понадобится второй экран с белым фоном: ноутбук, телевизор или другой телефон. На втором телефоне откройте эту же калибровку и нажмите «Белый экран для второго телефона».</p>
-          ${i.calibrated ? `<p class="mut">Сейчас калибровка сохранена${i.calibrated_at ? ` (${esc(shortDate(i.calibrated_at))})` : ""}.</p>` : ""}
+          ${i.calibrated ? `<p class="mut">Сейчас калибровка сохранена${i.calibrated_at ? ` (${esc(shortDate(i.calibrated_at))})` : ""}.${
+            this.canAdjustSaved() ? " Белый можно подстроить на глаз — без камеры." : ""}</p>` : ""}
           ${error}
-          <div class="acts">${btn("Начать", "start", "pri")}${btn("Белый экран для второго телефона", "white")}
+          <div class="acts">${btn("Начать", "start", "pri")}
+            ${this.canAdjustSaved() ? btn("Подстроить белый на глаз", "adjust-saved") : ""}
+            ${btn("Белый экран для второго телефона", "white")}
             ${i.calibrated ? btn("Сбросить калибровку", "reset-ask", "dan") : ""}</div>`;
       }
+      if (s === "adjust") return this.viewAdjust(error);
       if (s === "reset") {
         return `${head("Сбросить калибровку?")}<p>Лента вернётся к цветам контроллера без поправки.</p>${error}
           <div class="acts">${btn(this.saving ? "Сбрасываю…" : "Сбросить", "reset", "dan", this.saving ? "disabled" : "")}
@@ -442,21 +714,112 @@ function defineOverlay() {
       // Название цвета не сжимается мельче своего слова, а оценка при
       // нехватке места переносится: на узком телефоне они наезжали друг на друга.
       const rows = (ev.results || []).map((r) => `<div class="row chk">
-          <span class="sw" style="background:${hsToCss(checks[r.key]?.hs)}"></span>
-          <span class="grow">${esc(r.label || checks[r.key]?.label || colourName(r.key, checks[r.key]?.hs))}</span>
+          <span class="sw" style="background:${swatchOf(checks[r.key])}"></span>
+          <span class="grow">${esc(nbK(r.label || checks[r.key]?.label || colourName(r.key, checks[r.key]?.hs)))}</span>
           <span class="mut">${esc(r.words)}</span></div>`).join("");
       const unsteady = this.result.unsteady;
+      const off = this.saving ? "disabled" : "";
       return `<h2 tabindex="-1" class="${tone}">${esc(ev.verdict_words || "Готово")}</h2>
         ${whiteBefore || whiteAfter ? `<div class="card"><div class="row"><span class="sw" style="background:#fff"></span><div class="grow">
           ${whiteBefore ? `<div>Белый до калибровки: <b>${esc(whiteBefore.words)}</b></div>` : ""}
           ${whiteAfter ? `<div>Белый после: <b>${esc(whiteAfter.words)}</b></div>` : ""}</div></div></div>` : ""}
+        ${this.result.adjusted ? `<p class="note">Белый подстроен вручную — оценка проверки была до подстройки.</p>` : ""}
         ${rows ? `<div class="card"><div class="lh">Проверка цветов</div>${rows}</div>` : ""}
         ${ev.verdict === "poor" ? `<p class="note">Результат слабый. Проверьте, что в комнате темно, стена белая и телефон неподвижен, и нажмите «Повторить».</p>` : ""}
         ${unsteady ? `<p class="note">Часть замеров была неустойчивой — в следующий раз держите телефон неподвижнее.</p>` : ""}
-        ${this.result.showing ? `<p class="mut">Сейчас лента показывает белый с поправкой.</p>` : ""}
+        <div class="card"><div class="lh" id="cmp">Сравните на стене</div>
+          ${seg("Поправка", "corrected", [["0", "Как было"], ["1", "С поправкой"]], this.ab.corrected ? "1" : "0", off)}
+          ${seg("Цвет на ленте", "warm", [["0", "Белый"], ["1", WARM]], this.ab.warm ? "1" : "0", off)}
+          ${this.viewPreviewLine()}</div>
         ${error}
-        <div class="acts">${btn(this.saving ? "Сохраняю…" : "Сохранить", "save", "pri", this.saving ? "disabled" : "")}
-          ${btn("Повторить", "again", "", this.saving ? "disabled" : "")}${btn("Отмена", "close", "", this.saving ? "disabled" : "")}</div>`;
+        <div class="acts">${btn(this.saving ? "Сохраняю…" : "Сохранить", "save", "pri", off)}
+          ${this.wr ? btn("Подстроить белый на глаз", "adjust", "", off) : ""}
+          ${btn("Повторить", "again", "", off)}${btn("Отмена", "close", "", off)}</div>`;
+    }
+
+    viewPreviewLine() {
+      return `<div class="pv"><p class="mut" data-p="pv"></p>${btn("Показать снова", "pv-again", "link", "hidden")}</div>
+        <p class="err" data-p="pverr" hidden></p>`;
+    }
+
+    viewAdjust(error) {
+      const a = this.adj, r = this.wr, def = this.whiteDef;
+      const off = this.saving ? "disabled" : "";
+      const saved = a.from === "saved";
+      const slider = (k, cls, label, less, more) => {
+        const rg = r[k], pct = Math.round((100 * (def[k] - rg.min)) / (rg.max - rg.min));
+        return `<div class="sl">
+          <div class="row"><span class="grow val" data-p="${k}-w"></span>${k === "kelvin" ? `<span class="mut" data-p="kelvin-h"></span>` : ""}</div>
+          <div class="slr">
+            <button type="button" class="nb" data-act="nudge" data-k="${k}" data-d="-1" aria-label="${less}" ${off}>
+              <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+            <input type="range" class="rng ${cls}" data-k="${k}" min="${rg.min}" max="${rg.max}" step="${rg.step || "any"}"
+              value="${a.white[k]}" style="--mid:${Math.min(100, Math.max(0, pct))}%" aria-label="${label}" ${off}>
+            <button type="button" class="nb" data-act="nudge" data-k="${k}" data-d="1" aria-label="${more}" ${off}>
+              <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+          </div>
+          <div class="ends" aria-hidden="true"><span>${less}</span><span>${more}</span></div></div>`;
+      };
+      return `<h2 tabindex="-1">Подстройка белого на глаз</h2>
+        <p class="mut">Смотрите на стену, а не на экран, и двигайте ползунки, пока белый не станет на вид нейтральным.</p>
+        ${seg("Что показать на ленте", "warm", [["0", "Белый"], ["1", WARM]], a.warm ? "1" : "0", off)}
+        <div class="card">${slider("kelvin", "k", "Теплее или холоднее", "Теплее", "Холоднее")}
+          ${slider("tint", "t", "Розовее или зеленее", "Розовее", "Зеленее")}
+          ${this.viewPreviewLine()}</div>
+        ${error}
+        <div class="acts">${saved ? btn(this.saving ? "Сохраняю…" : "Сохранить", "save", "pri", off) : btn("Готово", "adj-done", "pri", off)}
+          ${btn("Сбросить", "adj-reset", "", `aria-label="Сбросить подстройку белого" ${off}`)}
+          ${btn("Отмена", "adj-cancel", "", off)}</div>`;
+    }
+
+    /** Подписи ползунков - по месту: перерисовка всего экрана оборвала бы
+     *  перетаскивание пальцем. sync - выставить и сами ползунки (сброс, «‹ ›»). */
+    paintAdjust(sync = false) {
+      if (this.step !== "adjust" || !this.adj || !this.shadowRoot) return;
+      const c = this.$("c"), a = this.adj, words = whiteWords(a.white, this.whiteDef, this.wr);
+      const q = (k) => c.querySelector(`[data-p="${k}"]`);
+      const hint = `≈${NB}${Math.round(a.white.kelvin)}${NB}K`;
+      if (q("kelvin-w")) q("kelvin-w").textContent = words.kelvin;
+      if (q("kelvin-h")) q("kelvin-h").textContent = hint;
+      if (q("tint-w")) q("tint-w").textContent = words.tint;
+      for (const input of c.querySelectorAll("input[data-k]")) {
+        const k = input.dataset.k;
+        if (sync) input.value = String(a.white[k]);
+        input.setAttribute("aria-valuetext", k === "kelvin" ? `${words.kelvin}, ${hint}` : words.tint);
+      }
+    }
+
+    paintSeg() {
+      const c = this.$("c");
+      for (const b of c.querySelectorAll('[data-act="seg"]')) {
+        const on = this.step === "adjust" ? this.adj?.warm : this.ab[b.dataset.g];
+        b.setAttribute("aria-pressed", String((b.dataset.v === "1") === !!on));
+      }
+    }
+
+    pvShownText() {
+      if (this.step === "adjust") {
+        return `Лента показывает ${this.adj?.warm ? `тёплый белый ${WARM_KELVIN}${NB}K` : "белый"} с этой подстройкой.`;
+      }
+      return `Лента показывает ${this.ab.warm ? `тёплый белый ${WARM_KELVIN}${NB}K` : "белый"} ${
+        this.ab.corrected ? "с поправкой" : "как было, без поправки"}.`;
+    }
+
+    paintPreview() {
+      if (!this.shadowRoot || (this.step !== "result" && this.step !== "adjust")) return;
+      const c = this.$("c"), line = c.querySelector('[data-p="pv"]'), bad = c.querySelector('[data-p="pverr"]');
+      if (!line) return;
+      const busy = this.pv.sending || this.pv.waiting;
+      const text = busy ? "Обновляю ленту…"
+        : this.paused ? "Экран телефона гас — лента вернулась как была."
+        : this.pvErr ? "" : this.pvShownText();
+      line.textContent = text;
+      line.hidden = !text;
+      bad.textContent = this.pvErr;
+      bad.hidden = busy || !this.pvErr;
+      const again = c.querySelector('[data-act="pv-again"]');
+      if (again) again.hidden = busy || this.saving || !(this.paused || this.pvErr);
+      for (const g of c.querySelectorAll(".seg")) g.setAttribute("aria-busy", String(busy));
     }
 
     paintMeter() {
@@ -483,8 +846,8 @@ function defineOverlay() {
       q("track").setAttribute("aria-valuenow", String(p.done));
     }
 
-    progress(done, total, label, hs) {
-      this.prog = { done, total, label, swatch: hs ? hsToCss(hs) : "" };
+    progress(done, total, label, swatch = "") {
+      this.prog = { done, total, label, swatch };
       if (this.step !== "measuring") this.go("measuring"); else this.paintProgress();
       this.$("sr").textContent = label;
     }
@@ -516,19 +879,54 @@ function defineOverlay() {
       if (a === "remember") return this.rememberWhite();
       if (a === "measure") return this.measure();
       if (a === "save") return this.save();
-      if (a === "again") { this.result = null; this.err = ""; return this.stream ? this.goAim() : this.start(); }
+      if (a === "again") return this.again();
+      if (a === "adjust") return this.adjustResult();
+      if (a === "adjust-saved") return this.adjustSaved();
+      if (a === "adj-done") return this.adjustLeave(true);
+      if (a === "adj-cancel") return this.adjustLeave(false);
+      if (a === "adj-reset") return this.setWhite(this.whiteDef, true);
+      if (a === "nudge") {
+        const k = el.dataset.k;
+        if (this.adj && this.wr?.[k]) this.setWhite({ [k]: nudge(this.adj.white[k], Number(el.dataset.d), this.wr[k]) }, true);
+        return;
+      }
+      if (a === "seg") return this.onSeg(el.dataset.g, el.dataset.v === "1");
+      if (a === "pv-again") return this.preview.now(this.previewNowPayload());
+    }
+
+    onInput(e) {
+      const el = e.composedPath()[0];
+      const k = el?.dataset?.k;
+      if (this.step !== "adjust" || !this.adj || !k || el.disabled) return;
+      this.setWhite({ [k]: Number(el.value) }, false);
+    }
+
+    onSeg(group, on) {
+      if (this.saving) return;
+      if (this.step === "adjust" && this.adj && group === "warm") {
+        if (this.adj.warm === on) return;
+        this.adj.warm = on;
+      } else if (this.step === "result" && (group === "warm" || group === "corrected")) {
+        if (this.ab[group] === on) return;
+        this.ab = { ...this.ab, [group]: on };
+      } else return;
+      this.paintSeg();
+      this.preview.now(this.previewNowPayload());
     }
 
     onKey(e) {
       if (e.key === "Escape") {
         e.preventDefault();
-        if (!this.$("white").hidden) this.exitWhite(); else if (!this.saving) this.close();
+        if (!this.$("white").hidden) this.exitWhite();
+        // Подстройка - слой поверх результата или вступления: Esc закрывает её, а не всё окно.
+        else if (this.step === "adjust" && !this.saving) this.adjustLeave(false);
+        else if (!this.saving) this.close();
         return;
       }
       if ((e.key === "Enter" || e.key === " ") && e.target === this.$("white")) { e.preventDefault(); return this.exitWhite(); }
       if (e.key !== "Tab" || !this.$("white").hidden) return;
       // Фокус не уходит за окно калибровки на страницу под ним.
-      const items = [...this.shadowRoot.querySelectorAll(".wrap button:not([disabled])")]
+      const items = [...this.shadowRoot.querySelectorAll(".wrap button:not([disabled]), .wrap input:not([disabled])")]
         .filter((b) => !b.hidden && b.getClientRects().length);
       if (!items.length) return;
       const active = this.shadowRoot.activeElement, first = items[0], last = items[items.length - 1];
@@ -555,12 +953,40 @@ function defineOverlay() {
       return res;
     }
 
-    async show(hs, calibration, token) {
-      const payload = { entity_id: this.id, hs };
-      if (calibration) payload.calibration = calibration;
+    async show(target, calibration, token) {
       this.shown = null;
-      await this.call("color_calibration/show", payload, token);
-      this.shown = { hs, cal: !!calibration };
+      await this.call("color_calibration/show", showPayload(this.id, target, calibration), token);
+      this.shown = { target, cal: !!calibration };
+    }
+
+    /** Отправка предпросмотра (её зовёт только latestWins). После «end»
+     *  (экран гас) сессия открывается заново: «begin» снимает то, что лента
+     *  показывает сейчас, - это уже возвращённое прежнее состояние. */
+    async previewSend(payload, live = () => true) {
+      if (this.stopping) await this.stopping;
+      // Отменённая отправка, проснувшись после «end», не должна открыть
+      // сессию снова: лента ушла бы на предпросмотр уже после возврата.
+      if (this.closed || this.saving || !live()) throw new Cancelled();
+      let token = this.token;
+      if (!this.begunOk) {
+        token ||= this.newToken();
+        this.begun = true;
+        this.lockWake();
+        await this.call("color_calibration/begin", { entity_id: this.id }, token);
+        this.begunOk = true;
+      }
+      if (!token || !live()) throw new Cancelled();
+      // Замер после предпросмотра не должен считать, что на ленте его цвет.
+      this.shown = null;
+      return this.call("color_calibration/show", payload, token);
+    }
+
+    /** Что сейчас должно быть на ленте по выбору на экране. */
+    previewNowPayload() {
+      if (this.step === "adjust" && this.adj) {
+        return previewPayload(this.id, { corrected: true, warm: this.adj.warm }, { calibration: this.adj.cal });
+      }
+      return previewPayload(this.id, this.ab, { calibration: this.resultCal(), whiteMode: this.hasWhiteMode() });
     }
 
     grab() {
@@ -614,12 +1040,15 @@ function defineOverlay() {
      *  «end» обгоняет её на сервере, и лента остаётся на цвете замера. */
     stopSession() {
       if (this.stopping) return this.stopping;
+      // Ждущий предпросмотр выбрасывается, а уже отправленный «end» дождётся ниже.
+      this.preview.cancel();
       this.cancelToken();
       this.stopMeter();
       this.stopCamera();
       this.releaseWake();
       if (!this.begun) return Promise.resolve({ ended: false, error: "" });
       this.begun = false;
+      this.begunOk = false;
       const pending = this.inflight;
       this.stopping = (async () => {
         if (pending) await Promise.race([pending.catch(() => {}), realSleep(4000)]);
@@ -671,7 +1100,7 @@ function defineOverlay() {
       this.track?.addEventListener("ended", () => {
         if (this.stream !== stream) return;
         // Готовый результат камера уже не нужна: сохранить его можно и так.
-        if (this.step === "result") return this.stopCamera();
+        if (this.step === "result" || this.step === "adjust") return this.stopCamera();
         this.fail(new Error("Камера отключилась. Закройте другие приложения с камерой и нажмите «Повторить»."));
       });
       try { await video.play(); } catch { /* muted + playsinline: кадры пойдут и без play() */ }
@@ -793,7 +1222,8 @@ function defineOverlay() {
         // повторный begin этот снимок не перезаписывает.
         this.begun = true;
         await this.call("color_calibration/begin", { entity_id: this.id }, token);
-        await this.show([0, 0], null, token);
+        this.begunOk = true;
+        await this.show({ hs: [0, 0] }, null, token);
         this.aimReady = true;
         this.paintMeter();
       } catch (err) {
@@ -801,9 +1231,9 @@ function defineOverlay() {
       }
     }
 
-    async measureColour(hs, calibration, name, token) {
-      const same = this.shown && sameHs(this.shown.hs, hs) && this.shown.cal === !!calibration;
-      await this.show(hs, calibration, token);
+    async measureColour(target, calibration, name, token) {
+      const same = this.shown && sameTarget(this.shown.target, target) && this.shown.cal === !!calibration;
+      await this.show(target, calibration, token);
       const run = (changedFrom) => measureUntilSettled(() => this.grab(),
         { sleep: (ms) => this.sleep(ms, token), changedFrom });
       let m = await run(same ? null : this.last);
@@ -819,7 +1249,7 @@ function defineOverlay() {
           : `Не удалось измерить «${name}»: слишком темно. Наведите камеру на место стены, ярче освещённое лентой, и нажмите «Повторить».`);
       }
       if (!m.settled) this.unsteady++;
-      if (m.changed === false) console.info("BMS калибровка: цвет на стене не сменился", name, hs);
+      if (m.changed === false) console.info("BMS калибровка: цвет на стене не сменился", name, target);
       this.last = chromaticity(m.rgb);
       return m.rgb.map((v) => Math.round(v * 1e6) / 1e6);
     }
@@ -834,46 +1264,45 @@ function defineOverlay() {
       this.unsteady = 0;
       this.last = this.live || null;
       try {
-        this.progress(0, total, "Готовлю камеру…", null);
+        this.progress(0, total, "Готовлю камеру…");
         await this.lockExposure(token);
         const samples = {};
         for (const [n, s] of S.entries()) {
           // hs: null - лампа в собственном белом режиме (white_mode): сервер
-          // сам включает его, поправка к нему не применяется.
-          const hs = s.hs ?? null;
-          const name = lower1(s.label || colourName(s.key, hs));
-          this.progress(done, total, `Замер ${n + 1} из ${S.length}: ${name}`, hs || [0, 0]);
-          samples[s.key] = await this.measureColour(hs, null, name, token);
+          // сам включает его, поправка к нему не применяется. kelvin - что
+          // лента делает сама на эту температуру, тоже без поправки.
+          const name = nbK(lower1(s.label || colourName(s.key, s.hs)));
+          this.progress(done, total, `Замер ${n + 1} из ${S.length}: ${name}`, swatchOf(s));
+          samples[s.key] = await this.measureColour(itemTarget(s), null, name, token);
           done++;
         }
-        this.progress(done, total, "Считаю поправку…", null);
+        this.progress(done, total, "Считаю поправку…");
         const fit = await this.call("color_calibration/fit", { samples }, token);
-        this.progress(done, total, "Проверяю белый с поправкой…", [0, 0]);
-        const white = await this.measureColour([0, 0], fit.calibration, "белый", token);
+        this.progress(done, total, "Проверяю белый с поправкой…", hsToCss([0, 0]));
+        const white = await this.measureColour({ hs: [0, 0] }, fit.calibration, "белый", token);
         done++;
         const { calibration } = await this.call("color_calibration/refine_white",
           { calibration: fit.calibration, measured: white }, token);
         const measured = {};
         for (const [n, c] of K.entries()) {
-          const name = lower1(c.label || colourName(c.key, c.hs));
-          this.progress(done, total, `Проверка ${n + 1} из ${K.length}: ${name}`, c.hs);
-          measured[c.key] = await this.measureColour(c.hs, calibration, name, token);
+          // Проверка с kelvin - эта температура через поправку: как её покажет
+          // пресет Home Assistant после сохранения.
+          const name = nbK(lower1(c.label || colourName(c.key, c.hs)));
+          this.progress(done, total, `Проверка ${n + 1} из ${K.length}: ${name}`, swatchOf(c));
+          measured[c.key] = await this.measureColour(itemTarget(c), calibration, name, token);
           done++;
         }
-        this.progress(total, total, "Оцениваю результат…", null);
+        this.progress(total, total, "Оцениваю результат…");
         const ev = await this.call("color_calibration/evaluate", { calibration, measured }, token);
         this.result = { calibration, method, ev, whiteBefore: fit.white_before || null,
-                        unsteady: this.unsteady > 0, showing: false };
-        try {
-          // Лента остаётся на белом с поправкой: результат видно глазами.
-          await this.show([0, 0], calibration, token);
-          this.result.showing = true;
-        } catch (err) {
-          if (err instanceof Cancelled) throw err;
-        }
+                        unsteady: this.unsteady > 0, adjusted: null };
+        // Лента остаётся на белом с поправкой: результат видно глазами, а
+        // переключатели ниже дают сравнить с тем, что было.
+        Object.assign(this, { ab: { corrected: true, warm: false }, pvErr: "", paused: false });
         this.stopMeter();
         this.go("result");
         this.$("sr").textContent = ev.verdict_words || "Замер окончен";
+        this.preview.now(this.previewNowPayload());
       } catch (err) {
         if (!(err instanceof Cancelled)) this.fail(err);
       }
@@ -895,28 +1324,121 @@ function defineOverlay() {
     /** Экран погас или приложение свернули: камеры уже нет, лента в замере. */
     interrupt() {
       if (this.closed || (!this.stream && !this.begun)) return;
-      const keep = this.step === "result" || this.step === "error";
+      // Результат и подстройка остаются на экране: камера им не нужна, а
+      // ленту можно показать снова кнопкой «Показать снова».
+      const keep = ["result", "error", "adjust"].includes(this.step);
       const wasBegun = this.begun;
       this.restoreNote = wasBegun ? "Возвращаю ленту в прежнее состояние…" : "";
       this.stopSession().then((r) => {
-        if (!r.ended || this.step !== "interrupted") return;
+        if (!r.ended) return;
+        if (r.error && (this.step === "result" || this.step === "adjust")) {
+          this.pvErr = `Ленту не удалось вернуть: ${r.error}`;
+          return this.paintPreview();
+        }
+        if (this.step !== "interrupted") return;
         this.restoreNote = r.error ? `Ленту не удалось вернуть: ${r.error}` : "Лента возвращена в прежнее состояние.";
         this.render(false);
       });
       if (!keep) return this.go("interrupted");
-      if (this.result?.showing) { this.result.showing = false; if (this.step === "result") this.render(false); }
+      if (wasBegun && (this.step === "result" || this.step === "adjust")) { this.paused = true; this.paintPreview(); }
+    }
+
+    // ------------------------------------------------- подстройка белого --
+    canAdjustSaved() {
+      const i = this.info;
+      return !!(i?.calibrated && i.calibration && typeof i.calibration === "object" && this.wr);
+    }
+
+    /** Подстройка поверх готового замера. Поправка от сервера не меняется:
+     *  правится её копия, «Отмена» её просто выбрасывает. */
+    adjustResult() {
+      if (!this.result || this.saving || !this.wr) return;
+      const base = this.result.calibration;
+      const white = whiteOf(this.resultCal(), this.whiteDef);
+      this.adj = { from: "result", base, white, warm: this.ab.warm, cal: withWhite(base, white, this.wr) };
+      this.err = "";
+      this.go("adjust");
+      this.preview.now(this.previewNowPayload());
+    }
+
+    /** Подстройка сохранённой калибровки - без камеры: человек смотрит на стену сам. */
+    async adjustSaved() {
+      if (this.stopping) await this.stopping;
+      if (this.closed || this.step !== "intro" || !this.canAdjustSaved()) return;
+      const base = this.info.calibration;
+      const white = whiteOf(base, this.whiteDef);
+      Object.assign(this, { err: "", pvErr: "", paused: false, result: null });
+      this.adj = { from: "saved", base, white, warm: false, cal: withWhite(base, white, this.wr) };
+      this.go("adjust");
+      // «begin» уходит первым в previewSend - до первого show.
+      this.preview.now(this.previewNowPayload());
+    }
+
+    setWhite(part, sync) {
+      const a = this.adj, r = this.wr;
+      if (this.step !== "adjust" || !a || !r || this.saving) return;
+      const next = { ...a.white, ...part };
+      const white = { kelvin: clampRange(next.kelvin, r.kelvin), tint: clampRange(next.tint, r.tint) };
+      if (white.kelvin === null || white.tint === null) return;
+      const moved = !sameWhite(white, a.white);
+      a.white = white;
+      a.cal = withWhite(a.base, white, r);
+      this.paintAdjust(sync);
+      if (!moved && !sync) return;
+      // Ползунок - с дребезгом; кнопки и сброс - сразу.
+      if (sync) this.preview.now(this.previewNowPayload()); else this.preview.schedule(this.previewNowPayload());
+    }
+
+    adjustLeave(keep) {
+      const a = this.adj;
+      if (!a || this.saving || this.step !== "adjust") return;
+      this.adj = null;
+      this.err = "";
+      if (a.from === "result" && this.result) {
+        if (keep) {
+          const measured = whiteOf(this.result.calibration, this.whiteDef);
+          this.result.adjusted = sameWhite(a.white, measured) ? null : a.cal;
+        }
+        this.ab = { corrected: true, warm: a.warm };
+        this.step = "result";
+        this.render('[data-act="adjust"]');
+        if (keep && this.result.adjusted) this.$("sr").textContent = "Белый подстроен вручную";
+        return this.preview.now(this.previewNowPayload());
+      }
+      // Из вступления: лента возвращается как была, сохранённая калибровка не тронута.
+      this.step = "intro";
+      this.render('[data-act="adjust-saved"]');
+      this.stopSession().then((r) => {
+        if (!r.error || this.closed) return;
+        this.err = `Ленту не удалось вернуть в прежнее состояние: ${r.error}`;
+        if (this.step === "intro") this.render(false);
+      });
+    }
+
+    async again() {
+      if (this.againing || this.saving || !this.result) return;
+      this.againing = true;
+      // Предпросмотр в пути догоняет замер на сервере: сначала дождаться его.
+      try { await this.preview.cancel(); } finally { this.againing = false; }
+      if (this.closed || this.step !== "result") return;
+      Object.assign(this, { result: null, adj: null, err: "", pvErr: "", paused: false });
+      return this.stream ? this.goAim() : this.start();
     }
 
     async save() {
-      if (!this.result || this.saving) return;
+      if (this.saving) return;
+      const saved = this.step === "adjust" && this.adj?.from === "saved";
+      if (!saved && !this.result) return;
+      const calibration = saved ? this.adj.cal : this.resultCal();
+      const method = saved ? this.info?.method : this.result.method;
       this.saving = true; this.err = ""; this.render(false);
-      const payload = { entity_id: this.id, calibration: this.result.calibration };
-      if (this.result.method) payload.method = this.result.method;
+      const payload = { entity_id: this.id, calibration };
+      if (METHODS.includes(method)) payload.method = method;
       try {
         await this.o.ws("color_calibration/save", payload);
       } catch (err) {
         this.saving = false; this.err = errorText(err);
-        return this.render(false);
+        return this.render('[data-act="save"]');
       }
       this.changed = true;
       if (this.closed) { this.o.toast?.("Калибровка сохранена"); return this.o.onClose?.(true); }
@@ -938,7 +1460,7 @@ function defineOverlay() {
       }
       this.saving = false;
       this.changed = true;
-      this.info = { ...this.info, calibrated: false, calibrated_at: null, method: null };
+      this.info = { ...this.info, calibrated: false, calibrated_at: null, method: null, calibration: null };
       this.go("intro");
       this.notify("Калибровка сброшена");
     }
