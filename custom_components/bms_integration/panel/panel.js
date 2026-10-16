@@ -1087,8 +1087,26 @@ class BmsControlCenter extends HTMLElement {
           <span style="flex:1 1 160px;min-width:0"><span style="display:block;font-size:13px;font-weight:600;color:${C.ink}">${esc(e.name)}</span>
             <span class="small" style="color:${info.calibrated ? C.ok : C.mut2}">${status}</span></span>
           ${btn("Калибровка цвета", { act: "calib-open", data: `data-eid="${esc(e.entity_id)}"`, primary: true, ico: "i-eye" })}
+          ${btn(info.white_from_rgb ? "Белый из RGB: включено" : "Белый из RGB: выключено",
+            { act: "white-rgb", data: `data-eid="${esc(e.entity_id)}" data-on="${info.white_from_rgb ? "0" : "1"}" aria-pressed="${info.white_from_rgb ? "true" : "false"}" title="Белых светодиодов на ленте нет: белый и температуры собирать из RGB"`, ico: "i-gear" })}
         </div>`;
       }).join("")}</div>${cardClose}`;
+  }
+
+  // Контроллер RGB+W на ленте без белых светодиодов: белый режим зажигает
+  // пустой канал, и лента гаснет. Переключатель велит собирать белый из RGB.
+  async setWhiteFromRgb(el, entityId, enabled) {
+    el.disabled = true;
+    try {
+      await this.ws("color_calibration/white_from_rgb", { entity_id: entityId, enabled });
+      this.toast(enabled ? "Белый теперь собирается из RGB" : "Белый снова идёт белым каналом");
+      delete this._calibInfo[entityId];
+      if (this.d.device) this.loadCalibInfo(this.d.device);
+    } catch (err) {
+      this.toast(err?.message || "Не удалось переключить", true);
+    } finally {
+      el.disabled = false;
+    }
   }
 
   async openCalibration(entityId) {
@@ -1716,6 +1734,7 @@ class BmsControlCenter extends HTMLElement {
     if (a === "nav") return this.go(el.dataset.nav);
     if (a === "dtab") { this.s.deviceTab = el.dataset.tab; return this.paint(); }
     if (a === "calib-open") return this.openCalibration(el.dataset.eid);
+    if (a === "white-rgb") return this.setWhiteFromRgb(el, el.dataset.eid, el.dataset.on === "1");
     if (a === "refresh") return this.refresh();
     if (a === "expert") { this.s.expert = !this.s.expert; return this.paint(); }
     if (a === "feed-clear" || a === "feed-restore") {

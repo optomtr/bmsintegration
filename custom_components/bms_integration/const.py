@@ -107,6 +107,9 @@ CONF_MUSIC_MODE = "music_mode"
 # Поправка цвета ленты по замеру камерой телефона (core/color_calibration.py).
 # В форме сущности её нет - пишет её панель, а правка сущности переносит как есть.
 CONF_COLOR_CALIBRATION = "color_calibration"
+# Белых светодиодов на ленте нет (контроллер RGB+W, лента RGB): белый и
+# температуры собирать из RGB, а не белым каналом.
+CONF_WHITE_FROM_RGB = "white_from_rgb"
 CONF_SCENE_VALUES = "scene_values"
 CONF_SCENE_VALUES_FRIENDLY = "scene_values_friendly"
 

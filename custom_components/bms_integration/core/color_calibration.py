@@ -170,6 +170,14 @@ def _clean(sample, name: str) -> list[float]:
     return [x / total for x in values]
 
 
+def _is_dark(sample) -> bool:
+    """Кадр без света: экран калибровки шлёт нули, если темно."""
+    try:
+        return sum(float(x) for x in sample) <= 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _delta(a, b) -> float:
     try:
         return delta_uv(a, b)
@@ -499,9 +507,15 @@ def fit(samples: dict) -> tuple[Calibration, dict]:
 
     white_mode = same_as_rgb = None
     if WHITE_MODE[0] in samples:
-        seen = _clean(samples[WHITE_MODE[0]], WHITE_MODE[2])
-        white_mode = _delta(seen, kelvin_target(DEFAULT_KELVIN, DEFAULT_TINT))
-        same_as_rgb = _delta(seen, unit["white"]) < SAME_AS_RGB_TOLERANCE
+        raw = samples[WHITE_MODE[0]]
+        if _is_dark(raw):
+            # Белый режим не светит вовсе: у контроллера белый канал, а на
+            # ленте белых светодиодов нет - белый только из RGB.
+            same_as_rgb = True
+        else:
+            seen = _clean(raw, WHITE_MODE[2])
+            white_mode = _delta(seen, kelvin_target(DEFAULT_KELVIN, DEFAULT_TINT))
+            same_as_rgb = _delta(seen, unit["white"]) < SAME_AS_RGB_TOLERANCE
     calibration = Calibration(
         tuple(tuple(r) for r in matrix),
         curves,

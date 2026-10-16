@@ -1237,7 +1237,7 @@ function defineOverlay() {
       }
     }
 
-    async measureColour(target, calibration, name, token) {
+    async measureColour(target, calibration, name, token, { allowDark = false } = {}) {
       const same = this.shown && sameTarget(this.shown.target, target) && this.shown.cal === !!calibration;
       await this.show(target, calibration, token);
       const run = (changedFrom) => measureUntilSettled(() => this.grab(),
@@ -1248,6 +1248,11 @@ function defineOverlay() {
         // снятой по белому, он в пересвете. Отдаём экспозицию камере.
         await this.unlockExposure();
         m = await run(null);
+      }
+      if (!m.rgb && allowDark && exposureState(m.last) !== "bright") {
+        // Белый режим не светит вовсе: контроллер RGB+W, а белых светодиодов
+        // на ленте нет. Это ответ, а не сбой - сервер соберёт белый из RGB.
+        return [0, 0, 0];
       }
       if (!m.rgb) {
         throw new Error(exposureState(m.last) === "bright"
@@ -1279,7 +1284,8 @@ function defineOverlay() {
           // лента делает сама на эту температуру, тоже без поправки.
           const name = nbK(lower1(s.label || colourName(s.key, s.hs)));
           this.progress(done, total, `Замер ${n + 1} из ${S.length}: ${name}`, swatchOf(s));
-          samples[s.key] = await this.measureColour(itemTarget(s), null, name, token);
+          samples[s.key] = await this.measureColour(itemTarget(s), null, name, token,
+            { allowDark: s.key === "white_mode" });
           done++;
         }
         this.progress(done, total, "Считаю поправку…");

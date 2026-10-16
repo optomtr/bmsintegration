@@ -117,6 +117,17 @@ the license text.
   was gone - and all 40 devices on the address were down, the healthy hub's
   included. A hub that announces itself later corrects the choice with one
   reload.
+- White from RGB: for an RGB strip on an RGB+W controller (the strip has no
+  white LEDs), white lit the controller's empty white channel and the strip
+  went dark. A light now has the option "White from RGB (the strip has no
+  white LEDs)" - in the entity settings and as a button on the strip's card
+  in the BMS panel, applied at once without a reload. White, the white
+  button, plain "turn on" from white mode, dimming in white mode and colour
+  temperatures then go out as colour from the RGB channels (corrected, if
+  the strip is calibrated), and Home Assistant keeps showing the colour
+  temperature. Calibration skips the lamp's white mode for such a strip, and
+  a white mode that gives no light at all is read as "no white LEDs" instead
+  of failing the measurement.
 - Colour calibration no longer fails on a real phone camera. On an iPhone it
   stopped with "the mixed colours failed" every time: the strength of each
   channel came from pure red, green and blue alone, which a phone distorts

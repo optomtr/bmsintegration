@@ -20,7 +20,13 @@ from homeassistant.core import HomeAssistant
 
 from homeassistant.const import CONF_BRIGHTNESS, CONF_COLOR_TEMP
 
-from .const import ATTR_UPDATED_AT, CONF_COLOR, CONF_COLOR_CALIBRATION, DOMAIN
+from .const import (
+    ATTR_UPDATED_AT,
+    CONF_COLOR,
+    CONF_COLOR_CALIBRATION,
+    CONF_WHITE_FROM_RGB,
+    DOMAIN,
+)
 from .core import color_calibration as cc
 from .core.colour_math import hs_target, kelvin_target, swatch
 
@@ -77,7 +83,8 @@ def _item(key, hs, kelvin, label) -> dict:
 def _samples(entity) -> list[dict]:
     """Что показать для замера: белый режим - только у ламп, где он есть."""
     items = [_item(k, hs, None, label) for k, hs, label in cc.SAMPLES]
-    if entity is not None and (
+    # Белых светодиодов нет - белый режим зажигает пустой канал, мерить нечего.
+    if entity is not None and not getattr(entity, "white_from_rgb", False) and (
         entity.has_config(CONF_BRIGHTNESS) or entity.has_config(CONF_COLOR_TEMP)
     ):
         key, _hs, label = cc.WHITE_MODE
@@ -137,6 +144,7 @@ async def ws_info(hass: HomeAssistant, connection, msg: dict) -> None:
             # Сохранённая поправка - для подстройки белого без нового замера.
             "calibration": entity.calibration.as_dict() if entity and entity.calibration else None,
             "white_default": dict(cc.WHITE_DEFAULT),
+            "white_from_rgb": bool(entity and entity.white_from_rgb),
             "white_range": {k: dict(v) for k, v in cc.WHITE_RANGE.items()},
         },
     )
@@ -307,10 +315,16 @@ async def ws_save(hass: HomeAssistant, connection, msg: dict) -> None:
 
 
 async def _async_store(hass: HomeAssistant, entity, stored: dict | None) -> None:
-    """Записать поправку в настройки сущности и применить её на ходу.
+    """Записать поправку в настройки сущности и применить её на ходу."""
+    await _async_store_option(hass, entity, CONF_COLOR_CALIBRATION, stored)
+    entity.set_calibration(cc.Calibration.load(stored))
+
+
+async def _async_store_option(hass: HomeAssistant, entity, key: str, value) -> None:
+    """Записать настройку сущности ленты; None - убрать.
 
     Перезагрузка записи ради одной ленты уронила бы связь со всем домом на
-    минуту, поэтому поправка ставится на живую сущность, а запись помечается
+    минуту, поэтому настройка ставится на живую сущность, а запись помечается
     как уже применённая.
     """
     from . import _applied_without_reload
@@ -331,20 +345,50 @@ async def _async_store(hass: HomeAssistant, entity, stored: dict | None) -> None
         )
         if item is None:
             raise RuntimeError("Сущность ленты не найдена в настройках")
-        if stored is None:
-            item.pop(CONF_COLOR_CALIBRATION, None)
+        if value is None:
+            item.pop(key, None)
         else:
-            item[CONF_COLOR_CALIBRATION] = stored
+            item[key] = value
         stamp = str(int(time.time() * 1000))
         new_data[ATTR_UPDATED_AT] = stamp
         _applied_without_reload[entry.entry_id] = stamp
         hass.config_entries.async_update_entry(entry, data=new_data)
-    # Та же поправка, что записана: сущность читает её из своих настроек.
-    if stored is None:
-        entity._config.pop(CONF_COLOR_CALIBRATION, None)
+    # То же, что записано: сущность читает настройку из своих настроек.
+    if value is None:
+        entity._config.pop(key, None)
     else:
-        entity._config[CONF_COLOR_CALIBRATION] = stored
-    entity.set_calibration(cc.Calibration.load(stored))
+        entity._config[key] = value
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/color_calibration/white_from_rgb",
+        vol.Required("entity_id"): str,
+        vol.Required("enabled"): bool,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_white_from_rgb(hass: HomeAssistant, connection, msg: dict) -> None:
+    """«Белых светодиодов нет»: белый и температуры - из RGB."""
+    entity = _light(hass, msg["entity_id"])
+    if entity is None or not entity.has_config(CONF_COLOR):
+        connection.send_error(msg["id"], "not_found", "Цветная лента не найдена")
+        return
+    try:
+        await _async_store_option(hass, entity, CONF_WHITE_FROM_RGB, bool(msg["enabled"]))
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.exception("Не удалось записать «белый из RGB» %s", msg["entity_id"])
+        _fail(connection, msg, err)
+        return
+    entity.set_white_from_rgb(msg["enabled"])
+    _LOGGER.warning(
+        "Белый из RGB для %s %s (пользователь %s)",
+        msg["entity_id"],
+        "включён" if msg["enabled"] else "выключен",
+        connection.user.name if connection.user else "?",
+    )
+    connection.send_result(msg["id"], {"ok": True})
 
 
 @websocket_api.websocket_command(
@@ -378,4 +422,5 @@ COMMANDS: tuple[Any, ...] = (
     ws_evaluate,
     ws_save,
     ws_end,
+    ws_white_from_rgb,
 )

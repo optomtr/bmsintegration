@@ -220,6 +220,14 @@ class TheLampsOwnWhite(unittest.TestCase):
         calibration, _ = cc.fit(self.samples(balanced, balanced.light((0, 0))))
         self.assertTrue(calibration.white_via_colour)
 
+    def test_a_dark_white_mode_means_no_white_leds(self):
+        # Контроллер RGB+W, лента RGB: белый режим не светит, экран шлёт нули.
+        samples = measure(GREENISH, Camera())
+        samples["white_mode"] = [0.0, 0.0, 0.0]
+        calibration, quality = cc.fit(samples)
+        self.assertTrue(calibration.white_via_colour)
+        self.assertGreater(quality["white_before"], 0.02)
+
     def test_the_choice_survives_saving_and_refining(self):
         calibration, _ = cc.fit(self.samples(GREENISH, GREENISH.light((0, 0))))
         self.assertTrue(cc.Calibration.from_dict(calibration.as_dict()).white_via_colour)
@@ -548,6 +556,72 @@ def make_ct_light(calibration, stored=None):
     return ent
 
 
+class _LightW(_Light):
+    supported_color_modes = {ColorMode.HS, ColorMode.WHITE}
+
+
+class RgbwControllerOnAnRgbStrip(unittest.TestCase):
+    """С объекта: «лента RGB, а блок управления RGB и белый: ставлю белый -
+    RGB выключается и подсветка гаснет». Белый режим зажигал белый канал, а
+    к нему на ленте ничего не подключено. «Белый из RGB» - без калибровки."""
+
+    def light(self, white_from_rgb=True):
+        ent = make_ct_light(None)
+        ent._white_from_rgb = white_from_rgb
+        ent._config["white_from_rgb"] = white_from_rgb
+        return ent
+
+    def test_white_comes_from_rgb(self):
+        ent = self.light()
+        asyncio.run(ent.async_turn_on(hs_color=(0, 0)))
+        states = ent.sent[-1]
+        self.assertNotIn(BRIGHT, states, "белый канал - пустой")
+        self.assertEqual(states[MODE], ent._modes.color)
+        self.assertEqual(sent_hs(ent)[1], 0)
+
+    def test_colour_temperature_comes_from_rgb_and_is_shown_as_temperature(self):
+        ent = self.light()
+        asyncio.run(ent.async_turn_on(color_temp_kelvin=3000))
+        states = ent.sent[-1]
+        self.assertNotIn(CT, states)
+        self.assertEqual(states[MODE], ent._modes.color)
+        got = sent_hs(ent)
+        self.assertTrue(20 < got[0] < 40 and got[1] > 40, got)  # тёплый, не белый
+        ent.status_updated()
+        self.assertEqual(ent.color_mode, ColorMode.COLOR_TEMP)
+        self.assertEqual(ent.color_temp_kelvin, 3000)
+
+    def test_white_mode_button_and_plain_turn_on(self):
+        # Лампа с белым каналом без температуры: у неё в Home Assistant
+        # есть отдельная кнопка «белый».
+        ent = make_light(None)
+        ent.__class__ = _LightW
+        ent._config["brightness"] = BRIGHT
+        ent._white_from_rgb = True
+        asyncio.run(ent.async_turn_on(white=200))
+        self.assertNotIn(BRIGHT, ent.sent[-1])
+        self.assertIn(COLOUR, ent.sent[-1])
+        ent = self.light()
+        ent.is_on = False
+        asyncio.run(ent.async_turn_on())
+        self.assertEqual(ent.sent[-1][MODE], ent._modes.color, "включилась бы пустым белым каналом")
+        self.assertIn(COLOUR, ent.sent[-1])
+        ent = self.light()
+        asyncio.run(ent.async_turn_on(brightness=120))
+        self.assertNotIn(BRIGHT, ent.sent[-1])
+        self.assertEqual(ent.sent[-1][MODE], ent._modes.color)
+
+    def test_without_the_option_white_stays_white(self):
+        ent = self.light(white_from_rgb=False)
+        asyncio.run(ent.async_turn_on(hs_color=(0, 0)))
+        self.assertIn(BRIGHT, ent.sent[-1])
+        self.assertNotIn(COLOUR, ent.sent[-1])
+
+    def test_option_is_in_the_entity_form(self):
+        keys = [getattr(k, "schema", k) for k in light_mod.flow_schema(["20", "21"]).keys()]
+        self.assertIn("white_from_rgb", keys)
+
+
 class ColourTemperatureOnAnRgbStrip(unittest.TestCase):
     """С объекта: «у меня лента RGB, белых светодиодов нет» - тёплый пресет
     горел белым. Температура такой ленты идёт исправленным цветом, а Home
@@ -834,6 +908,8 @@ class AbandonedCalibrationPutsTheStripBack(unittest.TestCase):
         })()
 
         class Conn:
+            user = None
+
             def __init__(self):
                 self.results, self.errors = [], []
 
@@ -877,6 +953,33 @@ class AbandonedCalibrationPutsTheStripBack(unittest.TestCase):
         self.call(self.ws.ws_show, kelvin=3000)  # лампа без белого режима - цвет без поправки
         self.assertEqual(self.conn.errors, [])
         self.assertIsNotNone(self.conn.results[-1]["sent_hs"])
+
+    def test_no_white_led_option_is_stored_live_and_skips_the_white_mode_frame(self):
+        light = make_ct_light(None)
+        light.available = True
+        light.async_write_ha_state = lambda: None
+        component = type("C", (), {"get_entity": lambda self_, eid: light})()
+        self.hass.data = {"light": component}
+        stored = []
+
+        async def fake_store(hass, entity, key, value):
+            stored.append((key, value))
+            entity._config[key] = value
+
+        real = self.ws._async_store_option
+        self.ws._async_store_option = fake_store
+        try:
+            self.call(self.ws.ws_info)
+            self.assertIn("white_mode", [i["key"] for i in self.conn.results[-1]["samples"]])
+            self.call(self.ws.ws_white_from_rgb, enabled=True)
+        finally:
+            self.ws._async_store_option = real
+        self.assertEqual(stored, [("white_from_rgb", True)])
+        self.assertTrue(light.white_from_rgb)
+        self.call(self.ws.ws_info)
+        info = self.conn.results[-1]
+        self.assertTrue(info["white_from_rgb"])
+        self.assertNotIn("white_mode", [i["key"] for i in info["samples"]])
 
     def test_info_gives_the_screen_what_tuning_needs(self):
         calibration, _ = calibrate(CLEAN, Camera(seed=52))
