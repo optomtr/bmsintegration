@@ -94,9 +94,22 @@ export function normPresets(list) {
     const target = normHs(p?.target);
     if (!target) continue;
     out.push({ key: typeof p.key === "string" ? p.key : "", label: cleanLabel(p.label) || colourLabel(target), target,
-      swatch: typeof p.swatch === "string" && HEX.test(p.swatch) ? p.swatch : hsToCss(target) });
+      swatch: typeof p.swatch === "string" && HEX.test(p.swatch) ? p.swatch : hsToCss(target),
+      group: cleanLabel(p.group) || "Цвета" });
   }
   return out;
+}
+
+/** Готовые цвета по разделам в порядке сервера: [{ group, items }]. */
+export function groupPresets(list) {
+  const groups = [];
+  for (const p of list || []) {
+    const name = p.group || "Цвета";
+    let g = groups.find((x) => x.group === name);
+    if (!g) groups.push((g = { group: name, items: [] }));
+    g.items.push(p);
+  }
+  return groups;
 }
 
 /** «1 цвет», «3 цвета», «24 цвета», «5 цветов». */
@@ -303,6 +316,7 @@ button:focus-visible,input:focus-visible,[tabindex="0"]:focus-visible{outline:3p
 .btns{display:flex;gap:8px}
 .btns .b{min-height:44px;padding:8px 12px;font-size:15px;flex:1 1 0}
 .chips{display:flex;flex-wrap:wrap;gap:8px}
+.grp{font-size:13px;font-weight:600;color:#C9D3DC;margin:12px 0 6px}
 .chip{display:inline-flex;align-items:center;gap:8px;min-height:44px;max-width:100%;padding:6px 14px 6px 8px;border-radius:999px;
   border:1px solid #2B3744;background:#18212B;color:#EEF2F6;font:inherit;font-size:15px;font-weight:600;line-height:1.2;
   text-align:left;cursor:pointer;touch-action:manipulation}
@@ -460,10 +474,11 @@ function defineOverlay() {
       const free = freePresets(this.presets, d);
       const add = !canAdd(d, this.max)
         ? `<p class="note">Это предел — ${colours(this.max)}. Удалите лишний, чтобы добавить новый.</p>`
-        : `<div class="chips" role="group" aria-labelledby="add-h">${free.map((p) =>
+        : `${groupPresets(free).map((g) => `<div class="grp">${esc(g.group)}</div>
+            <div class="chips" role="group" aria-label="${esc(g.group)}">${g.items.map((p) =>
             `<button type="button" class="chip" data-act="add-preset" data-k="${this.presets.indexOf(p)}" ${off}>
-              <span class="sw" style="background:${p.swatch}"></span>${esc(nbK(p.label))}</button>`).join("")}
-            <button type="button" class="chip" data-act="custom" ${off}><span class="sw rainbow"></span>Свой цвет</button></div>`;
+              <span class="sw" style="background:${p.swatch}"></span>${esc(nbK(p.label))}</button>`).join("")}</div>`).join("")}
+            <div class="chips"><button type="button" class="chip" data-act="custom" ${off}><span class="sw rainbow"></span>Свой цвет</button></div>`;
       return `<h2 tabindex="-1">Ваши цвета</h2>
         <p>Выберите цвет, подгоните ползунками, пока лента не станет такой же, как кружок на экране, и сохраните. Цвета между вашими лента возьмёт плавно.</p>
         ${cam ? `<p class="note">Пока здесь есть цвета, калибровка камерой не используется.</p>` : ""}
@@ -522,9 +537,12 @@ function defineOverlay() {
       const t = this.t;
       return `<h2 tabindex="-1">Проверить любой цвет</h2>
         <p class="mut">Лента покажет цвет так, как после сохранения ваших цветов — даже ещё не сохранённых. Так видно, как выходят цвета между ними.</p>
-        <div class="chips" role="group" aria-label="Готовые цвета">${this.presets.map((p, i) =>
-          `<button type="button" class="chip" data-act="test-preset" data-k="${i}" aria-pressed="${t.preset === i}">
-            <span class="sw" style="background:${p.swatch}"></span>${esc(nbK(p.label))}</button>`).join("")}</div>
+        ${groupPresets(this.presets).map((g) => `<div class="grp">${esc(g.group)}</div>
+          <div class="chips" role="group" aria-label="${esc(g.group)}">${g.items.map((p) => {
+            const i = this.presets.indexOf(p);
+            return `<button type="button" class="chip" data-act="test-preset" data-k="${i}" aria-pressed="${t.preset === i}">
+            <span class="sw" style="background:${p.swatch}"></span>${esc(nbK(p.label))}</button>`;
+          }).join("")}</div>`).join("")}
         <div class="cmp">
           <figure><span class="big" role="img" data-p="tgt"></span><figcaption>Так должно выглядеть</figcaption></figure>
           <figure><span class="big" role="img" data-p="dev"></span><figcaption>Что получает лента</figcaption></figure>

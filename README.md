@@ -117,6 +117,12 @@ the license text.
   was gone - and all 40 devices on the address were down, the healthy hub's
   included. A hub that announces itself later corrects the choice with one
   reload.
+- Manual calibration presets in sections: «Цвета Home Assistant» - exactly
+  the circles on the light's card in Home Assistant (four colour
+  temperatures spread over the lamp's own range, as the frontend computes
+  them - 2700/3967/5233/6500 K for 2700-6500 - and its blue, purple, pink
+  and red), «Температура белого» 2700-6500 K every 500 K plus 3000 K, and
+  the plain colours; up to 40 colours.
 - Manual colour calibration, tuned by eye. The camera result did not suit
   the owner ("не то"), so a strip's card in the BMS panel gets «Ручная
   калибровка»: pick a colour (white, 3000 K, 4000 K, nine colours or your

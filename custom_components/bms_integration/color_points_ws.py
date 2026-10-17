@@ -24,6 +24,16 @@ _POINTS = vol.All(list, vol.Length(max=cp.MAX_POINTS))
 _HS = vol.All([vol.Coerce(float)], vol.Length(min=2, max=2))
 
 
+def _kelvin_range(entity) -> tuple[int, int]:
+    """Пределы температуры лампы - те же, что видит Home Assistant."""
+    try:
+        low = int(entity.min_color_temp_kelvin)
+        high = int(entity.max_color_temp_kelvin)
+    except (AttributeError, TypeError, ValueError):
+        return (2700, 6500)
+    return (low, high) if 1000 <= low < high <= 12000 else (2700, 6500)
+
+
 def _points(data) -> cp.ColourPoints | None:
     return cp.ColourPoints.from_list(data)
 
@@ -45,7 +55,7 @@ async def ws_get(hass: HomeAssistant, connection, msg: dict) -> None:
             "supported": reason is None,
             "reason": reason,
             "points": points.as_list() if points else [],
-            "presets": cp.presets(),
+            "presets": cp.presets(*_kelvin_range(entity)),
             "max_points": cp.MAX_POINTS,
             "has_camera_calibration": bool(entity and entity.calibration),
             "white_from_rgb": bool(entity and entity.white_from_rgb),

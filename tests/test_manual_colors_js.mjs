@@ -86,6 +86,18 @@ await test("кружок цели: образец пресета, иначе ц�
   eq(mc.targetSwatch([30.2, 50.1], presets), "#FFB061");
   eq(mc.targetSwatch([200, 80], presets), mc.hsToCss([200, 80]));
 });
+await test("готовые цвета по разделам, в порядке сервера", () => {
+  const ps = mc.normPresets([
+    { label: "2700 K", target: [30, 65], group: "Цвета Home Assistant" },
+    { label: "Голубой (HA)", target: [219, 50], group: "Цвета Home Assistant" },
+    { label: "3000 K", target: [30, 56], group: "Температура белого" },
+    { label: "Белый", target: [0, 0] },
+  ]);
+  eq(ps[3].group, "Цвета", "без раздела - «Цвета»:");
+  const groups = mc.groupPresets(ps);
+  eq(groups.map((g) => g.group), ["Цвета Home Assistant", "Температура белого", "Цвета"]);
+  eq(groups[0].items.map((p) => p.label), ["2700 K", "Голубой (HA)"]);
+});
 await test("название своего цвета", () => {
   eq([mc.colourLabel([0, 0]), mc.colourLabel([30, 100]), mc.colourLabel([240, 40]), mc.colourLabel([350, 90])],
     ["Белый", "Оранжевый", "Светло-синий", "Красный"]);

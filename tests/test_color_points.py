@@ -91,10 +91,31 @@ class Points(unittest.TestCase):
 
     def test_warm_presets_are_warm(self):
         presets = {p["key"]: p for p in cp.presets()}
-        warm = presets["warm_3000"]["target"]
+        warm = presets["kelvin_3000"]["target"]
         self.assertTrue(25 < warm[0] < 40 and 40 < warm[1] < 70, warm)
-        self.assertLess(presets["neutral_4000"]["target"][1], warm[1])
-        for p in presets.values():
+        self.assertLess(presets["kelvin_4000"]["target"][1], warm[1])
+
+    def test_home_assistant_circles_exactly(self):
+        # С объекта: «именно эти цвета добавь» - кружки карточки лампы.
+        presets = [p for p in cp.presets(2700, 6500) if p["group"] == "Цвета Home Assistant"]
+        self.assertEqual([p["kelvin"] for p in presets[:4]], [2700, 3967, 5233, 6500])
+        self.assertEqual([p["swatch"] for p in presets[4:]], ["#7facff", "#d796ff", "#ff9ef3", "#ff6e54"])
+        # Кружок цвета шлёт RGB, лампа получает оттенок и насыщенность - как
+        # их считает Home Assistant (colorsys).
+        import colorsys
+        for p, rgb in zip(presets[4:], cp.HA_COLOURS):
+            h, sat, _v = colorsys.rgb_to_hsv(*(c / 255 for c in rgb[2]))
+            self.assertAlmostEqual(p["target"][0], h * 360, delta=0.01)
+            self.assertAlmostEqual(p["target"][1], sat * 100, delta=0.01)
+
+    def test_temperatures_follow_the_lamps_range(self):
+        presets = cp.presets(3000, 6000)
+        ha = [p["kelvin"] for p in presets if p["group"] == "Цвета Home Assistant" and p["kelvin"]]
+        self.assertEqual(ha, [3000, 4000, 5000, 6000])
+        scale = [p["kelvin"] for p in presets if p["group"] == "Температура белого"]
+        self.assertEqual(scale, [3000, 3500, 4000, 4500, 5000, 5500, 6000])
+        self.assertGreaterEqual(cp.MAX_POINTS, len(cp.presets()), "все готовые цвета должны помещаться")
+        for p in presets:
             self.assertRegex(p["swatch"], r"^#[0-9a-f]{6}$")
 
 
@@ -178,6 +199,8 @@ class PanelCommands(unittest.TestCase):
         self.assertEqual(info["points"], [])
         self.assertTrue(info["supported"])
         self.assertIn("white", [p["key"] for p in info["presets"]])
+        # Лампа стенда - 2700-6500 K, как у владельца.
+        self.assertEqual([p["kelvin"] for p in info["presets"][:4]], [2700, 3967, 5233, 6500])
         draft = [WHITE, YELLOW]
         self.call(self.ws.ws_command, target=[55, 100], points=draft)
         self.assertLess(gap(self.conn.results[-1]["device"], YELLOW["device"]), 1e-3)
