@@ -215,6 +215,15 @@ the license text.
   reported the new colour 5 times in 6 instead of 5 in 10, and twice as fast.
   Merged commands to a Zigbee device also wait 0.5 s after the gateway's
   acknowledgement, which only means the gateway received the command.
+- Cover calibration: two optional fields in a cover's settings say what the
+  motor reports when fully open and when fully closed (for example 7 and 100
+  for a motor that counts backwards and stops short of the scale's end). Home
+  Assistant then sees a true 0-100, and position commands are converted back.
+  Covers without these fields behave exactly as before. A **Calibrate** button
+  on every cover that reports its position does it by itself: it opens the
+  cover, closes it, reads the motor at each end (waiting out the full travel
+  and asking the motor again before trusting a reading) and saves both ends
+  without reloading the entry. The result arrives as a notification.
 - Cloud requests with a body are signed over the exact text that is sent. The
   first POST the integration ever made - the unlock ticket - was refused with
   "sign invalid" (1004).

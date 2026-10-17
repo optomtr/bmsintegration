@@ -179,6 +179,8 @@
           "gate_closing_state": "Gate action value for closing",
           "gate_inverted": "Invert gate sensor (sensor reports closed when the gate is open)",
           "position_inverted": "Invert 0-100 position (for *position* mode only)",
+          "position_open_raw": "(Optional) Calibration: position the motor reports when fully OPEN (e.g. 7). Leave empty if the cover reaches 100",
+          "position_closed_raw": "(Optional) Calibration: position the motor reports when fully CLOSED (e.g. 100). Leave empty if the cover reaches 0",
           "span_time": "Full opening time, in secs. (for *timed* mode only)",
           "unit_of_measurement": "(Optional) Unit of Measurement",
           "device_class": "(Optional) Device Class",
@@ -295,5 +297,12 @@
       }
     }
   },
-  "title": "BMS Integration"
+  "title": "BMS Integration",
+  "entity": {
+    "button": {
+      "cover_calibrate": {
+        "name": "Calibrate"
+      }
+    }
+  }
 }
