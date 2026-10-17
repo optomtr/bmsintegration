@@ -113,6 +113,8 @@ CONF_WHITE_FROM_RGB = "white_from_rgb"
 # Ручная калибровка: цвета, подогнанные на глаз (core/color_points.py). В
 # форме сущности её нет - пишет её панель, а правка сущности переносит как есть.
 CONF_COLOR_POINTS = "color_points"
+# Предел яркости ленты, % (мерцает на полной - блок питания не тянет).
+CONF_MAX_BRIGHTNESS = "max_brightness"
 CONF_SCENE_VALUES = "scene_values"
 CONF_SCENE_VALUES_FRIENDLY = "scene_values_friendly"
 

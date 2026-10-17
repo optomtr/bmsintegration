@@ -24,6 +24,7 @@ from .const import (
     ATTR_UPDATED_AT,
     CONF_COLOR,
     CONF_COLOR_CALIBRATION,
+    CONF_MAX_BRIGHTNESS,
     CONF_WHITE_FROM_RGB,
     DOMAIN,
 )
@@ -145,6 +146,7 @@ async def ws_info(hass: HomeAssistant, connection, msg: dict) -> None:
             "calibration": entity.calibration.as_dict() if entity and entity.calibration else None,
             "white_default": dict(cc.WHITE_DEFAULT),
             "white_from_rgb": bool(entity and entity.white_from_rgb),
+            "max_brightness": entity.max_brightness_percent if entity else 100,
             "white_range": {k: dict(v) for k, v in cc.WHITE_RANGE.items()},
         },
     )
@@ -413,6 +415,35 @@ async def ws_end(hass: HomeAssistant, connection, msg: dict) -> None:
     connection.send_result(msg["id"], {"ok": True})
 
 
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/color_calibration/max_brightness",
+        vol.Required("entity_id"): str,
+        vol.Required("percent"): vol.All(vol.Coerce(int), vol.Range(min=10, max=100)),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_max_brightness(hass: HomeAssistant, connection, msg: dict) -> None:
+    """Предел яркости ленты: на полной она мерцает - блок питания не тянет."""
+    entity = _light(hass, msg["entity_id"])
+    if entity is None:
+        connection.send_error(msg["id"], "not_found", "Лента не найдена")
+        return
+    percent = int(msg["percent"])
+    try:
+        # 100 % - предела нет: настройку убираем, а не храним «как без неё».
+        await _async_store_option(
+            hass, entity, CONF_MAX_BRIGHTNESS, None if percent >= 100 else percent
+        )
+        await entity.async_set_max_brightness(percent)
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.exception("Не удалось задать предел яркости %s", msg["entity_id"])
+        _fail(connection, msg, err)
+        return
+    connection.send_result(msg["id"], {"ok": True, "percent": entity.max_brightness_percent})
+
+
 COMMANDS: tuple[Any, ...] = (
     ws_info,
     ws_begin,
@@ -423,4 +454,5 @@ COMMANDS: tuple[Any, ...] = (
     ws_save,
     ws_end,
     ws_white_from_rgb,
+    ws_max_brightness,
 )

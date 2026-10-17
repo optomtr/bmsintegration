@@ -98,6 +98,10 @@ await test("готовые цвета по разделам, в порядке �
   eq(groups.map((g) => g.group), ["Цвета Home Assistant", "Температура белого", "Цвета"]);
   eq(groups[0].items.map((p) => p.label), ["2700 K", "Голубой (HA)"]);
 });
+await test("предел яркости: 10-100 %, мусор - без предела", () => {
+  eq([mc.clampPercent(80), mc.clampPercent(5), mc.clampPercent(140), mc.clampPercent("x"), mc.clampPercent(undefined)],
+    [80, 10, 100, 100, 100]);
+});
 await test("название своего цвета", () => {
   eq([mc.colourLabel([0, 0]), mc.colourLabel([30, 100]), mc.colourLabel([240, 40]), mc.colourLabel([350, 90])],
     ["Белый", "Оранжевый", "Светло-синий", "Красный"]);

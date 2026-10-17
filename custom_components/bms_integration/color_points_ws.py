@@ -59,6 +59,7 @@ async def ws_get(hass: HomeAssistant, connection, msg: dict) -> None:
             "max_points": cp.MAX_POINTS,
             "has_camera_calibration": bool(entity and entity.calibration),
             "white_from_rgb": bool(entity and entity.white_from_rgb),
+            "max_brightness": entity.max_brightness_percent if entity else 100,
         },
     )
 

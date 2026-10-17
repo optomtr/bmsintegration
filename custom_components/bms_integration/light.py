@@ -38,6 +38,7 @@ from .const import (
     CONF_COLOR_TEMP_MIN_KELVIN,
     CONF_COLOR_CALIBRATION,
     CONF_COLOR_POINTS,
+    CONF_MAX_BRIGHTNESS,
     CONF_WHITE_FROM_RGB,
     CONF_COLOR_TEMP_REVERSE,
     CONF_MUSIC_MODE,
@@ -161,6 +162,14 @@ class Mode:
 MAP_MODE_SET = {0: Mode(), 1: Mode(color=MODE_MANUAL)}
 
 
+def max_percent(value) -> int:
+    """Предел яркости из настроек: 10-100 %, по умолчанию без предела."""
+    try:
+        return min(100, max(10, int(value)))
+    except (TypeError, ValueError):
+        return 100
+
+
 def map_range(
     value: int, from_min: int, from_max: int, to_min=0, to_max=255, reverse=False
 ):
@@ -197,6 +206,9 @@ def flow_schema(dps):
         ),
         vol.Optional(CONF_COLOR_TEMP_REVERSE, default=DEFAULT_COLOR_TEMP_REVERSE): bool,
         vol.Optional(CONF_WHITE_FROM_RGB, default=False): bool,
+        vol.Optional(CONF_MAX_BRIGHTNESS, default=100): vol.All(
+            vol.Coerce(int), vol.Range(min=10, max=100)
+        ),
         vol.Optional(CONF_SCENE): col_to_select(dps, is_dps=True),
         vol.Optional(CONF_SCENE_VALUES, default={}): selector.ObjectSelector(),
         vol.Optional(CONF_MUSIC_MODE, default=False): selector.BooleanSelector(),
@@ -225,6 +237,9 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
     # Ручная калибровка - цвета, подогнанные на глаз. Пока они есть, команда
     # считается по ним, а калибровка камерой не используется.
     _points: ColourPoints | None = None
+    # Предел яркости, %. С объекта: на полной лента мерцает - блок питания
+    # не тянет все три канала разом. 100% в Home Assistant - этот предел.
+    _max_percent = 100
 
     def __init__(
         self,
@@ -258,6 +273,7 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
         self._calibration = Calibration.load(self._config.get(CONF_COLOR_CALIBRATION))
         self._white_from_rgb = bool(self._config.get(CONF_WHITE_FROM_RGB))
         self._points = ColourPoints.load(self._config.get(CONF_COLOR_POINTS))
+        self._max_percent = max_percent(self._config.get(CONF_MAX_BRIGHTNESS))
 
         if self._config.get(CONF_MUSIC_MODE):
             self._effect_list.append(SCENE_MUSIC)
@@ -331,7 +347,7 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
         """Return the brightness of the light."""
         brightness = self._brightness
         if brightness is not None and (self.is_color_mode or self.is_white_mode):
-            return map_range(brightness, self._lower_brightness, self._upper_brightness)
+            return map_range(brightness, self._lower_brightness, self._brightness_cap)
         return None
 
     @property
@@ -627,7 +643,7 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
                 0,
                 255,
                 self._lower_brightness,
-                self._upper_brightness,
+                self._brightness_cap,
             )
             brightness = max(brightness, self._lower_brightness)
 
@@ -669,7 +685,7 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
         if ATTR_HS_COLOR in kwargs and ColorMode.HS in color_modes:
             if brightness is None:
-                brightness = self._brightness
+                brightness = self.__capped(self._brightness)
             hs = kwargs[ATTR_HS_COLOR]
             if hs[1] == 0 and self.has_config(CONF_BRIGHTNESS) and not self.__white_by_colour():
                 states[self._config.get(CONF_BRIGHTNESS)] = brightness
@@ -685,17 +701,17 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
             self.__white_by_colour()
         ):
             if brightness is None:
-                brightness = self._brightness
+                brightness = self.__capped(self._brightness)
             kelvin = int(kwargs[ATTR_COLOR_TEMP_KELVIN])
             sent = self.__kelvin_command(kelvin)
             states[self._config.get(CONF_COLOR)] = self.__to_color(
-                sent, self._upper_brightness if brightness is None else brightness
+                sent, self._brightness_cap if brightness is None else brightness
             )
             color_mode = self._modes.color
             self._ct_emulated = (kelvin, sent)
         elif ATTR_COLOR_TEMP_KELVIN in kwargs and ColorMode.COLOR_TEMP in color_modes:
             if brightness is None:
-                brightness = self._brightness
+                brightness = self.__capped(self._brightness)
             self._ct_emulated = None
 
             color_temp = map_range(
@@ -717,11 +733,11 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
         if ATTR_WHITE in kwargs and ColorMode.WHITE in color_modes:
             if brightness is None:
-                brightness = self._brightness
+                brightness = self.__capped(self._brightness)
             if self.__white_by_colour():
                 states[self._config.get(CONF_COLOR)] = self.__to_color(
                     self.__device_hs((0, 0)),
-                    self._upper_brightness if brightness is None else brightness,
+                    self._brightness_cap if brightness is None else brightness,
                 )
                 color_mode = self._modes.color
             else:
@@ -738,7 +754,7 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
             # бы пустым белым каналом и осталась тёмной. Включаем белым из RGB.
             states[self._config.get(CONF_COLOR)] = self.__to_color(
                 self.__device_hs((0, 0)),
-                self._brightness if self._brightness is not None else self._upper_brightness,
+                self.__capped(self._brightness),
             )
             color_mode = self._modes.color
 
@@ -811,6 +827,33 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
         return self._calibration
 
     @property
+    def _brightness_cap(self) -> int:
+        """Самая большая яркость, которую лента получает (в шкале датапоинта)."""
+        cap = round(self._upper_brightness * self._max_percent / 100)
+        return max(cap, self._lower_brightness + 1)
+
+    def __capped(self, brightness):
+        """Яркость не выше предела; неизвестная - сам предел."""
+        if brightness is None:
+            return self._brightness_cap
+        return min(brightness, self._brightness_cap)
+
+    @property
+    def max_brightness_percent(self) -> int:
+        return self._max_percent
+
+    async def async_set_max_brightness(self, percent) -> None:
+        """Применить предел яркости сразу: горящая лента сразу убавляется."""
+        level = self.brightness if self.is_on else None
+        self._max_percent = max_percent(percent)
+        self.status_updated()
+        self.async_write_ha_state()
+        if level is not None and self._brightness is not None and (
+            self._brightness > self._brightness_cap or level >= 255
+        ):
+            await self.async_turn_on(brightness=min(level, 255))
+
+    @property
     def colour_points(self) -> ColourPoints | None:
         return self._points
 
@@ -856,7 +899,7 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
         sent = calibration.to_device(hs) if calibration else (float(hs[0]), float(hs[1]))
         states = {
             self._dp_id: True,
-            self._config.get(CONF_COLOR): self.__to_color(sent, self._upper_brightness),
+            self._config.get(CONF_COLOR): self.__to_color(sent, self._brightness_cap),
         }
         if mode_dp := self._config.get(CONF_COLOR_MODE):
             states[mode_dp] = self._modes.color
@@ -872,7 +915,7 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
         if mode_dp := self._config.get(CONF_COLOR_MODE):
             states[mode_dp] = self._modes.white
         if (bright_dp := self._config.get(CONF_BRIGHTNESS)) is not None:
-            states[bright_dp] = self._upper_brightness
+            states[bright_dp] = self._brightness_cap
         if (temp_dp := self._config.get(CONF_COLOR_TEMP)) is not None:
             wanted = min(6500, self.max_color_temp_kelvin) if kelvin is None else kelvin
             # Так же, как температуру пересчитывает обычное управление.
@@ -954,7 +997,7 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
                     # status callback and froze the entity's whole update.
                     self.debug("Ignoring undecodable colour %r (%s)", color, ex)
             elif self._brightness is None:
-                self._brightness = self._upper_brightness
+                self._brightness = self._brightness_cap
 
         if ColorMode.COLOR_TEMP in self.supported_color_modes:
             self._color_temp = self.dp_value(CONF_COLOR_TEMP)

@@ -211,6 +211,7 @@
           "color_temp": "Color Temperature",
           "color_temp_reverse": "Reverse Color Temperature?",
           "white_from_rgb": "White from RGB (the strip has no white LEDs)",
+          "max_brightness": "Maximum brightness, % (if the strip flickers at full brightness)",
           "color": "Color",
           "color_mode": "Color Mode aka Work Mode",
           "color_temp_min_kelvin": "Minimum Color Temperature in K",

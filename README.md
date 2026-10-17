@@ -117,6 +117,13 @@ the license text.
   was gone - and all 40 devices on the address were down, the healthy hub's
   included. A hub that announces itself later corrects the choice with one
   reload.
+- Maximum brightness limit for a strip that flickers at full brightness
+  (the power supply cannot carry all three channels at once): set in the
+  manual calibration screen («Максимальная яркость», applied and saved at
+  once) or in the entity settings. 100% in Home Assistant becomes that
+  limit - for both colour formats, including addressable strips - a colour
+  change never climbs back above it, the calibration preview stays under
+  it, and a strip already lit at full is dimmed straight away.
 - Manual calibration presets in sections: «Цвета Home Assistant» - exactly
   the circles on the light's card in Home Assistant (four colour
   temperatures spread over the lamp's own range, as the frontend computes

@@ -156,6 +156,61 @@ class InHomeAssistant(unittest.TestCase):
         self.assertEqual(ent.color_temp_kelvin, 3000)
 
 
+class MaxBrightness(unittest.TestCase):
+    """С объекта: «в калибровке добавь ограничение макс яркости, а то
+    мерцает» - на полной блок питания не тянет все три канала разом."""
+
+    def light(self, percent, paint=False):
+        ent = tc.make_light(paint=paint)
+        ent._max_percent = percent
+        ent.async_write_ha_state = lambda: None
+        return ent
+
+    def value(self, ent, paint=False):
+        colour = ent.sent[-1]["61" if paint else tc.COLOUR]
+        if paint:
+            import base64
+            data = base64.b64decode(colour)
+            return int.from_bytes(data[9:11], "big")
+        return int(colour[8:12], 16)
+
+    def test_full_brightness_in_home_assistant_is_the_limit(self):
+        for paint in (False, True):
+            ent = self.light(80, paint)
+            asyncio.run(ent.async_turn_on(hs_color=(200, 70), brightness=255))
+            self.assertEqual(self.value(ent, paint), 800, paint)
+            ent.status_updated()
+            self.assertEqual(ent.brightness, 255, "предел показывается как 100%")
+
+    def test_a_colour_change_does_not_climb_back_to_full(self):
+        ent = self.light(70)
+        ent._brightness = 1000  # лента горит на полной - включали из приложения
+        asyncio.run(ent.async_turn_on(hs_color=(120, 80)))
+        self.assertEqual(self.value(ent), 700)
+
+    def test_calibration_preview_respects_the_limit(self):
+        ent = self.light(60)
+        asyncio.run(ent.async_show_calibration_colour((0, 0)))
+        self.assertEqual(int(ent.confirmed[-1][tc.COLOUR][8:12], 16), 600)
+
+    def test_setting_the_limit_dims_a_lit_strip_at_once(self):
+        ent = self.light(100)
+        ent._status[tc.COLOUR] = "00c802bc03e8"
+        ent.status_updated()
+        asyncio.run(ent.async_set_max_brightness(75))
+        self.assertEqual(self.value(ent), 750)
+
+    def test_without_a_limit_nothing_changes(self):
+        ent = self.light(100)
+        asyncio.run(ent.async_turn_on(hs_color=(200, 70), brightness=255))
+        self.assertEqual(self.value(ent), 1000)
+
+    def test_option_and_bounds(self):
+        keys = [getattr(k, "schema", k) for k in tc.light_mod.flow_schema(["20", "21"]).keys()]
+        self.assertIn("max_brightness", keys)
+        self.assertEqual([tc.light_mod.max_percent(v) for v in (None, "x", 5, 80, 150)], [100, 100, 10, 80, 100])
+
+
 def load_points_ws():
     tc.load_calibration_ws()
     return importlib.import_module("custom_components.bms_integration.color_points_ws")
@@ -213,6 +268,25 @@ class PanelCommands(unittest.TestCase):
         self.call(self.ws.ws_save, points=[])
         self.assertEqual(self.stored[-1], ("color_points", None))
         self.assertIsNone(self.light.colour_points)
+
+    def test_max_brightness_is_stored_and_reported(self):
+        cal_ws = sys.modules["custom_components.bms_integration.calibration_ws"]
+        stored = []
+
+        async def fake_store(hass, entity, key, value):
+            stored.append((key, value))
+
+        real = cal_ws._async_store_option
+        cal_ws._async_store_option = fake_store
+        try:
+            asyncio.run(cal_ws.ws_max_brightness(self.hass, self.conn, {"id": 1, "entity_id": "light.x", "percent": 80}))
+            asyncio.run(cal_ws.ws_max_brightness(self.hass, self.conn, {"id": 1, "entity_id": "light.x", "percent": 100}))
+        finally:
+            cal_ws._async_store_option = real
+        self.assertEqual(stored, [("max_brightness", 80), ("max_brightness", None)])
+        self.assertEqual(self.conn.results[-1]["percent"], 100)
+        self.call(self.ws.ws_get)
+        self.assertEqual(self.conn.results[-1]["max_brightness"], 100)
 
     def test_broken_draft_is_an_error_in_words(self):
         self.call(self.ws.ws_save, points=[{"target": [0, 0]}])

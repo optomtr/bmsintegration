@@ -112,6 +112,13 @@ export function groupPresets(list) {
   return groups;
 }
 
+/** Предел яркости, %: 10-100 шагом 5, мусор - без предела. */
+export function clampPercent(v) {
+  const n = Math.round(Number(v));
+  if (!Number.isFinite(n)) return 100;
+  return Math.min(100, Math.max(10, n));
+}
+
 /** «1 цвет», «3 цвета», «24 цвета», «5 цветов». */
 export function colours(n) {
   const m10 = n % 10, m100 = n % 100;
@@ -485,6 +492,12 @@ function defineOverlay() {
         <div class="card"><div class="row"><span class="lh grow">Цвета</span>${d.length ? `<span class="mut">${d.length} из ${this.max}</span>` : ""}</div>
           ${rows ? `<div class="pts">${rows}</div>` : `<p class="mut">Пока нет ни одного цвета. Начните с белого.</p>`}</div>
         <div class="card"><div class="lh" id="add-h">Добавить цвет</div>${add}</div>
+        <div class="card"><div class="row"><span class="lh grow" id="max-h">Максимальная яркость</span>
+          <span class="mut" aria-live="polite">${this.maxPct ?? 100}%</span></div>
+          <p class="mut">Если лента мерцает на полной яркости — убавьте: 100% в Home Assistant станет этим пределом. Сохраняется сразу.</p>
+          <div class="btns" role="group" aria-labelledby="max-h">
+            ${btn("‹ Меньше", "max-step", "", `data-d="-5" aria-label="Убавить предел яркости" ${this.maxBusy || (this.maxPct ?? 100) <= 10 ? "disabled" : off}`)}
+            ${btn("Больше ›", "max-step", "", `data-d="5" aria-label="Прибавить предел яркости" ${this.maxBusy || (this.maxPct ?? 100) >= 100 ? "disabled" : off}`)}</div></div>
         ${btn("Проверить любой цвет", "test", "", off)}
         ${dirty ? `<p class="note">Изменения ещё не сохранены — нажмите «Сохранить всё».</p>` : ""}
         ${error}
@@ -646,6 +659,25 @@ function defineOverlay() {
       if (a === "reset-ask") { this.err = ""; return this.go("confirm-reset"); }
       if (a === "reset") return this.reset();
       if (a === "pv-again") { const v = this.previewValue(); if (v) this.preview.now(v); }
+      if (a === "max-step") return this.stepMax(Number(el.dataset.d));
+    }
+
+    /** Предел яркости: сразу на сервер, лента убавляется сразу. */
+    async stepMax(delta) {
+      if (this.maxBusy) return;
+      const next = clampPercent((this.maxPct ?? 100) + delta);
+      if (next === this.maxPct) return;
+      this.maxBusy = true; this.render(false);
+      try {
+        const res = await this.o.ws("color_calibration/max_brightness", { entity_id: this.id, percent: next });
+        this.maxPct = clampPercent(res?.percent ?? next);
+        // Пробный цвет на ленте - тот же, но уже с новым пределом.
+        if (this.lastHs && !this.closed) await this.o.ws("color_calibration/show", showPayload(this.id, this.lastHs));
+      } catch (err) {
+        this.o.toast?.(err?.message || "Не удалось задать предел яркости", true);
+      } finally {
+        this.maxBusy = false; this.render(false);
+      }
     }
 
     onSlide(e, how) {
@@ -765,6 +797,7 @@ function defineOverlay() {
         if (this.step === "test" && this.t && sameHs(this.t.target, v.target)) { this.t.device = hs; this.paintHs(); }
       }
       await this.call("color_calibration/show", showPayload(this.id, hs), token);
+      this.lastHs = hs;
       this.touched = Date.now();
     }
 
@@ -835,6 +868,7 @@ function defineOverlay() {
         this.info = info && typeof info === "object" ? info : {};
         if (!this.info.supported) return this.go("unsupported");
         this.presets = normPresets(this.info.presets);
+        this.maxPct = clampPercent(this.info.max_brightness);
         this.max = maxPoints(this.info);
         this.saved = normPoints(this.info.points);
         this.draft = this.saved.slice();
