@@ -117,6 +117,16 @@ the license text.
   was gone - and all 40 devices on the address were down, the healthy hub's
   included. A hub that announces itself later corrects the choice with one
   reload.
+- Manual colour calibration, tuned by eye. The camera result did not suit
+  the owner ("не то"), so a strip's card in the BMS panel gets «Ручная
+  калибровка»: pick a colour (white, 3000 K, 4000 K, nine colours or your
+  own), move two sliders - hue and saturation of what the strip receives -
+  watching the strip change live until it looks like the swatch on the
+  phone, and save the colour. The points themselves go out exactly; every
+  other colour, white and colour temperature is taken smoothly from the
+  nearest points, and Home Assistant shows the colour that was chosen. Any
+  colour can be tried before saving. While there are manual colours they
+  are used instead of the camera calibration; clearing them brings it back.
 - White from RGB: for an RGB strip on an RGB+W controller (the strip has no
   white LEDs), white lit the controller's empty white channel and the strip
   went dark. A light now has the option "White from RGB (the strip has no

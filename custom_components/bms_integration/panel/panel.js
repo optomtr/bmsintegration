@@ -35,9 +35,11 @@ const MONO = "ui-monospace,'SF Mono',Menlo,monospace";
 const moduleUrlFrom = (stack) =>
   (/https?:\/\/[^\s()]+?\/panel\.js(?:\?[^\s():]*)?/.exec(String(stack || "")) || [""])[0];
 const SELF_URL = (() => { try { throw new Error(); } catch (err) { return moduleUrlFrom(err.stack); } })();
-const calibrationUrl = (self = SELF_URL) => self
-  ? new URL(`calibration.js${new URL(self).search}`, self).href
-  : `/bms_integration_panel/calibration.js?t=${Date.now()}`;
+const panelAssetUrl = (name, self = SELF_URL) => self
+  ? new URL(`${name}${new URL(self).search}`, self).href
+  : `/bms_integration_panel/${name}?t=${Date.now()}`;
+const calibrationUrl = (self = SELF_URL) => panelAssetUrl("calibration.js", self);
+const manualColorsUrl = (self = SELF_URL) => panelAssetUrl("manual_colors.js", self);
 
 // Состояния из брифа: явный текст + цвет + иконка, никогда только цвет.
 const ST = {
@@ -203,6 +205,8 @@ class BmsControlCenter extends HTMLElement {
     this._err = null;
     // entity_id света -> { info } | { pending } | { failed: время }.
     this._calibInfo = {};
+    // То же для ручной калибровки (color_points/get).
+    this._pointsInfo = {};
   }
 
   set hass(hass) {
@@ -303,7 +307,7 @@ class BmsControlCenter extends HTMLElement {
         }));
       if (sc === "device" && devId)
         jobs.push(this.ws("device", { device_id: devId })
-          .then((r) => { if (this.s.deviceId === devId) { this.d.device = r; this.loadCalibInfo(r); } })
+          .then((r) => { if (this.s.deviceId === devId) { this.d.device = r; this.loadCalibInfo(r); this.loadPointsInfo(r); } })
           .catch(() => { if (this.s.deviceId === devId) this.d.device = null; }));
       if (sc === "add") {
         jobs.push(this.ws("discovered").then((r) => { if (onScreen()) this.d.discovered = r; }));
@@ -1073,6 +1077,22 @@ class BmsControlCenter extends HTMLElement {
     }
   }
 
+  // Ручные точки цвета - тем же порядком: по разу на свет, сбой не чаще
+  // раза в минуту. Отдельно от loadCalibInfo: у старого сервера этой
+  // команды нет, а кнопка калибровки камерой от этого пропадать не должна.
+  loadPointsInfo(d) {
+    for (const e of d?.device?.entities || []) {
+      if (e.domain !== "light" || e.disabled) continue;
+      const c = this._pointsInfo[e.entity_id];
+      if (c && !(c.failed && Date.now() - c.failed > 60000)) continue;
+      this._pointsInfo[e.entity_id] = { pending: true };
+      this.ws("color_points/get", { entity_id: e.entity_id })
+        .then((info) => { this._pointsInfo[e.entity_id] = { info }; })
+        .catch(() => { this._pointsInfo[e.entity_id] = { failed: Date.now() }; })
+        .finally(() => { if (this.s.screen === "device") this.paint(true); });
+    }
+  }
+
   calibCard(d) {
     const lights = (d.device.entities || []).filter((e) =>
       e.domain === "light" && this._calibInfo[e.entity_id]?.info?.supported);
@@ -1081,12 +1101,17 @@ class BmsControlCenter extends HTMLElement {
       <div>${lights.map((e) => {
         const info = this._calibInfo[e.entity_id].info;
         const when = info.calibrated_at ? new Date(info.calibrated_at) : null;
-        const status = !info.calibrated ? "Не откалибрована"
+        const manual = this._pointsInfo[e.entity_id]?.info;
+        const points = manual?.supported && Array.isArray(manual.points) ? manual.points.length : 0;
+        // Пока есть ручные цвета, камера не используется - статус говорит о них.
+        const status = points ? `Ручная: ${plural(points, "цвет", "цвета", "цветов")}`
+          : !info.calibrated ? "Не откалибрована"
           : when && !Number.isNaN(when.getTime()) ? `Откалибрована ${when.toLocaleDateString("ru-RU")}` : "Откалибрована";
         return `<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 16px;border-bottom:1px solid ${C.div}">
           <span style="flex:1 1 160px;min-width:0"><span style="display:block;font-size:13px;font-weight:600;color:${C.ink}">${esc(e.name)}</span>
-            <span class="small" style="color:${info.calibrated ? C.ok : C.mut2}">${status}</span></span>
+            <span class="small" style="color:${points || info.calibrated ? C.ok : C.mut2}">${esc(status)}</span></span>
           ${btn("Калибровка цвета", { act: "calib-open", data: `data-eid="${esc(e.entity_id)}"`, primary: true, ico: "i-eye" })}
+          ${manual?.supported ? btn("Ручная калибровка", { act: "manual-open", data: `data-eid="${esc(e.entity_id)}"`, ico: "i-sliders" }) : ""}
           ${btn(info.white_from_rgb ? "Белый из RGB: включено" : "Белый из RGB: выключено",
             { act: "white-rgb", data: `data-eid="${esc(e.entity_id)}" data-on="${info.white_from_rgb ? "0" : "1"}" aria-pressed="${info.white_from_rgb ? "true" : "false"}" title="Белых светодиодов на ленте нет: белый и температуры собирать из RGB"`, ico: "i-gear" })}
         </div>`;
@@ -1110,7 +1135,9 @@ class BmsControlCenter extends HTMLElement {
   }
 
   async openCalibration(entityId) {
-    if (this._calib) return;
+    // Одно окно на панель, и пока модуль грузится - тоже.
+    if (this._calib || this._calibOpening) return;
+    this._calibOpening = true;
     const ent = (this.d.device?.device?.entities || []).find((e) => e.entity_id === entityId);
     try {
       this._calibMod ||= import(calibrationUrl());
@@ -1129,6 +1156,36 @@ class BmsControlCenter extends HTMLElement {
     } catch (err) {
       this._calibMod = null;
       this.toast(`Не удалось открыть калибровку: ${err?.message || err}`, true);
+    } finally {
+      this._calibOpening = false;
+    }
+  }
+
+  async openManualColors(entityId) {
+    // Модуль грузится не мгновенно: второе касание за это время открыло бы второе окно.
+    if (this._calib || this._calibOpening) return;
+    this._calibOpening = true;
+    const ent = (this.d.device?.device?.entities || []).find((e) => e.entity_id === entityId);
+    try {
+      this._manualMod ||= import(manualColorsUrl());
+      const mod = await this._manualMod;
+      // Одно окно на панель: disconnectedCallback закрывает и это.
+      this._calib = mod.openManualColors({
+        entityId, name: ent?.name || entityId,
+        ws: (type, payload) => this.ws(type, payload),
+        toast: (text, bad) => this.toast(text, bad),
+        onClose: (changed) => {
+          this._calib = null;
+          if (!changed) return;
+          delete this._pointsInfo[entityId];
+          if (this.d.device) this.loadPointsInfo(this.d.device);
+        },
+      });
+    } catch (err) {
+      this._manualMod = null;
+      this.toast(`Не удалось открыть ручную калибровку: ${err?.message || err}`, true);
+    } finally {
+      this._calibOpening = false;
     }
   }
 
@@ -1734,6 +1791,7 @@ class BmsControlCenter extends HTMLElement {
     if (a === "nav") return this.go(el.dataset.nav);
     if (a === "dtab") { this.s.deviceTab = el.dataset.tab; return this.paint(); }
     if (a === "calib-open") return this.openCalibration(el.dataset.eid);
+    if (a === "manual-open") return this.openManualColors(el.dataset.eid);
     if (a === "white-rgb") return this.setWhiteFromRgb(el, el.dataset.eid, el.dataset.on === "1");
     if (a === "refresh") return this.refresh();
     if (a === "expert") { this.s.expert = !this.s.expert; return this.paint(); }
