@@ -642,5 +642,46 @@ class PanelCommands(unittest.TestCase):
         self.assertEqual(sent, ["open", "stop", "close"])
 
 
+    def test_goto_sends_the_raw_number_past_the_calibration(self):
+        # Край ищут на глаз: «встань на 95» уходит мотору как есть, даже
+        # если калибровка уже есть и пересчитала бы 95 во что-то другое.
+        self.call(self.ws.ws_set, open_raw=7, closed_raw=100)
+        self.motor.commands.clear()
+        self.call(self.ws.ws_goto, raw=95)
+        self.assertEqual(self.conn.errors, [])
+        self.assertIn((SET_DP, 95), self.motor.commands)
+        self.cover._calibrating = True
+        self.call(self.ws.ws_goto, raw=50)
+        self.assertEqual(self.conn.errors[-1][0], "failed")
+        self.assertNotIn((SET_DP, 50), self.motor.commands)
+
+    def test_motor_that_reports_nothing_is_calibrated_by_hand(self):
+        # Нет датапоинта положения - автоматически нельзя, но края
+        # вписываются руками, а команды «на процент» пересчитываются.
+        self.cover._config.pop("current_position_dp")
+        info = self.info()
+        self.assertTrue(info["supported"])
+        self.assertEqual((info["can_auto"], info["can_goto"], info["has_reading"]), (False, True, False))
+        self.call(self.ws.ws_run)
+        self.assertEqual(self.conn.errors[-1][0], "not_supported")
+        self.assertEqual(self.tasks, [])
+        self.call(self.ws.ws_set, open_raw=7, closed_raw=100)
+        self.assertEqual(self.cover._config["position_open_raw"], 7)
+        self.assertEqual(cover_mod.position_to_device(100, self.cover._config), 7)
+
+    def test_no_goto_without_a_position_command(self):
+        self.cover._config.pop("set_position_dp")
+        info = self.info()
+        self.assertTrue(info["supported"])
+        self.assertFalse(info["can_goto"])
+        self.call(self.ws.ws_goto, raw=95)
+        self.assertEqual(self.conn.errors[-1][0], "failed")
+        self.assertIn("не принимает", self.conn.errors[-1][1])
+
+    def test_neither_reading_nor_command_is_refused(self):
+        self.cover._config.pop("set_position_dp")
+        self.cover._config.pop("current_position_dp")
+        self.assertFalse(self.info()["supported"])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

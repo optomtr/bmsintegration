@@ -464,6 +464,36 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
             CONF_POSITIONING_MODE
         ) == MODE_SET_POSITION and self.has_config(CONF_CURRENT_POSITION_DP)
 
+    @property
+    def can_calibrate_manually(self) -> bool:
+        """Края руками: штора с положением в процентах - по показанию или по команде.
+
+        Мотор, который положение не сообщает, всё равно понимает «встань на
+        N»: край находят на глаз, отправляя числа, и вписывают руками.
+        """
+        return self._config.get(CONF_POSITIONING_MODE) == MODE_SET_POSITION and (
+            self.has_config(CONF_CURRENT_POSITION_DP)
+            or self.has_config(CONF_SET_POSITION_DP)
+        )
+
+    async def async_goto_raw(self, raw: int) -> None:
+        """Отправить мотору положение как есть, мимо калибровки.
+
+        Так ищут край на глаз: «встань на 95» - штора встала, где мотор
+        считает 95, и видно, открыта ли она там полностью.
+        """
+        if not self.has_config(CONF_SET_POSITION_DP):
+            raise HomeAssistantError("Эта штора не принимает команду положения.")
+        if getattr(self, "_calibrating", False):
+            raise HomeAssistantError("Идёт калибровка - дождитесь её конца.")
+        raw = int(raw)
+        if not 0 <= raw <= 100:
+            raise HomeAssistantError("Положение мотора - от 0 до 100.")
+        if self._current_state != STATE_STOPPED:
+            await self.async_stop_cover()
+        await self._device.set_dp(raw, self._config[CONF_SET_POSITION_DP])
+        self.update_state(STATE_SET_CMD, position_from_device(raw, self._config))
+
     def _raw_position(self) -> float | None:
         """Положение, как его сообщает мотор, без калибровки и инверсии."""
         value = self.dp_value(CONF_CURRENT_POSITION_DP)

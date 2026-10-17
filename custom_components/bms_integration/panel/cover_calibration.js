@@ -5,8 +5,10 @@
  * На объекте мотор считал в обратную сторону и не доходил до края шкалы:
  * закрытая штора показывала 100, открытая 7. Владелец попросил настраивать это
  * через интерфейс, как калибровку цвета. Два пути: автоматически (штора сама
- * едет в оба края, сервер записывает показания) и вручную (человек доводит
- * штору кнопками и говорит «это открыто», «это закрыто»).
+ * едет в оба края, сервер записывает показания) и полностью вручную: край
+ * вписывают числом или подгоняют кнопками − и +, «Поехать сюда» отправляет
+ * мотор ровно на это число - видно, где встанет штора. Мотору, который
+ * положение не сообщает, хватает и этого.
  *
  * Панель грузит модуль лениво и даёт ему только ws(name, payload),
  * toast(text, bad) и onClose(changed). Сверху - чистые функции: они
@@ -36,6 +38,9 @@ export function normInfo(info) {
     position: rawValue(i.position),
     state: typeof i.state === "string" ? i.state : "",
     calibrating: i.calibrating === true,
+    canAuto: i.can_auto === true,
+    canGoto: i.can_goto === true,
+    hasReading: i.has_reading === true,
     lastRun: run && typeof run.text === "string"
       ? { ok: run.ok === true, text: run.text, at: Number(run.at) || 0 } : null,
   };
@@ -50,12 +55,31 @@ export function endsText(open, closed) {
 
 /** Почему края нельзя сохранить; пустая строка - можно. */
 export function saveProblem(open, closed) {
-  if (open === null || closed === null) return "Отметьте оба края.";
+  if (open === null || closed === null) return "Задайте оба края.";
   if (Math.abs(open - closed) < MIN_SPREAD) {
     return `Края почти совпадают (${open} и ${closed}) — штору не довели до края.`;
   }
   return "";
 }
+
+/** Вписанное руками: пусто или не число - края нет; за шкалой - край шкалы. */
+export function parseRaw(text) {
+  const t = String(text ?? "").trim().replace(",", ".");
+  if (!t) return null;
+  const n = Number(t);
+  return Number.isFinite(n) ? rawValue(n) : null;
+}
+
+/** Кнопки − и +: шаг 1 в пределах 0..100. Пустой край начинается с
+ *  запасного значения (показание мотора или конец шкалы). */
+export function stepEnd(value, dir, fallback) {
+  if (value === null || value === undefined) return rawValue(fallback);
+  return rawValue(value + Math.sign(Number(dir) || 0));
+}
+
+/** С чего начать пустой край: с того, что показывает мотор, а без
+ *  показания - с конца шкалы, как штора без калибровки. */
+export const startFor = (which, raw) => (raw !== null && raw !== undefined ? raw : which === "open" ? 100 : 0);
 
 const STATES = { open: "Открыта", closed: "Закрыта", opening: "Открывается", closing: "Закрывается",
   unavailable: "Недоступна", unknown: "Неизвестно" };
@@ -72,6 +96,7 @@ export function freshRun(info, prevAt) {
 
 // ============================================================== окно ==
 const TAG = "bms-cover-calibration";
+const ENDS = [["open", "Открыто"], ["closed", "Закрыто"]];
 
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -106,16 +131,21 @@ p{margin:0}.mut{color:#9AA7B4;font-size:14px}
 .b.pri{background:#006FFF;border-color:#006FFF;color:#fff}
 .b.dan{background:transparent;border-color:#6A2B35;color:#FF8592}
 .b:disabled{opacity:.45;cursor:not-allowed}
-button:focus-visible{outline:3px solid #8DBBFF;outline-offset:2px}
+button:focus-visible,input:focus-visible{outline:3px solid #8DBBFF;outline-offset:2px}
 .card{background:#141C25;border:1px solid #222D39;border-radius:14px;padding:14px;display:flex;flex-direction:column;gap:12px}
 .now{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .now div{display:flex;flex-direction:column;gap:2px;min-width:0}
 .big{font-size:30px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.1}
 .lh{font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#9AA7B4}
 .btns{display:flex;flex-wrap:wrap;gap:8px}.btns .b{flex:1 1 84px;min-width:0;padding:8px 6px}
-.end{display:flex;align-items:center;gap:12px}
-.end .v{flex:none;min-width:84px}.end .v b{font-size:22px;font-variant-numeric:tabular-nums}
-.end .b{flex:1}
+.endc{display:flex;flex-direction:column;gap:8px;padding-top:12px;border-top:1px solid #222D39}
+.step{display:flex;align-items:center;gap:8px}
+.nb{width:52px;height:52px;flex:none;border-radius:12px;border:1px solid #2B3744;background:#18212B;color:#EEF2F6;
+  font:inherit;font-size:26px;font-weight:600;line-height:1;cursor:pointer;touch-action:manipulation;padding:0}
+.nb:disabled{opacity:.45;cursor:not-allowed}
+.step input{flex:1;min-width:0;height:52px;border-radius:12px;border:1px solid #2B3744;background:#0D1319;color:#EEF2F6;
+  font:inherit;font-size:24px;font-weight:700;text-align:center;font-variant-numeric:tabular-nums;padding:0 8px}
+.step input::placeholder{color:#5B6875}
 .ok{border-left:3px solid #3DD68C;padding:2px 0 2px 10px;color:#BDF0D5;font-size:14px}
 .note{border-left:3px solid #F0B429;padding:2px 0 2px 10px;color:#E8D6A8;font-size:14px}
 .err{border-left:3px solid #FF5A6A;padding:2px 0 2px 10px;color:#FFB3BB;font-size:14px}
@@ -146,7 +176,9 @@ function defineOverlay() {
     setup(o) {
       this.o = o;
       this.id = o.entityId;
-      Object.assign(this, { info: null, loadErr: "", err: "", open: null, closed: null, busy: false,
+      // open/closed - края на экране (вписанные, подогнанные или взятые с
+      // мотора); seeded - подставлены ли сохранённые при первом ответе.
+      Object.assign(this, { info: null, loadErr: "", err: "", open: null, closed: null, seeded: false, busy: false,
         started: false, prevAt: 0, result: null, confirmReset: false, changed: false, closed_: false, polling: false });
     }
 
@@ -157,6 +189,8 @@ function defineOverlay() {
       this.$ = (id) => root.getElementById(id);
       this.$("name").textContent = this.o.name || this.id;
       root.addEventListener("click", (e) => this.onClick(e));
+      root.addEventListener("input", (e) => this.onInput(e));
+      root.addEventListener("change", (e) => this.onChange(e));
       root.addEventListener("keydown", (e) => this.onKey(e));
       this.render();
       this.poll();
@@ -172,11 +206,15 @@ function defineOverlay() {
       try {
         this.info = normInfo(await this.o.ws("cover_calibration/info", { entity_id: this.id }));
         this.loadErr = "";
+        if (!this.seeded && this.info.supported) {
+          // Сохранённые края - в поля: подгонять их, а не начинать с нуля.
+          Object.assign(this, { open: this.info.open, closed: this.info.closed, seeded: true });
+        }
         const run = this.started ? freshRun(this.info, this.prevAt) : null;
         if (run) {
           this.started = false;
           this.result = run;
-          if (run.ok) this.changed = true;
+          if (run.ok) Object.assign(this, { changed: true, open: this.info.open, closed: this.info.closed });
           this.$("sr").textContent = run.text;
         }
       } catch (err) {
@@ -184,20 +222,81 @@ function defineOverlay() {
       } finally {
         this.polling = false;
       }
-      if (!this.closed_) this.render();
+      if (!this.closed_) this.paint();
+    }
+
+    get running() { return Boolean(this.info?.calibrating || this.started); }
+
+    // Опрос раз в секунду меняет только числа сверху. Разметку целиком
+    // перерисовывает лишь перемена устройства экрана: иначе поле, в котором
+    // человек печатает, пересоздавалось бы под пальцами каждую секунду.
+    structure() {
+      const i = this.info;
+      return JSON.stringify([this.loadErr, this.err, this.busy, this.running, this.result, this.open, this.closed,
+        this.confirmReset, i && [i.supported, i.reason, i.canAuto, i.canGoto, i.hasReading, i.open, i.closed, i.raw === null]]);
+    }
+
+    paint() {
+      if (this.structure() !== this._key) return this.render();
+      const i = this.info;
+      if (!i?.supported) return;
+      this.$("raw").textContent = num(i.raw);
+      this.$("pos").textContent = i.position === null ? "—" : `${i.position}%`;
+      this.$("st").textContent = stateText(i.state);
     }
 
     render() {
       if (!this.shadowRoot) return;
       const c = this.$("c");
-      // Опрос раз в секунду: без перемен разметку не трогать, иначе касание,
-      // пришедшееся на перерисовку, теряется вместе со старой кнопкой.
-      const html = this.view();
-      if (html === this._html) return;
-      this._html = html;
-      const focusAct = this.shadowRoot.activeElement?.dataset?.act;
-      c.innerHTML = html;
-      if (focusAct) c.querySelector(`[data-act="${focusAct}"]:not([disabled])`)?.focus();
+      this._key = this.structure();
+      const active = this.shadowRoot.activeElement;
+      const focus = active?.dataset?.act ? `[data-act="${active.dataset.act}"]`
+        : active?.dataset?.k ? `[data-k="${active.dataset.k}"]` : "";
+      c.innerHTML = this.view();
+      const el = focus && c.querySelector(`${focus}:not([disabled])`);
+      if (el) {
+        el.focus();
+        if (el.setSelectionRange) el.setSelectionRange(el.value.length, el.value.length);
+      }
+    }
+
+    /** Дирти/проблема краёв - без перерисовки, пока человек печатает. */
+    check() {
+      const i = this.info;
+      const problem = saveProblem(this.open, this.closed);
+      const dirty = this.open !== i?.open || this.closed !== i?.closed;
+      return { problem, dirty, text: problem || (dirty ? "Края заданы — можно сохранить." : "Сохранено."),
+        cls: problem ? "mut" : dirty ? "ok" : "mut" };
+    }
+
+    paintCheck() {
+      const k = this.check();
+      const hint = this.$("hint");
+      if (hint) { hint.textContent = k.text; hint.className = k.cls; }
+      const save = this.shadowRoot?.querySelector('[data-act="save"]');
+      if (save) save.disabled = Boolean(k.problem || !k.dirty || this.running || this.busy);
+      for (const [key] of ENDS) {
+        const go = this.shadowRoot?.querySelector(`[data-act="goto-${key}"]`);
+        if (go) go.disabled = this[key] === null || this.running || this.busy;
+      }
+    }
+
+    endRow(key, label) {
+      const i = this.info, v = this[key];
+      const off = this.running || this.busy;
+      return `<div class="endc">
+        <span class="lh" id="l-${key}">${label}</span>
+        <div class="step">
+          <button type="button" class="nb" data-act="dec-${key}" aria-label="${label}: меньше на 1" ${off ? "disabled" : ""}>−</button>
+          <input type="text" inputmode="numeric" autocomplete="off" maxlength="5" data-k="${key}" value="${v === null ? "" : v}"
+            placeholder="—" aria-labelledby="l-${key}" ${off ? "disabled" : ""}>
+          <button type="button" class="nb" data-act="inc-${key}" aria-label="${label}: больше на 1" ${off ? "disabled" : ""}>+</button>
+        </div>
+        ${i.hasReading || i.canGoto ? `<div class="btns">
+          ${i.hasReading ? btn("Взять с мотора", `take-${key}`, "", i.raw === null || off ? "disabled" : "") : ""}
+          ${i.canGoto ? btn("Поехать сюда", `goto-${key}`, "", v === null || off ? "disabled" : "") : ""}
+        </div>` : ""}
+      </div>`;
     }
 
     view() {
@@ -206,45 +305,46 @@ function defineOverlay() {
         return this.loadErr ? `<p class="err">${esc(this.loadErr)}</p>` : `<p class="mut"><span class="spin"></span>Загрузка…</p>`;
       }
       if (!i.supported) {
-        return `<div class="card"><h2>Калибровка недоступна</h2><p class="mut">${esc(i.reason || "Эта штора не сообщает своё положение.")}</p></div>`;
+        return `<div class="card"><h2>Калибровка недоступна</h2><p class="mut">${esc(i.reason || "Эта штора не знает своего положения.")}</p></div>`;
       }
-      const running = i.calibrating || this.started;
+      const running = this.running;
       const off = running || this.busy ? "disabled" : "";
-      const problem = saveProblem(this.open, this.closed);
+      const k = this.check();
       const result = this.result
         ? `<p class="${this.result.ok ? "ok" : "err"}">${esc(this.result.text)}</p>` : "";
+      const how = ["Впишите край числом или подгоните кнопками − и +."];
+      if (i.canGoto) how.push("«Поехать сюда» отправит мотор ровно на это число — посмотрите, где встанет штора.");
+      if (i.hasReading) how.push("Или доведите штору до края и нажмите «Взять с мотора».");
       return `
       ${this.loadErr ? `<p class="err">${esc(this.loadErr)}</p>` : ""}
       ${this.err ? `<p class="err">${esc(this.err)}</p>` : ""}
       <div class="card">
         <div class="now">
-          <div><span class="lh">Мотор показывает</span><span class="big">${num(i.raw)}</span></div>
-          <div><span class="lh">В Home Assistant</span><span class="big">${i.position === null ? "—" : `${i.position}%`}</span>
-            <span class="mut">${esc(stateText(i.state))}</span></div>
+          <div><span class="lh">Мотор показывает</span><span class="big" id="raw">${num(i.raw)}</span></div>
+          <div><span class="lh">В Home Assistant</span><span class="big" id="pos">${i.position === null ? "—" : `${i.position}%`}</span>
+            <span class="mut" id="st">${esc(stateText(i.state))}</span></div>
         </div>
         <p class="mut">Сейчас: ${esc(endsText(i.open, i.closed))}</p>
+        ${i.hasReading ? "" : `<p class="mut">Мотор не сообщает положение — края задаются числами.</p>`}
       </div>
 
-      <div class="card">
+      ${i.canAuto ? `<div class="card">
         <h2>Автоматически</h2>
         <p class="mut">Штора сама откроется до конца, потом закроется до конца, и края запишутся. Это занимает около минуты — не трогайте штору.</p>
         ${running ? `<p><span class="spin"></span>Идёт калибровка: штора едет…</p>` : ""}
         ${result}
         ${btn("Откалибровать автоматически", "run", "pri", off)}
-      </div>
+      </div>` : ""}
 
       <div class="card">
         <h2>Вручную</h2>
-        <p class="mut">Доведите штору кнопками до края и отметьте его. Так можно поставить край там, где штора должна останавливаться.</p>
+        <p class="mut">${how.join(" ")}</p>
         <div class="btns">
           ${btn("Открыть", "move-open", "", off)}${btn("Стоп", "move-stop", "", running ? "disabled" : "")}${btn("Закрыть", "move-close", "", off)}
         </div>
-        <div class="end"><span class="v"><span class="lh">Открыто</span><br><b>${num(this.open)}</b></span>
-          ${btn("Это полностью открыто", "mark-open", "", i.raw === null || running ? "disabled" : "")}</div>
-        <div class="end"><span class="v"><span class="lh">Закрыто</span><br><b>${num(this.closed)}</b></span>
-          ${btn("Это полностью закрыто", "mark-closed", "", i.raw === null || running ? "disabled" : "")}</div>
-        ${this.open !== null || this.closed !== null ? `<p class="${problem ? "mut" : "ok"}">${esc(problem || "Края отмечены — можно сохранить.")}</p>` : ""}
-        ${btn("Сохранить края", "save", "pri", problem || off ? "disabled" : "")}
+        ${ENDS.map(([key, label]) => this.endRow(key, label)).join("")}
+        <p id="hint" class="${k.cls}">${esc(k.text)}</p>
+        ${btn("Сохранить края", "save", "pri", k.problem || !k.dirty || off ? "disabled" : "")}
       </div>
 
       <p class="note">Если «Открыть» закрывает штору — у мотора перепутано направление. Смените у устройства «Motor Direction» (направление мотора) и откалибруйте заново.</p>
@@ -255,23 +355,47 @@ function defineOverlay() {
         : btn("Сбросить калибровку", "reset-ask", "dan", off)) : ""}`;
     }
 
+    onInput(e) {
+      const el = e.composedPath()[0];
+      const key = el?.dataset?.k;
+      if (!key) return;
+      this[key] = parseRaw(el.value);
+      this.err = "";
+      // Поле не перерисовывается, пока в нём печатают: только подсказка и кнопки.
+      this._key = this.structure();
+      this.paintCheck();
+    }
+
+    onChange(e) {
+      const el = e.composedPath()[0];
+      const key = el?.dataset?.k;
+      if (!key) return;
+      // «150» становится 100, «abc» - пустым: в поле то, что уйдёт на сервер.
+      el.value = this[key] === null ? "" : String(this[key]);
+    }
+
     async onClick(e) {
       const el = e.composedPath().find((n) => n?.dataset?.act);
       if (!el || el.disabled) return;
       const a = el.dataset.act;
       if (a === "close") return this.close();
       if (a.startsWith("move-")) return this.call("cover_calibration/move", { action: a.slice(5) });
-      if (a === "mark-open" || a === "mark-closed") {
+      const [verb, key] = a.split("-");
+      if (key === "open" || key === "closed") {
         const raw = this.info?.raw ?? null;
-        if (raw === null) return;
-        if (a === "mark-open") this.open = raw; else this.closed = raw;
+        if (verb === "take") { if (raw === null) return; this[key] = raw; }
+        else if (verb === "inc" || verb === "dec") this[key] = stepEnd(this[key], verb === "inc" ? 1 : -1, startFor(key, raw));
+        else if (verb === "goto") {
+          if (this[key] === null) return;
+          return this.call("cover_calibration/goto", { raw: this[key] });
+        } else return;
         this.err = "";
         return this.render();
       }
       if (a === "save") {
-        if (saveProblem(this.open, this.closed)) return;
+        if (this.check().problem) return;
         const ok = await this.call("cover_calibration/set", { open_raw: this.open, closed_raw: this.closed });
-        if (ok) { this.changed = true; this.open = this.closed = null; this.notify("Края сохранены"); }
+        if (ok) { this.changed = true; this.notify("Края сохранены"); }
         return this.render();
       }
       if (a === "run") {
@@ -287,7 +411,7 @@ function defineOverlay() {
       if (a === "reset") {
         const ok = await this.call("cover_calibration/set", { open_raw: null, closed_raw: null });
         this.confirmReset = false;
-        if (ok) { this.changed = true; this.notify("Калибровка сброшена"); }
+        if (ok) { Object.assign(this, { changed: true, open: null, closed: null }); this.notify("Калибровка сброшена"); }
         return this.render();
       }
     }
@@ -320,9 +444,10 @@ function defineOverlay() {
 
     onKey(e) {
       if (e.key === "Escape") { e.preventDefault(); return this.close(); }
+      if (e.key === "Enter" && e.composedPath()[0]?.dataset?.k) { e.composedPath()[0].blur?.(); return; }
       if (e.key !== "Tab") return;
       // Фокус не уходит за окно на страницу под ним.
-      const items = [...this.shadowRoot.querySelectorAll(".wrap button:not([disabled])")]
+      const items = [...this.shadowRoot.querySelectorAll(".wrap button:not([disabled]), .wrap input:not([disabled])")]
         .filter((b) => b.getClientRects().length);
       if (!items.length) return;
       const active = this.shadowRoot.activeElement, first = items[0], last = items[items.length - 1];

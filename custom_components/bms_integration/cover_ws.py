@@ -16,7 +16,13 @@ import voluptuous as vol
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant
 
-from .const import CONF_POSITION_CLOSED_RAW, CONF_POSITION_OPEN_RAW, DOMAIN
+from .const import (
+    CONF_CURRENT_POSITION_DP,
+    CONF_POSITION_CLOSED_RAW,
+    CONF_POSITION_OPEN_RAW,
+    CONF_SET_POSITION_DP,
+    DOMAIN,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -48,10 +54,11 @@ def _state(entity) -> str | None:
 
 
 def _reason(entity) -> str | None:
+    """Почему края нельзя задать даже руками; None - можно."""
     if entity is None:
         return "Это не штора интеграции BMS или она сейчас не загружена."
-    if not entity.can_calibrate:
-        return "Калибровка нужна шторам, которые сами сообщают положение."
+    if not entity.can_calibrate_manually:
+        return "Калибровка нужна шторам с положением в процентах."
     if not entity.available:
         return "Штора сейчас недоступна."
     return None
@@ -74,6 +81,10 @@ async def ws_info(hass: HomeAssistant, connection, msg: dict) -> None:
             "name": entity.name if entity else None,
             "supported": reason is None,
             "reason": reason,
+            # Что из ручного режима доступно этой шторе.
+            "can_auto": bool(entity and entity.can_calibrate),
+            "can_goto": bool(entity and entity.has_config(CONF_SET_POSITION_DP)),
+            "has_reading": bool(entity and entity.has_config(CONF_CURRENT_POSITION_DP)),
             "open_raw": config.get(CONF_POSITION_OPEN_RAW),
             "closed_raw": config.get(CONF_POSITION_CLOSED_RAW),
             "raw": entity._raw_position() if entity is not None else None,
@@ -110,6 +121,29 @@ async def ws_move(hass: HomeAssistant, connection, msg: dict) -> None:
               "stop": entity.async_stop_cover}[msg["action"]]
     try:
         await action()
+    except Exception as err:  # noqa: BLE001
+        connection.send_error(msg["id"], "failed", str(err))
+        return
+    connection.send_result(msg["id"], {"ok": True})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/cover_calibration/goto",
+        vol.Required("entity_id"): str,
+        vol.Required("raw"): vol.All(vol.Coerce(int), vol.Range(min=0, max=100)),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_goto(hass: HomeAssistant, connection, msg: dict) -> None:
+    """Мотор - на число как есть: найти край на глаз."""
+    entity = _cover(hass, msg["entity_id"])
+    if (reason := _reason(entity)) is not None:
+        connection.send_error(msg["id"], "not_supported", reason)
+        return
+    try:
+        await entity.async_goto_raw(msg["raw"])
     except Exception as err:  # noqa: BLE001
         connection.send_error(msg["id"], "failed", str(err))
         return
@@ -171,6 +205,12 @@ async def ws_run(hass: HomeAssistant, connection, msg: dict) -> None:
     if (reason := _reason(entity)) is not None:
         connection.send_error(msg["id"], "not_supported", reason)
         return
+    if not entity.can_calibrate:
+        connection.send_error(
+            msg["id"], "not_supported",
+            "Мотор не сообщает положение - края задаются вручную.",
+        )
+        return
     if getattr(entity, "_calibrating", False) or (_runs.get(entity_id) or {}).get("running"):
         connection.send_error(msg["id"], "busy", "Калибровка этих штор уже идёт.")
         return
@@ -200,4 +240,4 @@ async def ws_run(hass: HomeAssistant, connection, msg: dict) -> None:
     connection.send_result(msg["id"], {"started": True})
 
 
-COMMANDS: tuple[Any, ...] = (ws_info, ws_move, ws_set, ws_run)
+COMMANDS: tuple[Any, ...] = (ws_info, ws_move, ws_goto, ws_set, ws_run)

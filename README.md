@@ -233,6 +233,12 @@ the license text.
   motor's reading at that moment. Ends that almost coincide are refused, a
   reset needs a confirmation, and everything applies without reloading the
   entry. Admin only.
+- Fully manual cover calibration: each end is a number on the screen - typed
+  in, or nudged with − and + - and «Поехать сюда» sends the motor exactly
+  that number, bypassing the calibration, so the end is found by eye. Saved
+  ends come back into the fields for fine-tuning. A motor that does not
+  report its position at all can now be calibrated this way (only the
+  automatic pass needs the reading).
 - Cloud requests with a body are signed over the exact text that is sent. The
   first POST the integration ever made - the unlock ticket - was refused with
   "sign invalid" (1004).
