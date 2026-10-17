@@ -265,6 +265,7 @@ class FakeEntries:
 
     def async_update_entry(self, entry, data):
         self.updates.append(data)
+        entry.data = data
 
 
 def calibrating(report="end", closed=0, opened=93, travel=4.6, span=5.0, start=None,
@@ -448,6 +449,197 @@ class Button(unittest.TestCase):
         for name in ("strings.json", "translations/en.json", "translations/ru.json"):
             with open(os.path.join(pkg, name), encoding="utf-8") as fh:
                 self.assertTrue(json.load(fh)["entity"]["button"]["cover_calibrate"]["name"], name)
+
+
+def load_cover_ws():
+    """Команды панели поверх заглушек: декораторы веб-сокета - пустые."""
+    import importlib
+    import types
+
+    ws = types.ModuleType("homeassistant.components.websocket_api")
+    ws.websocket_command = lambda schema: (lambda fn: fn)
+    ws.require_admin = lambda fn: fn
+    ws.async_response = lambda fn: fn
+    sys.modules["homeassistant.components.websocket_api"] = ws
+    sys.modules["homeassistant.components"].websocket_api = ws
+    vol = sys.modules["voluptuous"]
+    for name in ("All", "Any", "Coerce", "In", "Length", "Optional", "Range", "Required"):
+        if not hasattr(vol, name):
+            setattr(vol, name, lambda *a, **k: None)
+    return importlib.import_module("custom_components.bms_integration.cover_ws")
+
+
+class Conn:
+    user = None
+
+    def __init__(self):
+        self.results, self.errors = [], []
+
+    def send_result(self, _id, payload):
+        self.results.append(payload)
+
+    def send_error(self, _id, code, text):
+        self.errors.append((code, text))
+
+
+class PanelCommands(unittest.TestCase):
+    """Калибровка шторы из панели - те же края, что у кнопки, плюс ручные."""
+
+    def setUp(self):
+        import types
+
+        self.ws = load_cover_ws()
+        self.ws._runs.clear()
+        sys.modules["custom_components.bms_integration"]._applied_without_reload = {}
+        self.cover, self.motor, self.clock = calibrating(report="end", closed=100, opened=7, pos=100)
+        self.motor.available = True
+        self.motor.is_sleep = False
+        cover = self.cover
+        component = types.SimpleNamespace(get_entity=lambda eid: cover if eid == "cover.tiul" else None)
+        self.tasks = []
+        self.cover.hass.data = {"cover": component}
+        self.cover.hass.async_create_task = lambda coro: self.tasks.append(coro)
+        self.hass = self.cover.hass
+        self.conn = Conn()
+        self.motor.push(100)
+
+    def call(self, handler, entity_id="cover.tiul", **msg):
+        asyncio.run(handler(self.hass, self.conn, {"id": 1, "entity_id": entity_id, **msg}))
+        return self.conn.results[-1] if self.conn.results else None
+
+    def info(self):
+        return self.call(self.ws.ws_info)
+
+    def saved(self):
+        return self.hass.config_entries.updates[-1]["devices"]["tiul"]["entities"][0]
+
+    def test_info_shows_what_the_motor_reports(self):
+        info = self.info()
+        self.assertTrue(info["supported"])
+        self.assertEqual((info["raw"], info["open_raw"], info["closed_raw"]), (100, None, None))
+        self.assertFalse(info["calibrating"])
+        self.assertIsNone(info["last_run"])
+
+    def test_other_entities_and_timed_covers_are_refused(self):
+        info = self.call(self.ws.ws_info, entity_id="cover.chuzhaya")
+        self.assertFalse(info["supported"])
+        self.assertTrue(info["reason"])
+        self.cover._config["positioning_mode"] = cover_mod.MODE_TIME_BASED
+        self.assertFalse(self.info()["supported"])
+        self.call(self.ws.ws_set, open_raw=7, closed_raw=100)
+        self.assertEqual(self.conn.errors[-1][0], "not_supported")
+        self.assertEqual(self.hass.config_entries.updates, [])
+
+    def test_manual_ends_are_saved_and_applied_live(self):
+        self.call(self.ws.ws_set, open_raw=7, closed_raw=100)
+        self.assertEqual(self.conn.errors, [])
+        saved = self.saved()
+        self.assertEqual((saved["position_open_raw"], saved["position_closed_raw"]), (7, 100))
+        self.assertEqual(self.cover.current_cover_position, 0)
+        self.assertEqual(shown(self.cover, 7), 100)
+        info = self.info()
+        self.assertEqual((info["open_raw"], info["closed_raw"]), (7, 100))
+
+    def test_reset_removes_both_ends(self):
+        self.call(self.ws.ws_set, open_raw=7, closed_raw=100)
+        self.call(self.ws.ws_set, open_raw=None, closed_raw=None)
+        saved = self.saved()
+        self.assertNotIn("position_open_raw", saved)
+        self.assertNotIn("position_closed_raw", saved)
+        self.assertNotIn("position_open_raw", self.cover._config)
+        # Мотор снова читается как есть: 7 - это 7%.
+        self.assertEqual(shown(self.cover, 7), 7)
+
+    def test_half_or_too_close_ends_are_refused_and_nothing_written(self):
+        self.call(self.ws.ws_set, open_raw=7, closed_raw=None)
+        self.call(self.ws.ws_set, open_raw=50, closed_raw=55)
+        self.assertEqual([e[0] for e in self.conn.errors], ["invalid", "invalid"])
+        self.assertIn("почти совпадают", self.conn.errors[-1][1])
+        self.assertEqual(self.hass.config_entries.updates, [])
+
+    def run_in_background(self):
+        """ws_run, затем сама задача калибровки - с часами мотора."""
+        import types
+
+        real_sleep = asyncio.sleep
+
+        async def fake_sleep(delay):
+            self.clock.now += delay
+            self.motor.advance()
+            await real_sleep(0)
+
+        async def scenario():
+            await self.ws.ws_run(self.hass, self.conn, {"id": 1, "entity_id": "cover.tiul"})
+            during = []
+            if self.tasks:
+                # Панель спрашивает сразу после запуска - задача ещё не начата.
+                await self.ws.ws_info(self.hass, self.conn, {"id": 2, "entity_id": "cover.tiul"})
+                during.append(self.conn.results[-1])
+                task = asyncio.ensure_future(self.tasks.pop())
+                await real_sleep(0)
+                await self.ws.ws_info(self.hass, self.conn, {"id": 2, "entity_id": "cover.tiul"})
+                during.append(self.conn.results[-1])
+                await self.ws.ws_run(self.hass, self.conn, {"id": 3, "entity_id": "cover.tiul"})
+                for extra in self.tasks:
+                    extra.close()
+                await task
+            return during
+
+        saved = cover_mod.asyncio, cover_mod._monotonic
+        cover_mod.asyncio = types.SimpleNamespace(
+            sleep=fake_sleep, CancelledError=asyncio.CancelledError,
+            current_task=asyncio.current_task)
+        cover_mod._monotonic = lambda: self.clock.now
+        try:
+            return asyncio.run(scenario())
+        finally:
+            cover_mod.asyncio, cover_mod._monotonic = saved
+
+    def test_auto_calibration_runs_in_background_and_reports(self):
+        during = self.run_in_background()
+        self.assertEqual(self.conn.results[0], {"started": True})
+        self.assertEqual([d["calibrating"] for d in during], [True, True])
+        self.assertEqual(len(self.tasks), 0)
+        # Второй запуск, пока штора едет, - отказ, а не вторая поездка.
+        self.assertEqual(self.conn.errors[-1][0], "busy")
+        info = self.info()
+        self.assertFalse(info["calibrating"])
+        self.assertTrue(info["last_run"]["ok"])
+        self.assertIn("7", info["last_run"]["text"])
+        self.assertIn("Motor Direction", info["last_run"]["text"])
+        self.assertEqual((info["open_raw"], info["closed_raw"]), (7, 100))
+
+    def test_auto_calibration_failure_is_reported_in_words(self):
+        self.motor.report = "never"
+        self.cover._status = {}
+        self.run_in_background()
+        info = self.info()
+        self.assertFalse(info["calibrating"])
+        self.assertFalse(info["last_run"]["ok"])
+        self.assertIn("не сообщает положение", info["last_run"]["text"])
+        self.assertEqual(self.hass.config_entries.updates, [])
+
+    def test_move_buttons_drive_the_curtain(self):
+        sent = []
+
+        async def opened():
+            sent.append("open")
+
+        async def closed():
+            sent.append("close")
+
+        async def stopped():
+            sent.append("stop")
+
+        self.cover.async_open_cover, self.cover.async_close_cover = opened, closed
+        self.cover.async_stop_cover = stopped
+        for action in ("open", "stop", "close"):
+            self.call(self.ws.ws_move, action=action)
+        self.assertEqual(sent, ["open", "stop", "close"])
+        self.cover._calibrating = True
+        self.call(self.ws.ws_move, action="open")
+        self.assertEqual(self.conn.errors[-1][0], "busy")
+        self.assertEqual(sent, ["open", "stop", "close"])
 
 
 if __name__ == "__main__":

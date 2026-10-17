@@ -537,11 +537,14 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
                 f"Шторы почти не сдвинулись (открыто {opened:g}, закрыто "
                 f"{closed:g}) - калибровка не записана."
             )
-        self._store_calibration(round(opened), round(closed))
+        self.store_calibration(round(opened), round(closed))
         return round(opened), round(closed)
 
-    def _store_calibration(self, opened: int, closed: int) -> None:
-        """Записать края в настройки записи без перезагрузки всей записи."""
+    def store_calibration(self, opened: int | None, closed: int | None) -> None:
+        """Записать края в настройки записи без перезагрузки всей записи.
+
+        Оба None - калибровку убрать: штора снова читается как есть.
+        """
         from . import _applied_without_reload
 
         entry = self.hass.config_entries.async_get_entry(self._device._entry.entry_id)
@@ -551,17 +554,27 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
             if str(config.get(CONF_ID)) == str(self._dp_id) and config.get(
                 CONF_PLATFORM
             ) == "cover":
-                config[CONF_POSITION_OPEN_RAW] = opened
-                config[CONF_POSITION_CLOSED_RAW] = closed
+                for key, value in (
+                    (CONF_POSITION_OPEN_RAW, opened),
+                    (CONF_POSITION_CLOSED_RAW, closed),
+                ):
+                    if value is None:
+                        config.pop(key, None)
+                    else:
+                        config[key] = value
         stamp = str(int(time.time() * 1000))
         new_data[ATTR_UPDATED_AT] = stamp
         # Перезагрузка записи - это переподключение всех её устройств ради
         # одной шторы. Настройки применяются к живой сущности здесь же.
         _applied_without_reload[entry.entry_id] = stamp
         self._config = {
-            **self._config,
-            CONF_POSITION_OPEN_RAW: opened,
-            CONF_POSITION_CLOSED_RAW: closed,
+            k: v
+            for k, v in {
+                **self._config,
+                CONF_POSITION_OPEN_RAW: opened,
+                CONF_POSITION_CLOSED_RAW: closed,
+            }.items()
+            if v is not None or k not in (CONF_POSITION_OPEN_RAW, CONF_POSITION_CLOSED_RAW)
         }
         self.hass.config_entries.async_update_entry(entry, data=new_data)
         if (raw := self._raw_position()) is not None:

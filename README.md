@@ -224,6 +224,15 @@ the license text.
   cover, closes it, reads the motor at each end (waiting out the full travel
   and asking the motor again before trusting a reading) and saves both ends
   without reloading the entry. The result arrives as a notification.
+- Cover calibration from the BMS panel, the way colour calibration works: a
+  cover's card gets «Калибровка шторы». The screen shows live what the motor
+  reports and what Home Assistant shows; «Откалибровать автоматически» runs
+  the same open-close pass as the button and shows the result right there;
+  manually, the cover is driven with Открыть / Стоп / Закрыть to where it
+  should stop, and «Это полностью открыто» / «Это полностью закрыто» take the
+  motor's reading at that moment. Ends that almost coincide are refused, a
+  reset needs a confirmation, and everything applies without reloading the
+  entry. Admin only.
 - Cloud requests with a body are signed over the exact text that is sent. The
   first POST the integration ever made - the unlock ticket - was refused with
   "sign invalid" (1004).

@@ -95,7 +95,7 @@ async def async_setup_panel(hass: HomeAssistant) -> None:
             # calibration.js грузится с той же меткой, что и панель: правка в
             # нём одном тоже обязана сбросить кэш браузера.
             stamps = []
-            for name in ("panel.js", "calibration.js", "manual_colors.js"):
+            for name in ("panel.js", "calibration.js", "manual_colors.js", "cover_calibration.js"):
                 try:
                     stamps.append(int(os.path.getmtime(os.path.join(panel_dir, name))))
                 except OSError:

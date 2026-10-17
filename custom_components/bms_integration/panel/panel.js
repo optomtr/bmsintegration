@@ -40,6 +40,7 @@ const panelAssetUrl = (name, self = SELF_URL) => self
   : `/bms_integration_panel/${name}?t=${Date.now()}`;
 const calibrationUrl = (self = SELF_URL) => panelAssetUrl("calibration.js", self);
 const manualColorsUrl = (self = SELF_URL) => panelAssetUrl("manual_colors.js", self);
+const coverCalibrationUrl = (self = SELF_URL) => panelAssetUrl("cover_calibration.js", self);
 
 // Состояния из брифа: явный текст + цвет + иконка, никогда только цвет.
 const ST = {
@@ -207,6 +208,8 @@ class BmsControlCenter extends HTMLElement {
     this._calibInfo = {};
     // То же для ручной калибровки (color_points/get).
     this._pointsInfo = {};
+    // То же для калибровки штор (cover_calibration/info).
+    this._coverInfo = {};
   }
 
   set hass(hass) {
@@ -307,7 +310,7 @@ class BmsControlCenter extends HTMLElement {
         }));
       if (sc === "device" && devId)
         jobs.push(this.ws("device", { device_id: devId })
-          .then((r) => { if (this.s.deviceId === devId) { this.d.device = r; this.loadCalibInfo(r); this.loadPointsInfo(r); } })
+          .then((r) => { if (this.s.deviceId === devId) { this.d.device = r; this.loadCalibInfo(r); this.loadPointsInfo(r); this.loadCoverInfo(r); } })
           .catch(() => { if (this.s.deviceId === devId) this.d.device = null; }));
       if (sc === "add") {
         jobs.push(this.ws("discovered").then((r) => { if (onScreen()) this.d.discovered = r; }));
@@ -1042,6 +1045,7 @@ class BmsControlCenter extends HTMLElement {
     return `<div class="row14">
       <div style="flex:1 1 420px;min-width:300px" class="col14">
         ${this.calibCard(d)}
+        ${this.coverCard(d)}
         ${cardOpen("Соединение")}<div style="padding:14px">${kv(conn)}</div>${cardClose}
         ${kids}
       </div>
@@ -1090,6 +1094,67 @@ class BmsControlCenter extends HTMLElement {
         .then((info) => { this._pointsInfo[e.entity_id] = { info }; })
         .catch(() => { this._pointsInfo[e.entity_id] = { failed: Date.now() }; })
         .finally(() => { if (this.s.screen === "device") this.paint(true); });
+    }
+  }
+
+  // Шторы - тем же порядком, что и свет: по разу на штору, сбой не чаще
+  // раза в минуту. Старый сервер команды не знает - карточки просто нет.
+  loadCoverInfo(d) {
+    for (const e of d?.device?.entities || []) {
+      if (e.domain !== "cover" || e.disabled) continue;
+      const c = this._coverInfo[e.entity_id];
+      if (c && !(c.failed && Date.now() - c.failed > 60000)) continue;
+      this._coverInfo[e.entity_id] = { pending: true };
+      this.ws("cover_calibration/info", { entity_id: e.entity_id })
+        .then((info) => { this._coverInfo[e.entity_id] = { info }; })
+        .catch(() => { this._coverInfo[e.entity_id] = { failed: Date.now() }; })
+        .finally(() => { if (this.s.screen === "device") this.paint(true); });
+    }
+  }
+
+  coverCard(d) {
+    const covers = (d.device.entities || []).filter((e) =>
+      e.domain === "cover" && this._coverInfo[e.entity_id]?.info?.supported);
+    if (!covers.length) return "";
+    return `${cardOpen("Калибровка штор")}
+      <div>${covers.map((e) => {
+        const info = this._coverInfo[e.entity_id].info;
+        const set = Number.isFinite(info.open_raw) || Number.isFinite(info.closed_raw);
+        const part = (v) => (Number.isFinite(v) ? v : "по умолчанию");
+        const status = info.calibrating ? "Идёт калибровка…"
+          : set ? `Открыто ${part(info.open_raw)} · закрыто ${part(info.closed_raw)}` : "Не откалибрована";
+        return `<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 16px;border-bottom:1px solid ${C.div}">
+          <span style="flex:1 1 160px;min-width:0"><span style="display:block;font-size:13px;font-weight:600;color:${C.ink}">${esc(e.name)}</span>
+            <span class="small" style="color:${set ? C.ok : C.mut2}">${esc(status)}</span></span>
+          ${btn("Калибровка шторы", { act: "cover-calib-open", data: `data-eid="${esc(e.entity_id)}"`, primary: true, ico: "i-sliders" })}
+        </div>`;
+      }).join("")}</div>${cardClose}`;
+  }
+
+  async openCoverCalibration(entityId) {
+    if (this._calib || this._calibOpening) return;
+    this._calibOpening = true;
+    const ent = (this.d.device?.device?.entities || []).find((e) => e.entity_id === entityId);
+    try {
+      this._coverMod ||= import(coverCalibrationUrl());
+      const mod = await this._coverMod;
+      // Одно окно на панель: disconnectedCallback закрывает и это.
+      this._calib = mod.openCoverCalibration({
+        entityId, name: ent?.name || entityId,
+        ws: (type, payload) => this.ws(type, payload),
+        toast: (text, bad) => this.toast(text, bad),
+        onClose: (changed) => {
+          this._calib = null;
+          if (!changed) return;
+          delete this._coverInfo[entityId];
+          if (this.d.device) this.loadCoverInfo(this.d.device);
+        },
+      });
+    } catch (err) {
+      this._coverMod = null;
+      this.toast(`Не удалось открыть калибровку шторы: ${err?.message || err}`, true);
+    } finally {
+      this._calibOpening = false;
     }
   }
 
@@ -1792,6 +1857,7 @@ class BmsControlCenter extends HTMLElement {
     if (a === "dtab") { this.s.deviceTab = el.dataset.tab; return this.paint(); }
     if (a === "calib-open") return this.openCalibration(el.dataset.eid);
     if (a === "manual-open") return this.openManualColors(el.dataset.eid);
+    if (a === "cover-calib-open") return this.openCoverCalibration(el.dataset.eid);
     if (a === "white-rgb") return this.setWhiteFromRgb(el, el.dataset.eid, el.dataset.on === "1");
     if (a === "refresh") return this.refresh();
     if (a === "expert") { this.s.expert = !this.s.expert; return this.paint(); }

@@ -28,7 +28,7 @@ from homeassistant.helpers import (
     entity_registry as er,
 )
 
-from . import calibration_ws, color_points_ws
+from . import calibration_ws, color_points_ws, cover_ws
 from . import replace as replace_mod
 from .const import (
     CONF_GATEWAY_ID,
@@ -644,6 +644,7 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
         ws_group_send,
         *calibration_ws.COMMANDS,
         *color_points_ws.COMMANDS,
+        *cover_ws.COMMANDS,
     ):
         websocket_api.async_register_command(hass, command)
     domain_data[DATA_WS_REGISTERED] = True
