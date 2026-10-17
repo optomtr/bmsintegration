@@ -26,6 +26,7 @@ from homeassistant.exceptions import HomeAssistantError
 from .config_flow import col_to_select
 from .core import colour_math
 from .core.color_calibration import Calibration
+from .core.color_points import ColourPoints, kelvin_hs
 from .entity import LocalTuyaEntity, async_setup_entry
 from .const import (
     CONF_BRIGHTNESS_LOWER,
@@ -36,6 +37,7 @@ from .const import (
     CONF_COLOR_TEMP_MAX_KELVIN,
     CONF_COLOR_TEMP_MIN_KELVIN,
     CONF_COLOR_CALIBRATION,
+    CONF_COLOR_POINTS,
     CONF_WHITE_FROM_RGB,
     CONF_COLOR_TEMP_REVERSE,
     CONF_MUSIC_MODE,
@@ -220,6 +222,9 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
     # белый режим зажигает пустой канал, и лента гаснет. Белый и температуры
     # тогда собираются из RGB.
     _white_from_rgb = False
+    # Ручная калибровка - цвета, подогнанные на глаз. Пока они есть, команда
+    # считается по ним, а калибровка камерой не используется.
+    _points: ColourPoints | None = None
 
     def __init__(
         self,
@@ -252,6 +257,7 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
         # с которой лента покажет его верно, а цвет от ленты - обратно.
         self._calibration = Calibration.load(self._config.get(CONF_COLOR_CALIBRATION))
         self._white_from_rgb = bool(self._config.get(CONF_WHITE_FROM_RGB))
+        self._points = ColourPoints.load(self._config.get(CONF_COLOR_POINTS))
 
         if self._config.get(CONF_MUSIC_MODE):
             self._effect_list.append(SCENE_MUSIC)
@@ -763,6 +769,8 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
     def __kelvin_command(self, kelvin) -> tuple:
         """Цвет ленты для температуры: с поправкой, а без неё - как есть."""
+        if self._points:
+            return self._points.to_device(kelvin_hs(kelvin))
         if self._calibration:
             return self._calibration.to_device_kelvin(kelvin)
         return colour_math.rgb_to_hs(
@@ -794,11 +802,24 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
     def __device_hs(self, hs):
         """Выбранный цвет -> команда ленте, с поправкой, если она есть."""
+        if self._points:
+            return self._points.to_device(hs)
         return self._calibration.to_device(hs) if self._calibration else hs
 
     @property
     def calibration(self) -> Calibration | None:
         return self._calibration
+
+    @property
+    def colour_points(self) -> ColourPoints | None:
+        return self._points
+
+    def set_colour_points(self, points: ColourPoints | None) -> None:
+        """Применить ручную калибровку сразу, без перезагрузки интеграции."""
+        self._points = points
+        self._ct_emulated = None
+        self.status_updated()
+        self.async_write_ha_state()
 
     @property
     def white_from_rgb(self) -> bool:
@@ -921,7 +942,9 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
                     # ленты) - тогда пересчитывать нечего, он уже наш.
                     if self._hs is not decoded_before:
                         self._ct_active = self.__ct_shown(self._hs)
-                        if self._calibration:
+                        if self._points:
+                            self._hs = list(self._points.from_device(self._hs))
+                        elif self._calibration:
                             self._hs = list(self._calibration.from_device(self._hs))
                 except (TypeError, ValueError, IndexError) as ex:
                     # The colour datapoint is decoded with int(..., 16) over

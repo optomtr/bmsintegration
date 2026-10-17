@@ -110,6 +110,9 @@ CONF_COLOR_CALIBRATION = "color_calibration"
 # Белых светодиодов на ленте нет (контроллер RGB+W, лента RGB): белый и
 # температуры собирать из RGB, а не белым каналом.
 CONF_WHITE_FROM_RGB = "white_from_rgb"
+# Ручная калибровка: цвета, подогнанные на глаз (core/color_points.py). В
+# форме сущности её нет - пишет её панель, а правка сущности переносит как есть.
+CONF_COLOR_POINTS = "color_points"
 CONF_SCENE_VALUES = "scene_values"
 CONF_SCENE_VALUES_FRIENDLY = "scene_values_friendly"
 

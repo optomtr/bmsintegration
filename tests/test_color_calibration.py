@@ -1014,7 +1014,9 @@ class EditingTheEntityKeepsTheCalibration(unittest.TestCase):
             src = fh.read()
         body = src[src.index("async def async_step_configure_entity"):]
         body = body[: body.index("self.device_data[CONF_ENTITIES].append(entity)")]
-        self.assertIn("entity[CONF_COLOR_CALIBRATION] = self.current_entity[CONF_COLOR_CALIBRATION]", body)
+        # Калибровку камерой и ручные цвета пишет панель, в форме их нет.
+        self.assertIn("for kept in (CONF_COLOR_CALIBRATION, CONF_COLOR_POINTS):", body)
+        self.assertIn("entity[kept] = self.current_entity[kept]", body)
 
 
 if __name__ == "__main__":

@@ -250,6 +250,29 @@ class PanelFrontend(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class ManualColourCommandsRequireAdmin(unittest.TestCase):
+    """Ручная калибровка пишет настройки ленты - только администратор."""
+
+    def test_every_command_requires_admin_and_is_registered(self):
+        module = tree("color_points_ws.py")
+        functions = {
+            n.name: n for n in ast.walk(module)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        listing = next(
+            n for n in module.body
+            if isinstance(n, ast.AnnAssign) and getattr(n.target, "id", "") == "COMMANDS"
+        )
+        commands = [e.id for e in listing.value.elts]
+        self.assertEqual(set(commands), {n for n in functions if n.startswith("ws_")})
+        for name in commands:
+            self.assertIn("require_admin", decorators(functions[name]), name)
+            self.assertIn("websocket_command", decorators(functions[name]), name)
+        body = source("websocket.py")
+        register = body[body.index("def async_register_websocket_api"):]
+        self.assertIn("*color_points_ws.COMMANDS", register[: register.index("DATA_WS_REGISTERED] = True")])
+
+
 class CalibrationCommandsRequireAdmin(unittest.TestCase):
     """Калибровка цвета включает ленту и пишет настройки - только администратор."""
 
