@@ -546,6 +546,47 @@ class EmptyListener(TuyaListener):
         """Device is offline or online."""
 
 
+# Команды дочерним устройствам шлюза идут по одному сокету в один очередной
+# приёмник шлюза. «Алиса, выключи свет» - это десятки команд в одну секунду:
+# пачкой они переполняли шлюз, часть терялась, и свет оставался гореть (на
+# объекте проход по 36 лампам дал 297 таймаутов). Следующая команда уходит,
+# как только шлюз подтвердил приём предыдущей, но не чаще SUBDEVICE_COMMAND_GAP:
+# темп задаёт сам шлюз. Опоздавшее подтверждение очередь не держит дольше
+# SUBDEVICE_ACK_WAIT - иначе одна занятая лампа задержала бы весь дом.
+SUBDEVICE_COMMAND_GAP = 0.05
+SUBDEVICE_ACK_WAIT = 0.5
+
+
+class CommandPacer:
+    """Очередь команд на общий сокет шлюза: по одной, в темпе шлюза."""
+
+    def __init__(self, gap: float = SUBDEVICE_COMMAND_GAP, ack_wait: float = SUBDEVICE_ACK_WAIT):
+        self.gap = gap
+        self.ack_wait = ack_wait
+        self._lock = asyncio.Lock()
+        self._previous: asyncio.Event | None = None
+        self._last_sent = float("-inf")
+
+    async def turn(self) -> asyncio.Event:
+        """Дождаться своей очереди. Вернувшееся событие - «шлюз ответил».
+
+        Его надо выставить, когда команда закончилась любым исходом: иначе
+        следующая будет ждать полные ack_wait.
+        """
+        async with self._lock:
+            if self._previous is not None and not self._previous.is_set():
+                try:
+                    await asyncio.wait_for(self._previous.wait(), self.ack_wait)
+                except asyncio.TimeoutError:
+                    pass
+            loop = asyncio.get_running_loop()
+            if (wait := self._last_sent + self.gap - loop.time()) > 0:
+                await asyncio.sleep(wait)
+            self._last_sent = loop.time()
+            self._previous = asyncio.Event()
+            return self._previous
+
+
 class TuyaProtocol(asyncio.Protocol, ContextualLogger):
     """Implementation of the Tuya protocol."""
 
@@ -612,6 +653,7 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         self._last_command_sent = 1  # The time last command was sent
         self._write_lock = asyncio.Lock()  # To serialize writes
         self._negotiation_lock = asyncio.Lock()  # Single session key negotiation
+        self.command_pacer = CommandPacer()  # Commands to sub-devices, one at a time
         self.enable_debug(enable_debug)
 
     def set_version(self, protocol_version):

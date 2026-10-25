@@ -31,6 +31,15 @@ the license text.
 
 ## What changed
 
+- Commands to the sub-devices of one gateway go one at a time. «Алиса,
+  выключи свет» is dozens of commands in the same second; sent as one burst
+  they overflowed the Tuya gateway, some were lost and those lights stayed on
+  while Home Assistant showed them off. Now the next command leaves as soon as
+  the gateway acknowledged the previous one, but no more often than every
+  50 ms, and a late acknowledgement holds the queue for at most 0.5 s.
+  Channels of one device that arrive while it waits go out as one command.
+  Wi-Fi devices with their own connection are not queued, and each gateway
+  has its own queue.
 - Integration domain is `bms_integration`.
 - BMS Smart Home brand assets are included under `brand/`.
 - Entity availability no longer drops immediately on a short socket/Wi-Fi disconnect.

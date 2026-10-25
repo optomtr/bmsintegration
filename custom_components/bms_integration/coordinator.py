@@ -806,6 +806,17 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         """Send self._pending_status payload to device."""
         await self.check_connection()
         if self._interface and self._pending_status:
+            answered = None
+            pacer = getattr(self._interface, "command_pacer", None)
+            if self._node_id and pacer is not None:
+                # Через шлюз - в общую очередь (см. CommandPacer). Пока ждём,
+                # каналы того же устройства копятся в _pending_status и уходят
+                # одной командой.
+                answered = await pacer.turn()
+                if not self._pending_status:
+                    # Наши значения уже отправил тот, кто встал в очередь раньше.
+                    answered.set()
+                    return
             payload, self._pending_status = self._pending_status.copy(), {}
             try:
                 await self._interface.set_dps(payload, cid=self._node_id)
@@ -818,6 +829,9 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 # value is already showing in the interface and only an
                 # exception here triggers its rollback.
                 raise
+            finally:
+                if answered is not None:
+                    answered.set()
             self._command_failures = 0
             # Команда сама по себе не становится состоянием. Раньше «0» в ручных
             # DP значил «Bluetooth» и подставлял отправленное в статус - но «0»
