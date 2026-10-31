@@ -1367,6 +1367,20 @@ async def validate_input(entry_runtime: HassLocalTuyaData, data):
                     # A v3.4 session negotiation can be rejected by a v3.5
                     # device. Continue auto detection with the next protocol.
                     continue
+                except ConnectionError as ex:
+                    # Соединение было, но устройство само его закрыло: термостат
+                    # 3.5 на объекте рвал сессию на кадр 3.3, и перебор
+                    # останавливался на первой же версии с «the session was
+                    # closed» - до 3.5 не доходил. Адрес верный, пробуем дальше.
+                    if not auto_protocol or interface is None:
+                        logger.error(f"Connection failed! {ex}")
+                        error = ex
+                        break
+                    logger.debug("Protocol %s: the device closed the session", version)
+                    await interface.close()
+                    interface = None
+                    error = ex
+                    continue
                 # If connection to host is failed raise wrong address.
                 except (OSError, ValueError) as ex:
                     logger.error(f"Connection failed! {ex}")

@@ -167,5 +167,55 @@ class WifiDeviceUnchanged(unittest.TestCase):
         self.assertTrue(dev.closed)
 
 
+class AutoProtocolPastAClosedSession(unittest.TestCase):
+    """С объекта: Wi-Fi термостат 3.5 рвал сессию на кадр 3.3, и «auto»
+    останавливался на первой версии с «the session was closed»."""
+
+    def _run(self, answers):
+        tried = []
+
+        class Device:
+            def __init__(self, version):
+                self.version = version
+                self.closed = False
+
+            async def detect_available_dps(self, cid=None):
+                outcome = answers.get(self.version)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return dict(outcome or {})
+
+            async def close(self):
+                self.closed = True
+
+        async def connect(host, dev_id, key, version, debug):
+            tried.append(version)
+            return Device(version)
+
+        ns = _load(connect)
+        data = subdevice(node_id=None, protocol_version="auto")
+        result = asyncio.run(ns["validate_input"](runtime(hub=False), data))
+        return result, tried
+
+    def test_a_closed_session_moves_on_to_the_next_version(self):
+        closed = ConnectionError("the session was closed")
+        result, tried = self._run({3.3: closed, 3.1: closed, 3.2: closed, 3.4: closed, 3.5: {"1": True}})
+        self.assertEqual(result["protocol_version"], "3.5")
+        self.assertEqual(tried, [3.3, 3.1, 3.2, 3.4, 3.5])
+
+    def test_a_wrong_address_still_stops_at_once(self):
+        tried = []
+
+        async def connect(host, dev_id, key, version, debug):
+            tried.append(version)
+            raise OSError(113, "No route to host")
+
+        ns = _load(connect)
+        data = subdevice(node_id=None, protocol_version="auto")
+        with self.assertRaises(Exception):
+            asyncio.run(ns["validate_input"](runtime(hub=False), data))
+        self.assertEqual(tried, [3.3], "недоступный адрес перебирал все версии")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
