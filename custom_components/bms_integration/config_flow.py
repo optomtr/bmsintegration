@@ -442,6 +442,11 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
                     devices[dev_id] = "Sub Device"
                 else:
                     devices[dev_id] = dev.get(CONF_TUYA_IP, "")
+        devices.update(
+            silent_cloud_devices(
+                self.cloud_data.device_list, allDevices, configured_Devices
+            )
+        )
 
         return self.async_show_form(
             step_id="add_device",
@@ -577,6 +582,14 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
                         ]
                         return await self.async_step_configure_entity()
 
+                # Ключ оставили пустым - берём из облака: для устройства, которого
+                # не слышно в сети, другого источника ключа нет.
+                if not user_input.get(CONF_LOCAL_KEY):
+                    cloud_dev = cloud_devs.get(user_input.get(CONF_DEVICE_ID)) or {}
+                    if cloud_key := cloud_dev.get(CONF_LOCAL_KEY):
+                        user_input[CONF_LOCAL_KEY] = cloud_key
+                        self.device_data[CONF_LOCAL_KEY] = cloud_key
+
                 valid_data = await validate_input(self.localtuya_data, user_input)
                 self.dps_strings = valid_data[CONF_DPS_STRINGS]
                 # We will also get protocol version from valid date in case auto used.
@@ -641,8 +654,12 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
             defaults[CONF_FRIENDLY_NAME] = user_in.get(CONF_FRIENDLY_NAME, "")
             defaults[CONF_NODE_ID] = user_in.get(CONF_NODE_ID, "")
 
-            if defaults[CONF_DEVICE_ID] in [cloud_devs, self.selected_device]:
-                dev_id = defaults[CONF_DEVICE_ID]
+            # Было `in [cloud_devs, self.selected_device]` - сравнение со
+            # списком из словаря и строки: вписанный руками ID облачного
+            # устройства никогда не находился, и ключ не подставлялся.
+            typed = defaults[CONF_DEVICE_ID]
+            if typed and (typed in cloud_devs or typed == self.selected_device):
+                dev_id = typed
 
             if dev_id is not None and dev_id in self.discovered_devices:
                 # Insert default values from discovery and cloud if present
@@ -1077,6 +1094,30 @@ def devices_schema(
     )
 
     return schema.extend(MASS_CONFIGURE_SCHEMA) if known_devices else schema
+
+
+# Подпись устройства, которое в сети о себе не объявляет: адрес вписывается руками.
+SILENT_DEVICE_HOST = "адрес не найден — впишите IP"
+
+
+def silent_cloud_devices(cloud_list: dict, listed: dict, configured: list) -> dict:
+    """Wi-Fi-устройства из облака, которых не слышно в сети.
+
+    Мастер подставлял ключ только тем, кого услышал по UDP. С объекта: Wi-Fi
+    термостат отвечал на порту 6668, но за 20 с не прислал ни одного
+    объявления - в списке его не было, а local_key есть только в облаке,
+    руками его взять негде. Теперь такое устройство в списке с пометкой:
+    имя и ключ подставляются из облака, вписать остаётся адрес.
+    """
+    found = {}
+    for dev_id, dev in (cloud_list or {}).items():
+        if dev_id in listed or dev_id in configured:
+            continue
+        # Дочерние устройства приходят через свой шлюз, выключенные не ответят.
+        if dev.get(CONF_NODE_ID) or dev.get("sub") or not dev.get("online"):
+            continue
+        found[dev_id] = SILENT_DEVICE_HOST
+    return found
 
 
 def mergeDevicesList(localList: dict, cloudList: dict, addSubDevices=True) -> dict:
