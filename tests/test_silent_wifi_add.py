@@ -81,6 +81,17 @@ class WizardWiring(unittest.TestCase):
         check = step.index("await validate_input(")
         self.assertLess(fill, check, "ключ из облака подставляется после проверки связи")
 
+    def test_device_id_comes_from_the_cloud_too(self):
+        # С объекта: имя и ключ подставились, ID - нет; устройство записалось
+        # под ключом "" с сущностями local__1, local__24, local__40.
+        step = self._method("async_step_configure_device")
+        self.assertIn("defaults[CONF_DEVICE_ID] = defaults[CONF_DEVICE_ID] or dev_id", step)
+        fill = step.index("user_input[CONF_DEVICE_ID] = dev_id")
+        refuse = step.index("Не указан ID устройства")
+        check = step.index("await validate_input(")
+        self.assertLess(fill, refuse)
+        self.assertLess(refuse, check, "пустой ID доходит до проверки связи и записи")
+
     def test_typed_cloud_id_is_recognised(self):
         step = self._method("async_step_configure_device")
         self.assertNotIn("in [cloud_devs, self.selected_device]", step)

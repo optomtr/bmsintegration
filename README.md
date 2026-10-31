@@ -39,7 +39,9 @@ the license text.
   найден — впишите IP»: name and key come from the cloud, only the address
   is typed in. A blank key on the manual form is also taken from the cloud,
   and a device id typed by hand is now recognised as a cloud device (the
-  check compared it against a list holding a dict).
+  check compared it against a list holding a dict). The device id is filled
+  from the cloud as well, and a device without an id is refused instead of
+  being saved under an empty key with entities named `local__1`.
 - Commands to the sub-devices of one gateway go one at a time. «Алиса,
   выключи свет» is dozens of commands in the same second; sent as one burst
   they overflowed the Tuya gateway, some were lost and those lights stayed on

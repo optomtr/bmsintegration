@@ -582,6 +582,14 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
                         ]
                         return await self.async_step_configure_entity()
 
+                if not user_input.get(CONF_DEVICE_ID) and dev_id:
+                    user_input[CONF_DEVICE_ID] = dev_id
+                    self.device_data[CONF_DEVICE_ID] = dev_id
+                if not user_input.get(CONF_DEVICE_ID):
+                    # Пустой ID - это один на всю запись ключ "" и сущности
+                    # local__1: второе такое устройство затёрло бы первое.
+                    raise ValueError("Не указан ID устройства")
+
                 # Ключ оставили пустым - берём из облака: для устройства, которого
                 # не слышно в сети, другого источника ключа нет.
                 if not user_input.get(CONF_LOCAL_KEY):
@@ -672,6 +680,10 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
             if dev_id in cloud_devs:
                 defaults[CONF_LOCAL_KEY] = cloud_devs[dev_id].get(CONF_LOCAL_KEY)
                 defaults[CONF_FRIENDLY_NAME] = cloud_devs[dev_id].get(CONF_NAME)
+                # ID обычно приходит из объявления в сети; у устройства, которое
+                # себя не объявляет, его даёт только облако. Без этого термостат
+                # с объекта записался под пустым ID - сущности local__1, local__24.
+                defaults[CONF_DEVICE_ID] = defaults[CONF_DEVICE_ID] or dev_id
 
             schema = schema_suggested_values(DEVICE_SCHEMA, **defaults)
 
