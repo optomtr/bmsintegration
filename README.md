@@ -36,7 +36,9 @@ the license text.
   a wrong address, stopping at the first version - a 3.5 Wi-Fi thermostat
   could only be added with the version picked by hand. A session the device
   closed after a successful connect now moves on to the next version; an
-  unreachable address still stops at once.
+  unreachable address still stops at once. The same holds for a device that
+  stays silent on a foreign version until the 5 s timeout (TimeoutError is an
+  OSError too).
 - A Wi-Fi device that never announces itself on the LAN can be added from
   the cloud. The add-device wizard used to list only devices heard over UDP
   and filled the local_key only for them, so a thermostat that answered on

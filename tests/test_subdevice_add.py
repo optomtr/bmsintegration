@@ -203,6 +203,14 @@ class AutoProtocolPastAClosedSession(unittest.TestCase):
         self.assertEqual(result["protocol_version"], "3.5")
         self.assertEqual(tried, [3.3, 3.1, 3.2, 3.4, 3.5])
 
+    def test_a_silent_wrong_version_moves_on_too(self):
+        # Второй термостат с того же объекта на кадр 3.3 не рвал связь, а молчал:
+        # asyncio.timeout давал TimeoutError - тоже OSError.
+        silent = TimeoutError()
+        result, tried = self._run({3.3: silent, 3.1: silent, 3.2: silent, 3.4: silent, 3.5: {"1": True}})
+        self.assertEqual(result["protocol_version"], "3.5")
+        self.assertEqual(tried, [3.3, 3.1, 3.2, 3.4, 3.5])
+
     def test_a_wrong_address_still_stops_at_once(self):
         tried = []
 
