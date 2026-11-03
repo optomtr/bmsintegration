@@ -84,6 +84,7 @@ class CloudTuyaLock(LockEntity):
     def __init__(self, locks: cloud_lock.CloudLocks, dev_id: str, config: dict):
         self._locks = locks
         self._dev_id = dev_id
+        self._category = str(config.get("category") or "")
         self._attr_unique_id = f"cloud_lock_{dev_id}"
         self._attr_device_info = cloud_lock.device_info(dev_id, config)
         self._attr_is_locked = True
@@ -111,7 +112,9 @@ class CloudTuyaLock(LockEntity):
         setattr(self, flag, True)
         self.async_write_ha_state()
         try:
-            await cloud_lock.async_operate(self._locks.api, self._dev_id, open_door)
+            await cloud_lock.async_operate(
+                self._locks.api, self._dev_id, open_door, self._category
+            )
         except BaseException:
             setattr(self, flag, False)
             self.async_write_ha_state()

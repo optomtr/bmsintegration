@@ -198,6 +198,92 @@ class Quota(unittest.TestCase):
         self.assertNotIn("SECRETKEY123", "\n".join(logs.output))
 
 
+PROPS = f"/v2.0/cloud/thing/{LOCK}/shadow/properties"
+
+
+def shadow(request=0, at_ms=1793454880000, extra=()):
+    """Теневые свойства замка как с объекта (SmartLock, category ms)."""
+    props = [
+        {"code": "unlock_fingerprint", "dp_id": 1, "time": 1793711204000, "value": 11},
+        {"code": "unlock_request", "dp_id": 9, "time": at_ms, "value": request},
+        {"code": "reply_unlock_request", "dp_id": 10, "time": 1793454880000, "value": False},
+        {"code": "unlock_app", "dp_id": 15, "time": 1793454880000, "value": 0},
+        {"code": "doorbell", "dp_id": 19, "time": 1793454880000, "value": False},
+    ]
+    props += [{"code": code, "dp_id": 60 + i, "time": 0, "value": ""} for i, code in enumerate(extra)]
+    return ok({"properties": props})
+
+
+class RequestOnlyLock(unittest.TestCase):
+    """С объекта (03.11): простой Wi-Fi замок открывается только в ответ на
+    запрос у двери. Облако «открыть» принимало, публиковало ответ, замок его
+    молча пропускал - а интеграция показывала «открыт» на закрытой двери."""
+
+    def now_ms(self):
+        import time
+
+        return int(time.time() * 1000)
+
+    def test_no_request_says_so_and_sends_nothing(self):
+        api = FakeApi({PROPS: [shadow(request=0)]})
+        with self.assertRaises(cloud_lock.CloudLockError) as err:
+            run(cloud_lock.async_operate(api, LOCK, True, "ms"))
+        self.assertIn("запрос у двери", str(err.exception))
+        self.assertEqual(api.paths(), [PROPS], "без запроса билет и команда не нужны")
+
+    def test_expired_request_is_no_request(self):
+        # Запрос был 5 минут назад и ждал 90 с: отвечать уже некому.
+        api = FakeApi({PROPS: [shadow(request=90, at_ms=self.now_ms() - 300_000)]})
+        with self.assertRaises(cloud_lock.CloudLockError):
+            run(cloud_lock.async_operate(api, LOCK, True, "ms"))
+        self.assertEqual(api.paths(), [PROPS])
+
+    def test_live_request_opens(self):
+        api = FakeApi({PROPS: [shadow(request=90, at_ms=self.now_ms() - 10_000)], OPERATE: [ok()]})
+        run(cloud_lock.async_operate(api, LOCK, True, "ms"))
+        self.assertEqual(api.paths(), [PROPS, TICKET, OPERATE])
+
+    def test_seconds_left_counts_down(self):
+        props = shadow(request=60, at_ms=1_000_000)["result"]["properties"]
+        self.assertEqual(cloud_lock.request_seconds_left(props, 1_000_000 + 15_000), 45)
+        self.assertEqual(cloud_lock.request_seconds_left(props, 1_000_000 + 61_000), 0)
+
+    def test_lock_command_is_refused_without_reaching_the_door(self):
+        # door-operate ушёл бы такому замку тем же ответом на запрос: при
+        # живом запросе «запереть» открыло бы дверь.
+        api = FakeApi({PROPS: [shadow(request=90, at_ms=self.now_ms())]})
+        with self.assertRaises(cloud_lock.CloudLockError) as err:
+            run(cloud_lock.async_operate(api, LOCK, False, "ms"))
+        self.assertIn("запирается сам", str(err.exception))
+        self.assertEqual(api.paths(), [PROPS])
+
+    def test_lock_that_opens_any_time_is_not_held(self):
+        api = FakeApi({PROPS: [shadow(request=0, extra=("remote_no_dp_key",))], OPERATE: [ok()]})
+        run(cloud_lock.async_operate(api, LOCK, True, "ms"))
+        self.assertEqual(api.paths(), [PROPS, TICKET, OPERATE])
+
+    def test_unknown_shadow_does_not_block(self):
+        # Подписка на свойства истекла или облако не ответило: команда уходит
+        # как раньше, отказ скажет само облако.
+        for answer in (fail(28841002, "No permissions"), False, ok({"properties": []})):
+            api = FakeApi({PROPS: [answer], OPERATE: [ok()]})
+            run(cloud_lock.async_operate(api, LOCK, True, "ms"))
+            self.assertEqual(api.paths(), [PROPS, TICKET, OPERATE], answer)
+
+    def test_other_categories_cost_nothing_extra(self):
+        api = FakeApi({OPERATE: [ok()]})
+        run(cloud_lock.async_operate(api, LOCK, True, "videolock"))
+        self.assertEqual(api.paths(), [TICKET, OPERATE])
+
+    def test_entity_passes_its_category_and_stays_locked(self):
+        ent = entity(script={PROPS: [shadow(request=0)]}, category="ms")
+        with self.assertRaises(cloud_lock.CloudLockError):
+            run(ent.async_unlock())
+        self.assertTrue(ent._attr_is_locked)
+        self.assertFalse(ent._attr_is_unlocking)
+        self.assertEqual(ha_stubs.CALL_LATER_LOG, [], "«открыт» не показывался")
+
+
 class Candidates(unittest.TestCase):
     def test_only_lock_categories_not_yet_taken(self):
         devices = {
@@ -221,12 +307,15 @@ class FakeHass:
         self.data = data
 
 
-def entity(script=None, lockdown=False):
+def entity(script=None, lockdown=False, category="videolock"):
     ha_stubs.CALL_LATER_LOG.clear()
     api = FakeApi(script or {})
     api.lockdown = lockdown
     locks = cloud_lock.CloudLocks("entry1", api, {LOCK: {}})
-    ent = lock_mod.CloudTuyaLock(locks, LOCK, {"friendly_name": "Дверь", "product_name": "Smart Door Lock"})
+    ent = lock_mod.CloudTuyaLock(
+        locks, LOCK,
+        {"friendly_name": "Дверь", "product_name": "Smart Door Lock", "category": category},
+    )
     ent.hass = object()
     ent.written = []
     ent.async_write_ha_state = lambda: ent.written.append(

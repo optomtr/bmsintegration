@@ -10,6 +10,7 @@ Smart Lock Open Service.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from homeassistant.exceptions import HomeAssistantError
@@ -24,7 +25,8 @@ LOCK_CATEGORIES = frozenset(
 )
 
 # Облако не опрашивается вовсе: запросы уходят только по команде, два на одно
-# открытие (билет и сама команда). Бесплатный тариф облачного проекта - 26 000
+# открытие (билет и сама команда), у простого Wi-Fi замка - три (ещё вопрос,
+# ждёт ли он ответа у двери). Бесплатный тариф облачного проекта - 26 000
 # запросов в месяц на все объекты проекта, и так его хватает с запасом.
 # Сколько показывать «открыт» после удачного открытия. Настоящего положения
 # засова такой замок не сообщает, а запирается сам через несколько секунд.
@@ -33,6 +35,30 @@ RELOCK_SECONDS = 10
 _SUBSCRIPTION_HINT = (
     "Облачный проект Tuya не разрешает открывать замки. Проверьте, что в проекте "
     "на iot.tuya.com включена Smart Lock Open Service и не истёк пробный период."
+)
+
+# Простой Wi-Fi замок (category ms) может не уметь открываться по желанию.
+# С объекта (SmartLock bf7485…, 03.11): из записываемого у него один DP -
+# reply_unlock_request, ответ на запрос открытия. Запрос делают у двери, замок
+# просыпается и шлёт unlock_request - сколько секунд он ждёт ответа. Без
+# запроса облако «открыть» принимает (success), публикует ответ - и ничего:
+# пять таких «открытий» за день, в том числе пока замок был в сети, ни одного
+# unlock_app. Интеграция при этом показывала «открыт».
+REQUEST_CATEGORY = "ms"
+_REQUEST = "unlock_request"
+_REPLY = "reply_unlock_request"
+# Коды открытия без запроса (remote_no_dp_key, remote_no_pd_setkey): есть они -
+# замок открывается в любой момент, и ждать запроса незачем.
+_FREE_OPEN_PREFIX = "remote_no_"
+
+NO_REQUEST_HINT = (
+    "Этот замок открывается удалённо только в ответ на запрос у двери, а "
+    "запроса сейчас нет. Когда у двери нажмут на замке кнопку звонка (запрос "
+    "открытия), «Открыть» сработает, пока замок ждёт ответа - до 90 секунд."
+)
+SELF_LOCKING_HINT = (
+    "Этот замок запирается сам после открытия - удалённо его можно только "
+    "открыть, по запросу у двери."
 )
 
 
@@ -158,14 +184,61 @@ async def _remote_unlock_disabled(api, dev_id: str) -> bool:
     )
 
 
-async def async_operate(api, dev_id: str, open_door: bool) -> None:
+def request_seconds_left(properties: Any, now_ms: int) -> int | None:
+    """Сколько секунд ещё ждёт ответа запрос открытия у двери.
+
+    None - замок открывается и без запроса, или по ответу облака этого не
+    понять: тогда команда уходит как раньше. 0 - замок ждёт запроса, а его нет.
+    """
+    if not isinstance(properties, list):
+        return None
+    by_code = {p.get("code"): p for p in properties if isinstance(p, dict)}
+    request = by_code.get(_REQUEST)
+    if request is None or _REPLY not in by_code:
+        return None
+    if any(str(code).startswith(_FREE_OPEN_PREFIX) for code in by_code):
+        return None
+    try:
+        waits = int(request.get("value") or 0)
+        reported_ms = int(request.get("time") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not reported_ms:
+        return None
+    return max(0, waits - max(0, now_ms - reported_ms) // 1000)
+
+
+async def _request_seconds_left(api, dev_id: str) -> int | None:
+    """Запрос у двери по теневым свойствам замка: значение и время отчёта."""
+    resp = await api.async_make_request(
+        "GET", f"/v2.0/cloud/thing/{dev_id}/shadow/properties"
+    )
+    if not _ok(resp) or not isinstance(resp.get("result"), dict):
+        # Не узнали - не мешаем: отказ облака скажет сама команда.
+        return None
+    return request_seconds_left(resp["result"].get("properties"), int(time.time() * 1000))
+
+
+async def async_operate(api, dev_id: str, open_door: bool, category: str = "") -> None:
     """Открыть или запереть замок через облако; при отказе - CloudLockError.
 
     Путей открытия у Tuya два: новый door-operate (он же умеет запирать) и
     прежний password-free/open-door. Какой из них принимает конкретная модель,
     документация не говорит, поэтому при отказе первого пробуем второй - с
     новым билетом, старый одноразовый.
+
+    Простой Wi-Fi замок сначала спрашиваем, ждёт ли он ответа у двери (см.
+    REQUEST_CATEGORY): один запрос вместо «открыт» на экране и закрытой двери.
     """
+    if category == REQUEST_CATEGORY:
+        left = await _request_seconds_left(api, dev_id)
+        if left is not None and not open_door:
+            # Запереть такой замок нечем, а door-operate уходит ему тем же
+            # ответом на запрос (в журнале замка «запереть» - то же «Remote
+            # Unlock Reply: On»): при живом запросе это открыло бы дверь.
+            raise CloudLockError(SELF_LOCKING_HINT)
+        if left == 0:
+            raise CloudLockError(NO_REQUEST_HINT)
     ticket, resp = await _ticket(api, dev_id)
     if ticket is None:
         raise CloudLockError(explain(resp))

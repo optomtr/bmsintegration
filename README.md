@@ -31,6 +31,19 @@ the license text.
 
 ## What changed
 
+- A Wi-Fi lock that opens only on a request at the door says so instead of
+  showing «открыт» on a closed door. A simple `ms` lock may have exactly one
+  writable DP, `reply_unlock_request`: someone at the door asks for remote
+  opening (the bell key), the lock wakes and reports `unlock_request` - how
+  many seconds it waits for an answer. Without that request the cloud accepts
+  «open» and publishes the answer, the lock ignores it (five such openings on
+  site, two while the lock was online, no `unlock_app`), and the entity showed
+  «открыт» for 10 s. Such a lock is now asked first (one request to its shadow
+  properties): no live request - a clear refusal and no ticket spent; a live
+  one - it opens as before. «Lock» is refused for it, because door-operate
+  would reach it as the same answer and open the door during a request. Locks
+  with `remote_no_*` codes, other categories, and an unreadable shadow behave
+  as before.
 - Protocol «auto» reaches 3.5. A 3.5 device closes the session when it gets
   a 3.3 frame; that arrived as a connection error and the wizard took it for
   a wrong address, stopping at the first version - a 3.5 Wi-Fi thermostat
