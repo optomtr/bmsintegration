@@ -31,6 +31,19 @@ the license text.
 
 ## What changed
 
+- A LocalTuya entry can be taken over from the UI, while Home Assistant
+  runs. With LocalTuya installed, adding BMS Integration offers «Перенести
+  запись из LocalTuya»: the new entry gets the old entry's data and, before
+  creating a single entity, unloads the LocalTuya entry, moves its entities and
+  devices to itself through Home Assistant's own registries and removes the
+  LocalTuya entry. Registry entries stay the same, so entity ids, device ids,
+  rooms, history, switch_as_x helpers and automations are kept. Entities move
+  before devices: a device moved first makes the entity registry delete the
+  old entry's entities on it, helpers included (found on a 2026.9 test
+  instance). On cores before 2026.9 a device is moved in two calls (add, then
+  remove): in one call 2026.1 loses the new entry from the device's subentry
+  map and every entity then fails to add. Everything is checked before
+  LocalTuya is unloaded; a conflict leaves the house as it was.
 - A Wi-Fi lock that opens only on a request at the door says so instead of
   showing «открыт» on a closed door. A simple `ms` lock may have exactly one
   writable DP, `reply_unlock_request`: someone at the door asks for remote
@@ -753,6 +766,12 @@ If the device also exposes a movement/action DP, set `Gate movement/action DP`. 
 If the reed switch is mounted the other way round - it reports `closed` while the gate is actually open - tick **`Invert gate sensor`** instead of swapping the open/closed values. The inversion applies to the sensor DP only: the reported state, the position (0/100) and `is_closed` all follow it. The movement/action DP is not affected.
 
 ## Migrating from LocalTuya
+
+The simplest way: install BMS Integration, then Settings -> Devices &
+services -> Add integration -> BMS Integration -> «Перенести запись из
+LocalTuya», once per LocalTuya entry. Home Assistant keeps running; entity
+ids, rooms, history and helpers stay. Remove LocalTuya from HACS afterwards.
+The script below does the same with Home Assistant stopped.
 
 This integration is a fork of LocalTuya and keeps the same config entry
 layout, the same entity `unique_id` format and the same entry version, so an

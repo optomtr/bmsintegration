@@ -2,7 +2,9 @@
   "config": {
     "abort": {
       "already_configured": "Эта учётная запись уже настроена.",
-      "device_updated": "Конфигурация устройства обновлена."
+      "device_updated": "Конфигурация устройства обновлена.",
+      "no_localtuya": "Записей LocalTuya для переноса не осталось.",
+      "localtuya_blocked": "{msg}"
     },
     "error": {
       "authentication_failed": "Не удалось выполнить аутентификацию.\n{msg}",
@@ -28,6 +30,21 @@
           "user_id": "User ID",
           "username": "Имя пользователя",
           "no_cloud": "Отключить Cloud API?"
+        }
+      },
+      "source": {
+        "title": "BMS Integration",
+        "description": "Здесь стоит LocalTuya. Её запись можно забрать как есть: устройства, entity_id, история, комнаты и помощники остаются на месте.",
+        "menu_options": {
+          "adopt_localtuya": "Перенести запись из LocalTuya",
+          "cloud": "Новая учётная запись облака"
+        }
+      },
+      "adopt_localtuya": {
+        "title": "Перенос записи LocalTuya",
+        "description": "Устройства и сущности записи перейдут в BMS Integration с теми же entity_id, после этого запись LocalTuya удалится. Для каждой записи - отдельно.",
+        "data": {
+          "localtuya_entry": "Запись LocalTuya (устройств)"
         }
       }
     }

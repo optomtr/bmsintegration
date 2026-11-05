@@ -24,7 +24,7 @@ from homeassistant.const import (
     SERVICE_RELOAD,
 )
 from homeassistant.core import Event, HomeAssistant, ServiceCall, callback
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import ConfigEntryError, HomeAssistantError
 from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.helpers.service import async_register_admin_service
 
@@ -60,6 +60,7 @@ from .const import (
 
 from .discovery import TuyaDiscovery
 from .cloud_lock import CloudLocks
+from .localtuya_import import AdoptError, async_adopt
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -686,6 +687,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             entry.version,
         )
         return
+
+    # Запись, созданная «Перенести из LocalTuya», сначала забирает устройства
+    # и сущности старой записи - до того, как здесь появится первая своя.
+    try:
+        await async_adopt(hass, entry)
+    except AdoptError as err:
+        raise ConfigEntryError(str(err)) from err
 
     region = entry.data[CONF_REGION]
     client_id = entry.data[CONF_CLIENT_ID]

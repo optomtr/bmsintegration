@@ -2,7 +2,9 @@
   "config": {
     "abort": {
       "already_configured": "This account has already been configured.",
-      "device_updated": "Device configuration has been updated."
+      "device_updated": "Device configuration has been updated.",
+      "no_localtuya": "No LocalTuya entries left to take over.",
+      "localtuya_blocked": "{msg}"
     },
     "error": {
       "authentication_failed": "Failed to authenticate.\n{msg}",
@@ -28,6 +30,21 @@
           "user_id": "User ID",
           "username": "Username",
           "no_cloud": "Disable Cloud API?"
+        }
+      },
+      "source": {
+        "title": "BMS Integration",
+        "description": "LocalTuya is installed here. Its entry can be taken over as it is: devices, entity ids, history, rooms and helpers stay in place.",
+        "menu_options": {
+          "adopt_localtuya": "Take over a LocalTuya entry",
+          "cloud": "New cloud account"
+        }
+      },
+      "adopt_localtuya": {
+        "title": "Take over a LocalTuya entry",
+        "description": "The entry's devices and entities move to BMS Integration with the same entity ids, then the LocalTuya entry is removed. Repeat for each entry.",
+        "data": {
+          "localtuya_entry": "LocalTuya entry (devices)"
         }
       }
     }

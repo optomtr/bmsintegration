@@ -44,6 +44,7 @@ from homeassistant.const import (
 
 from .coordinator import HassLocalTuyaData
 from .cloud_lock import lock_candidates, lock_labels
+from .localtuya_import import ADOPT_KEY, adopt_blocker, localtuya_entries
 from .core import pytuya
 from .core.cloud_api import TUYA_ENDPOINTS, TuyaCloudApi
 from .core.helpers import templates, get_gateway_by_deviceid, gen_localtuya_entities
@@ -92,6 +93,7 @@ USE_TEMPLATE = "use_template"
 TEMPLATES = "templates"
 NO_ADDITIONAL_ENTITIES = "no_additional_entities"
 SELECTED_DEVICE = "selected_device"
+CONF_LOCALTUYA_ENTRY = "localtuya_entry"
 EXPORT_CONFIG = "export_config"
 
 TUYA_CATEGORY = "category"
@@ -186,9 +188,14 @@ class LocaltuyaConfigFlow(ConfigFlow, domain=DOMAIN):
 
     def __init__(self):
         """Initialize a new LocaltuyaConfigFlow."""
+        self._cloud_chosen = False
 
     async def async_step_user(self, user_input=None):
         """Handle the initial step."""
+        if user_input is None and not self._cloud_chosen and localtuya_entries(self.hass):
+            # На объекте стоит LocalTuya: её запись можно забрать целиком, с
+            # теми же entity_id, вместо того чтобы заводить дом заново.
+            return await self.async_step_source()
         errors = {}
         placeholders = {}
         if user_input is not None:
@@ -246,6 +253,53 @@ class LocaltuyaConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_create_entry(
             title=user_input.get(CONF_USERNAME),
             data=user_input,
+        )
+
+    async def async_step_source(self, user_input=None):
+        """Забрать LocalTuya или завести новую учётную запись."""
+        return self.async_show_menu(
+            step_id="source", menu_options=["adopt_localtuya", "cloud"]
+        )
+
+    async def async_step_cloud(self, user_input=None):
+        """Новая учётная запись - обычная форма облака."""
+        self._cloud_chosen = True
+        return await self.async_step_user()
+
+    async def async_step_adopt_localtuya(self, user_input=None):
+        """Забрать запись LocalTuya: устройства, сущности, учётную запись облака.
+
+        Сам перенос реестров идёт при запуске новой записи (localtuya_import),
+        до того как она создаст первую сущность.
+        """
+        entries = {e.entry_id: e for e in localtuya_entries(self.hass)}
+        if not entries:
+            return self.async_abort(reason="no_localtuya")
+        if user_input is not None:
+            old = entries.get(user_input[CONF_LOCALTUYA_ENTRY])
+            if old is None:
+                return self.async_abort(reason="no_localtuya")
+            if blocker := adopt_blocker(old, ENTRIES_VERSION):
+                return self.async_abort(
+                    reason="localtuya_blocked", description_placeholders={"msg": blocker}
+                )
+            if user_id := old.data.get(CONF_USER_ID):
+                await self.async_set_unique_id(user_id)
+                self._abort_if_unique_id_configured()
+            return self.async_create_entry(
+                title=old.title,
+                data={**old.data, ADOPT_KEY: old.entry_id},
+                options=dict(old.options),
+            )
+        labels = {
+            f"{e.title} ({len(e.data.get(CONF_DEVICES) or {})})": entry_id
+            for entry_id, e in entries.items()
+        }
+        return self.async_show_form(
+            step_id="adopt_localtuya",
+            data_schema=vol.Schema(
+                {vol.Required(CONF_LOCALTUYA_ENTRY): col_to_select(labels)}
+            ),
         )
 
     async def async_step_import(self, user_input):
