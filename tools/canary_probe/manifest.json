@@ -1,0 +1,10 @@
+{
+  "domain": "canary_probe",
+  "name": "BMS canary probe (test stand only)",
+  "version": "1.0.0",
+  "codeowners": [],
+  "documentation": "https://github.com/optomtr/bmsintegration/",
+  "requirements": [],
+  "dependencies": [],
+  "iot_class": "local_push"
+}

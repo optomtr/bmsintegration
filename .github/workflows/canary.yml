@@ -1,0 +1,38 @@
+name: Core canary
+
+# The suites in tests/ run on stubs and cannot see the main risk to a long
+# life: Home Assistant core changes every month. This runs the integration on
+# the real, current core (and on the beta of the next one) against the device
+# simulator and fails when the integration stops working OR when core reports
+# that something it uses is deprecated - months before a site finds out.
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"   # every Monday
+  workflow_dispatch:
+  push:
+    branches: ["**"]
+
+jobs:
+  canary:
+    name: Home Assistant ${{ matrix.core }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        core: [stable, beta]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install Home Assistant (${{ matrix.core }})
+        run: |
+          if [ "${{ matrix.core }}" = "beta" ]; then
+            pip install --pre homeassistant
+          else
+            pip install homeassistant
+          fi
+          hass --version
+      - name: Run the integration on this core
+        run: python3 tools/core_canary.py --hass "$(which hass)"
