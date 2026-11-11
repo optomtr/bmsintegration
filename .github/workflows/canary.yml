@@ -27,12 +27,14 @@ jobs:
         with:
           python-version: "3.14"
       - name: Install Home Assistant (${{ matrix.core }})
+        # In a virtual environment: core refuses to start outside one.
         run: |
+          python3 -m venv "$RUNNER_TEMP/ha"
           if [ "${{ matrix.core }}" = "beta" ]; then
-            pip install --pre homeassistant
+            "$RUNNER_TEMP/ha/bin/pip" install --pre homeassistant
           else
-            pip install homeassistant
+            "$RUNNER_TEMP/ha/bin/pip" install homeassistant
           fi
-          hass --version
+          "$RUNNER_TEMP/ha/bin/hass" --version
       - name: Run the integration on this core
-        run: python3 tools/core_canary.py --hass "$(which hass)"
+        run: python3 tools/core_canary.py --hass "$RUNNER_TEMP/ha/bin/hass"
