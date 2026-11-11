@@ -38,6 +38,10 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Сколько разных нечисловых скоростей одна сущность помнит (см.
+# status_updated). Прошивка шлёт их из своего короткого списка.
+UNPARSED_SPEEDS_MEMORY = 16
+
 
 def flow_schema(dps):
     """Return schema used in config flow."""
@@ -83,6 +87,7 @@ class LocalTuyaFan(LocalTuyaEntity, FanEntity):
             self._use_ordered_list = True
         else:
             self._use_ordered_list = False
+        self._unparsed_speeds: set = set()
 
     @property
     def oscillating(self):
@@ -217,7 +222,10 @@ class LocalTuyaFan(LocalTuyaEntity, FanEntity):
         """Speed count for the fan."""
         if self._use_ordered_list:
             return len(self._ordered_list)
-        speed_count = int_states_in_range(self._speed_range)
+        # Минимум 1: ядро делит 100 на speed_count при каждой записи
+        # состояния, а настройки вида «мин 5, макс 4» давали ноль (и
+        # отрицательное число при макс < мин - 1).
+        speed_count = max(1, int_states_in_range(self._speed_range))
         _LOGGER.debug("Fan speed_count: %s", speed_count)
         return speed_count
 
@@ -252,12 +260,32 @@ class LocalTuyaFan(LocalTuyaEntity, FanEntity):
                     self._percentage = ranged_value_to_percentage(
                         self._speed_range, int(current_speed)
                     )
+                except ZeroDivisionError:
+                    # Пустой диапазон скоростей в настройках (макс = мин - 1):
+                    # формула ядра делит на ноль на каждом отчёте.
+                    if "range" not in self._unparsed_speeds:
+                        self._unparsed_speeds.add("range")
+                        _LOGGER.warning(
+                            "Fan speed range %s-%s is empty: speed ignored",
+                            *self._speed_range,
+                        )
+                    self._percentage = None
                 except (TypeError, ValueError):
                     # A non-numeric speed value must not abort the update and
                     # freeze the entity for good.
-                    _LOGGER.warning(
-                        "Fan speed value %r is not numeric: ignoring", current_speed
-                    )
+                    #
+                    # Предупреждение - один раз на значение: скорость-перечисление
+                    # ("low", "high") без упорядоченного списка в настройках
+                    # приходит в каждом отчёте, и строка журнала была на каждый.
+                    key = repr(current_speed)
+                    if key in self._unparsed_speeds:
+                        _LOGGER.debug("Fan speed value %s ignored again", key)
+                    else:
+                        if len(self._unparsed_speeds) < UNPARSED_SPEEDS_MEMORY:
+                            self._unparsed_speeds.add(key)
+                        _LOGGER.warning(
+                            "Fan speed value %r is not numeric: ignoring", current_speed
+                        )
                     self._percentage = None
 
         _LOGGER.debug("Fan current_percentage: %s", self._percentage)

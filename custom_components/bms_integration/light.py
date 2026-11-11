@@ -2,6 +2,7 @@
 
 import base64
 import logging
+import math
 import textwrap
 import homeassistant.util.color as color_util
 import voluptuous as vol
@@ -170,10 +171,39 @@ def max_percent(value) -> int:
         return 100
 
 
+def _dp_number(value):
+    """Число из датапоинта яркости или температуры; None, если это не число.
+
+    Часть прошивок шлёт их строкой ("500"). Строка доходила до map_range и
+    падала там TypeError в свойствах brightness/color_temp_kelvin - на каждой
+    записи состояния.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return int(number) if number.is_integer() else number
+
+
 def map_range(
     value: int, from_min: int, from_max: int, to_min=0, to_max=255, reverse=False
 ):
     """Maps a value from one range to another."""
+
+    if from_max == from_min:
+        # Диапазон из одной точки (нижняя граница яркости равна верхней,
+        # min и max температуры одинаковы - так бывает в перенесённых и
+        # правленных руками настройках). Деление на ноль летело из свойств
+        # состояния на КАЖДОЙ записи и голым ZeroDivisionError из команды.
+        # Шкалы нет: «дошло до точки» - верх, иначе низ.
+        at_top = (value >= from_max) != bool(reverse)
+        return to_max if at_top else to_min
 
     if reverse:
         value = from_max - (value - from_min)
@@ -442,7 +472,10 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
     def is_scene_mode(self):
         """Return true if the light is in scene mode."""
         color_mode = self.__get_color_mode()
-        return color_mode is not None and color_mode.startswith(self._modes.scene)
+        # Режим - строка по документации Tuya, но прошивки шлют и число, и
+        # bool: startswith на них падал из status_updated и из effect - на
+        # каждом отчёте.
+        return isinstance(color_mode, str) and color_mode.startswith(self._modes.scene)
 
     @property
     def is_music_mode(self):
@@ -972,7 +1005,10 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
         self._effect = None
 
         if (brightness_dp_value := self.dp_value(CONF_BRIGHTNESS)) is not None:
-            self._brightness = brightness_dp_value
+            if (brightness := _dp_number(brightness_dp_value)) is not None:
+                self._brightness = brightness
+            else:
+                self.debug("Ignoring non-numeric brightness %r", brightness_dp_value)
 
         self._ct_active = None
         if ColorMode.HS in self.supported_color_modes:
@@ -1000,7 +1036,9 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
                 self._brightness = self._brightness_cap
 
         if ColorMode.COLOR_TEMP in self.supported_color_modes:
-            self._color_temp = self.dp_value(CONF_COLOR_TEMP)
+            color_temp = self.dp_value(CONF_COLOR_TEMP)
+            if color_temp is None or (color_temp := _dp_number(color_temp)) is not None:
+                self._color_temp = color_temp
 
         if self.is_scene_mode and supported & LightEntityFeature.EFFECT:
             color_mode = self.dp_value(CONF_COLOR_MODE)

@@ -29,6 +29,16 @@ was silently never executed.
 
 ## What is covered
 
+- `test_fuzz_protocol.py`, `test_longevity_core.py`, `test_longevity_io.py`,
+  `test_longevity_platforms.py` — the November 2026 longevity audit: thousands
+  of seeded random and mutated frame streams (the parser never raises, its
+  buffer stays bounded, a tampered frame is never delivered), oddly shaped
+  signed JSON, frame-counter extremes, a foreign report that must not
+  acknowledge a command, log and journal volume for faults that last for
+  years, clock steps, both device-registry generations of Home Assistant, and
+  one test per platform defect that would raise on every device report.
+  `tools/core_canary.py` complements them on a real core.
+
 - `test_protocol.py` — TCP fragmentation and message framing, garbage
   resynchronisation, CRC/HMAC rejection, 3.5 GCM decryption, command timeouts
   not cascading into the heartbeat, payload generation, session key

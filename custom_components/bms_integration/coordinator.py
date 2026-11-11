@@ -5,6 +5,7 @@ import asyncio
 import errno
 import json
 import logging
+import re
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -85,6 +86,11 @@ GATEWAY_FAST_RETRY_WINDOW = 300
 GATEWAY_RECONNECT_SLOW_SECONDS = 60
 # Одно и то же событие с той же причиной пишется в журнал не чаще этого.
 AVAILABILITY_REPEAT_INTERVAL = 300.0
+# Сколько разных событий одного устройства помним для отсева повторов.
+AVAILABILITY_REPORT_MEMORY = 16
+# Не больше стольких записей одного устройства в час, что бы с ним ни было.
+AVAILABILITY_REPORTS_PER_HOUR = 20
+_NUMBERS = re.compile(r"\d+")
 # Пауза между фоновыми сверками состояния. Интеграция живёт на «толчках» от
 # устройств, периодического опроса нет ни у одного устройства на объекте
 # (scan_interval = 0 у всех 238). Потерянный толчок означает неверный показ
@@ -205,8 +211,10 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._health_check_failures = 0
         self._unsub_refresh: CALLBACK_TYPE | None = None
         self._created_at: float = time.monotonic()
-        self._last_report_key: tuple | None = None
-        self._last_report_at: float = 0.0
+        # (событие, причина без чисел) -> когда записано в отчёт.
+        self._reports_seen: dict[tuple, float] = {}
+        # [начало часа, записано, пропущено]
+        self._report_budget: list = [time.monotonic(), 0, 0]
         self._gateway_down_notified = False
         self._unsub_status_verify: CALLBACK_TYPE | None = None
         self._unsub_empty_status: CALLBACK_TYPE | None = None
@@ -226,6 +234,30 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             self.dps_to_request[dp.split(" ")[0]] = None
 
         self.set_logger(_LOGGER, dev.id, dev.enable_debug, self.friendly_name)
+
+        # Когда закроется окно старта, сущностям надо об этом сказать (см.
+        # _startup_window_closed). Объект создаётся в async_setup_entry, то
+        # есть в цикле событий.
+        self._unsub_startup_window: CALLBACK_TYPE | None = async_call_later(
+            self.hass, self._startup_grace + 1, self._startup_window_closed
+        )
+
+    @callback
+    def _startup_window_closed(self, _now=None) -> None:
+        """Окно старта кончилось, а устройство на связь так и не вышло.
+
+        Сущности не опрашиваются - состояние они пишут по сигналу устройства.
+        Устройство, которое не подключилось ни разу, сигнала не даёт вовсе,
+        и его сущности оставались «неизвестно» навсегда: по панели оно
+        «нет связи», а в карточке - будто просто ещё не сообщило состояние.
+        С объекта (ноябрь 2026): семь устройств за лежащим шлюзом. Тот же
+        сигнал, что при обрыве, заставляет сущности записать «недоступно».
+        """
+        self._unsub_startup_window = None
+        # Двойник-шлюз делит id (и сигнал) с настоящим дочерним устройством.
+        if self.is_closing or self._fake_gateway or self._status or self.available:
+            return
+        dispatcher_send(self.hass, f"{DOMAIN}_{self._device_config.id}", None)
 
     @property
     def friendly_name(self):
@@ -274,7 +306,11 @@ class TuyaDevice(TuyaListener, ContextualLogger):
     @property
     def is_connecting(self):
         """Return whether device is currently connecting."""
-        return self._task_connect is not None
+        # Завершённая задача - не подключение. Задача, отменённая до первого
+        # шага, свою ссылку не снимает, и по одному `is not None` устройство
+        # числилось бы «подключается» вечно: сторож его не спасает
+        # (needs_recovery), цикл переподключения ждёт задачу, которой нет.
+        return self._task_connect is not None and not self._task_connect.done()
 
     @property
     def is_subdevice(self):
@@ -361,13 +397,39 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         # вытеснял из журнала всё остальное: журнал ротируется на 2 МиБ, и
         # разбирать в нём потом нечего. Разные события по-прежнему пишутся
         # всегда - именно смена событий и есть картина обрыва.
-        key = (event, str(reason or ""))
-        if key == self._last_report_key and (
-            now - self._last_report_at
-        ) < AVAILABILITY_REPEAT_INTERVAL:
+        #
+        # Помнить надо не одно последнее событие, а несколько, и без чисел в
+        # причине. Шлюз с живым TCP и мёртвым Zigbee ходит по кругу «сторож не
+        # дождался - обрыв - переподключился» каждые полторы минуты, три разных
+        # события подряд, и память на одно событие не срабатывала ни разу:
+        # 3-4 тысячи строк в сутки, журнал на 2 МиБ оборачивался за день.
+        # А таймаут несёт в тексте номер кадра и поэтому «новый» каждый раз.
+        key = (event, _NUMBERS.sub("#", str(reason or "")))
+        seen = self._reports_seen
+        last = seen.pop(key, None)
+        if last is not None and (now - last) < AVAILABILITY_REPEAT_INTERVAL:
+            seen[key] = last
             return
-        self._last_report_key = key
-        self._last_report_at = now
+        if event == "reconnect_succeeded":
+            # Связь вернулась: следующий обрыв - новый случай, а не повтор.
+            seen.clear()
+        elif len(seen) >= AVAILABILITY_REPORT_MEMORY:
+            seen.pop(next(iter(seen)))
+        seen[key] = now
+        # И потолок на устройство в час. Обрыв с возвратом каждые полторы
+        # минуты - каждый раз честно новый случай, и отсев повторов его не
+        # берёт; без потолка одно такое устройство за сутки вытесняет из
+        # журнала всех остальных.
+        budget = self._report_budget
+        if now - budget[0] >= 3600:
+            skipped = budget[2]
+            budget[:] = [now, 0, 0]
+            if skipped:
+                extra = {**extra, "skipped_last_hour": skipped}
+        if budget[1] >= AVAILABILITY_REPORTS_PER_HOUR:
+            budget[2] += 1
+            return
+        budget[1] += 1
         last_success_age = (
             round(now - self._last_successful_update_time, 3)
             if self._last_successful_update_time is not None
@@ -580,7 +642,16 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                             "состояния не имеет - пустой ответ это норма"
                         )
                     else:
-                        raise Exception("Failed to retrieve status")
+                        # Слово local_key в тексте не случайно: по нему ниже
+                        # решается, идти ли в облако за свежим ключом. У 3.4 и
+                        # 3.5 смену ключа выдаёт согласование сессии, а 3.3 и
+                        # 3.1 просто не расшифровывают ответ - и раньше
+                        # перепривязанное в приложении устройство оставалось
+                        # со старым ключом навсегда, даже при настроенном облаке.
+                        raise Exception(
+                            "Failed to retrieve status: the reply was empty or "
+                            "could not be decrypted - check the local_key"
+                        )
 
                 self.status_updated(status)
             except (UnicodeDecodeError, DecodeError) as e:
@@ -652,6 +723,12 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                     )
 
                 if (scan_inv := int(self._device_config.scan_interval)) > 0:
+                    # Прежний таймер снять, а не затереть: соединение дочернего
+                    # устройства бывает сброшено мимо disconnected(), и каждое
+                    # следующее подключение добавляло ещё один опрос, который
+                    # жил до конца процесса и держал старые объекты в памяти.
+                    if self._unsub_refresh:
+                        self._unsub_refresh()
                     self._unsub_refresh = async_track_time_interval(
                         self.hass, self._async_refresh, timedelta(seconds=scan_inv)
                     )
@@ -796,7 +873,17 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             self._unsub_status_verify()
             self._unsub_status_verify = None
 
+        if getattr(self, "_unsub_startup_window", None) is not None:
+            self._unsub_startup_window()
+            self._unsub_startup_window = None
+
         await self.abort_connect()
+
+        # Уведомление «шлюз не отвечает» принадлежит этому объекту. После
+        # перезагрузки записи его создаёт заново новый объект (если шлюз всё
+        # ещё лежит), а снять старое уже некому: оно висело до перезапуска
+        # Home Assistant, хотя шлюз давно поднялся.
+        self._clear_gateway_down_notice()
 
         if self.gateway:
             self.gateway.filter_subdevices()
@@ -1019,6 +1106,21 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         if self._interface is None:
             return None
         return self._interface.dps_cache.setdefault(self._node_id or "parent", {})
+
+    @callback
+    def forget_dp(self, dp_id) -> None:
+        """Забыть значение датапоинта - в устройстве и в кэше протокола.
+
+        Для датчиков со сбросом по таймеру (движение): устройство шлёт «pir» и
+        никогда не шлёт «нет движения». Каждый отчёт устройства несёт ВЕСЬ кэш,
+        поэтому значение, оставшееся в кэше, приезжало к датчику снова с
+        любым соседним отчётом - заряд батареи, освещённость - и он
+        срабатывал повторно, запуская автоматизации без всякого движения.
+        """
+        dp = str(dp_id)
+        if (cache := self._protocol_dps_cache()) is not None:
+            cache.pop(dp, None)
+        self._status.pop(dp, None)
 
     @callback
     def apply_optimistic_status(self, status: dict) -> tuple[dict, dict]:
@@ -1374,7 +1476,13 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                     if self.connected:
                         self._clear_gateway_down_notice()
                         if not self.is_sleep and attempts > 0:
-                            self.info(f"Reconnect succeeded on attempt: {attempts}")
+                            # clear_warning: связь вернулась, значит следующий
+                            # обрыв - новый случай и должен быть виден в журнале,
+                            # а не считаться повтором вчерашнего.
+                            self.info(
+                                f"Reconnect succeeded on attempt: {attempts}",
+                                clear_warning=True,
+                            )
                             self._availability_report(
                                 "reconnect_succeeded",
                                 self._last_disconnect_reason or "",

@@ -23,6 +23,12 @@ REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=20)
 LOCKDOWN_REASON = "Изолированный режим: обмен с облаком Tuya запрещён настройками"
 LOCKDOWN_LOG_INTERVAL = 3600.0
 
+# Облако отвечает этими кодами, когда токен отозван или истёк раньше срока
+# (1010 token invalid, 1011 token expired). Без сброса клиент считал токен
+# живым до его собственного срока - а при сбитых часах годами - и каждый
+# запрос падал до перезапуска Home Assistant.
+TOKEN_INVALID_CODES = ("1010", "1011")
+
 _LOGGER = logging.getLogger(__name__)
 
 TUYA_ENDPOINTS = {
@@ -66,7 +72,6 @@ class AioHttpSession:
     """
 
     _session: aiohttp.ClientSession = None
-    _lock = asyncio.Lock()
     _active_requests = 0
 
     async def __get_session(self):
@@ -85,10 +90,13 @@ class AioHttpSession:
         """Close session only if this is the last used of session."""
         self._active_requests -= 1
 
-        async with self._lock:
-            if self._session and self._active_requests <= 0:
-                await self._session.close()
-                self._session = None
+        if self._session and self._active_requests <= 0:
+            # Сессия отцепляется ДО await: пока закрытие ждёт, новый запрос
+            # уже успевал взять ту же закрываемую сессию, и aiohttp отвечал
+            # RuntimeError("Session is closed") мимо обработки ошибок сети.
+            # Теперь такой запрос заводит себе новую.
+            session, self._session = self._session, None
+            await session.close()
 
     async def __aenter__(self):
         return await self.__get_session()
@@ -114,7 +122,10 @@ class TuyaCloudApi:
         self._secret = secret
         self._user_id = user_id
         self._access_token = ""
-        self._token_expire_time: int = 0
+        # Сроки токена и списка устройств - по монотонным часам: стенные
+        # часы коробки без интернета могут уйти вперёд, а после NTP вернуться
+        # назад, и тогда токен «жил» годами, а список устройств не обновлялся.
+        self._token_expire_time: float = 0
         # Изолированный режим: жёсткий запрет любого обмена с облаком.
         self._lockdown = False
         self._lockdown_last_log = 0.0
@@ -132,7 +143,7 @@ class TuyaCloudApi:
         self.device_list = {}
         self.cached_device_list = {}
 
-        self._last_devices_update = int(time.time())
+        self._last_devices_update = time.monotonic()
 
     def generate_payload(self, method, timestamp, url, headers, body=None):
         """Generate signed payload for requests."""
@@ -247,7 +258,17 @@ class TuyaCloudApi:
                 )
             # Gateways and CDNs answer with HTML on 5xx: do not let the
             # content-type check raise.
-            return await resp.json(content_type=None)
+            data = await resp.json(content_type=None)
+            if (
+                isinstance(data, dict)
+                and str(data.get("code")) in TOKEN_INVALID_CODES
+                and self._token_expire_time != -1
+            ):
+                # Следующий запрос обновит токен сам. Во время обновления
+                # (-1) не трогаем: метку снимает async_get_access_token.
+                self._token_expire_time = 0
+                self._access_token = ""
+            return data
 
         async with self._session as session:
             try:
@@ -309,7 +330,7 @@ class TuyaCloudApi:
                 return self._logger.debug("Token response contained no access token")
 
             expire_time = int(req_results.get("expire_time", 3600))
-            self._token_expire_time = int(time.time()) + expire_time
+            self._token_expire_time = time.monotonic() + expire_time
             self._access_token = access_token
             succeeded = True
             return "ok"
@@ -325,7 +346,7 @@ class TuyaCloudApi:
         )
         if (
             self.device_list
-            and int(time.time()) - (self._last_devices_update + interval) < 0
+            and time.monotonic() - (self._last_devices_update + interval) < 0
         ):
             return self._logger.debug(f"Devices has been updated a minutes ago.")
 
@@ -341,7 +362,7 @@ class TuyaCloudApi:
 
         self.device_list.update({dev["id"]: dev for dev in resp["result"]})
 
-        self._last_devices_update = int(time.time())
+        self._last_devices_update = time.monotonic()
         return "ok"
 
     async def async_get_devices_dps_query(self):
@@ -531,7 +552,7 @@ class TuyaCloudApi:
     @property
     def token_validate(self):
         """Return whether token is expired or not"""
-        cur_time = int(time.time())
+        cur_time = time.monotonic()
         expire_time = self._token_expire_time - 30
 
         return expire_time >= cur_time

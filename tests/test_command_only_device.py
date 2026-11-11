@@ -18,6 +18,7 @@
 
 import asyncio
 import os
+import time
 import sys
 import unittest
 
@@ -93,8 +94,8 @@ def make_device(platforms):
     dev._empty_status_delay = coordinator.EMPTY_STATUS_RETRY_FIRST
     dev._gateway_down_notified = False
     dev._created_at = 0.0
-    dev._last_report_key = None
-    dev._last_report_at = 0.0
+    dev._reports_seen = {}
+    dev._report_budget = [time.monotonic(), 0, 0]
     dev._last_disconnect_reason = None
     dev._disconnect_started_at = None
     dev._last_update_time = None

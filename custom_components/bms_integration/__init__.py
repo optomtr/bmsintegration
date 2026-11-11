@@ -61,6 +61,7 @@ from .const import (
 from .discovery import TuyaDiscovery
 from .cloud_lock import CloudLocks
 from .localtuya_import import AdoptError, async_adopt
+from .registry_compat import device_in_entry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -82,6 +83,10 @@ DISCOVERY_ADDRESS_CONFIRMATIONS = 3
 # stop following the address and say so: the device needs a static lease.
 DISCOVERY_FLAP_LIMIT = 5
 DISCOVERY_FLAP_WINDOW = 3600.0
+# На сколько перестаём следить за адресом, который скачет.
+DISCOVERY_FREEZE_SECONDS = 86400.0
+# Ключ в hass.data[DOMAIN]: уровень debug логгеру интеграции выставили мы.
+DATA_DEBUG_FORCED = "debug_forced"
 
 SERVICE_SET_DP = "set_dp"
 SERVICE_UPDATE_DPS = "update_dps"
@@ -134,7 +139,8 @@ async def async_setup(hass: HomeAssistant, config: dict):
     _last_ip_update: dict[str, float] = {}
     _address_confirmations: dict[str, tuple[str, int]] = {}
     _address_history: dict[str, list[float]] = {}
-    _address_frozen: set[str] = set()
+    # device_id -> когда перестали следить (monotonic). Запрет не вечный.
+    _address_frozen: dict[str, float] = {}
 
     async def _handle_reload(service: ServiceCall):
         """Handle reload service call."""
@@ -193,8 +199,17 @@ async def async_setup(hass: HomeAssistant, config: dict):
         life.
         """
         now = time.monotonic()
-        if device_id in _address_frozen:
-            return False
+        if (frozen_at := _address_frozen.get(device_id)) is not None:
+            if now - frozen_at < DISCOVERY_FREEZE_SECONDS:
+                return False
+            # Раньше запрет держался до перезапуска Home Assistant (перезагрузка
+            # интеграции, которую советовало сообщение, его не снимала): шлюз,
+            # у которого адрес пять раз сменился за час и потом действительно
+            # переехал, оставался без связи со всеми своими устройствами на
+            # месяцы. Через сутки пробуем снова; если адрес по-прежнему
+            # скачет - запрет вернётся после тех же пяти смен.
+            _address_frozen.pop(device_id, None)
+            _address_history.pop(device_id, None)
 
         seen_ip, count = _address_confirmations.get(device_id, ("", 0))
         count = count + 1 if seen_ip == device_ip else 1
@@ -218,11 +233,12 @@ async def async_setup(hass: HomeAssistant, config: dict):
             if now - at < DISCOVERY_FLAP_WINDOW
         ]
         if len(history) >= DISCOVERY_FLAP_LIMIT:
-            _address_frozen.add(device_id)
+            _address_frozen[device_id] = now
             _LOGGER.error(
-                "Адрес устройства %s менялся %d раз за час — больше не следим "
+                "Адрес устройства %s менялся %d раз за час — сутки не следим "
                 "за ним автоматически. Задайте устройству постоянный адрес "
-                "(резервирование в роутере) и перезагрузите интеграцию.",
+                "(резервирование в роутере); чтобы не ждать сутки, "
+                "перезапустите Home Assistant.",
                 device_id,
                 len(history),
             )
@@ -268,9 +284,15 @@ async def async_setup(hass: HomeAssistant, config: dict):
 
     def _device_discovered(device: dict):
         """Update address of device if it has changed."""
-        device_ip = device["ip"]
-        device_id = device["gwId"]
-        product_key = device["productKey"]
+        # .get, а не [..]: объявление без адреса (чужая прошивка, сканер)
+        # роняло эту функцию на КАЖДОЙ посылке - раз в пять секунд, ошибка с
+        # трассировкой, десятки мегабайт журнала в сутки от одного такого
+        # соседа по сети.
+        device_ip = device.get("ip")
+        device_id = device.get("gwId")
+        product_key = device.get("productKey")
+        if not device_ip or not device_id:
+            return
         # If device is not in cache, check if a config entry exists
         entry: ConfigEntry = async_config_entry_by_device_id(hass, device_id)
 
@@ -316,7 +338,11 @@ async def async_setup(hass: HomeAssistant, config: dict):
             dev_changes = {}
             if host != device_ip:
                 dev_changes[CONF_HOST] = device_ip
-            if (p_key := dev_entry.get(CONF_PRODUCT_KEY)) and p_key != product_key:
+            if (
+                product_key
+                and (p_key := dev_entry.get(CONF_PRODUCT_KEY))
+                and p_key != product_key
+            ):
                 dev_changes[CONF_PRODUCT_KEY] = product_key
             if dev_changes:
                 changes[dev_id] = dev_changes
@@ -329,9 +355,11 @@ async def async_setup(hass: HomeAssistant, config: dict):
             _start_parked_if_owner(entry, device_id, device_ip)
             return
 
-        if any(CONF_HOST in c for c in changes.values()) and not _address_change_ok(
-            device_id, device_ip
-        ):
+        # Любая запись в конфигурацию - это запись на диск, а смена ключа
+        # продукта ещё и перезагрузка всей записи. Раньше подтверждения и
+        # пауза действовали только на смену адреса, и объявления с
+        # чередующимся productKey переписывали запись на каждой посылке.
+        if not _address_change_ok(device_id, device_ip):
             return
 
         new_data = copy.deepcopy(dict(entry.data))
@@ -415,12 +443,19 @@ async def async_setup(hass: HomeAssistant, config: dict):
     )
 
     discovery = TuyaDiscovery(_device_discovered)
+    hass.data[DOMAIN][DATA_DISCOVERY] = discovery
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _shutdown)
     try:
         await discovery.start()
-        hass.data[DOMAIN][DATA_DISCOVERY] = discovery
-        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _shutdown)
-    except Exception:  # pylint: disable=broad-except
-        _LOGGER.exception("failed to set up discovery")
+    except Exception as ex:  # pylint: disable=broad-except
+        # Порт занят в момент запуска (другой процесс, прежний экземпляр ещё
+        # не отпустил) - не повод остаться без обнаружения до следующего
+        # перезапуска Home Assistant, то есть на месяцы. Тот же цикл, что
+        # восстанавливает оборванное обнаружение, откроет его, когда сможет.
+        _LOGGER.warning(
+            "Обнаружение устройств не запустилось (%s): пробую снова в фоне", ex
+        )
+        discovery.connection_lost(ex)
 
     return True
 
@@ -739,8 +774,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     # Отладка всей интеграции одним переключателем из панели: иначе её
     # приходится включать правкой configuration.yaml и перезапуском.
-    if (entry.options or {}).get(OPT_DEBUG):
-        logging.getLogger(f"custom_components.{DOMAIN}").setLevel(logging.DEBUG)
+    integration_logger = logging.getLogger(f"custom_components.{DOMAIN}")
+    if any(
+        (other.options or {}).get(OPT_DEBUG)
+        for other in hass.config_entries.async_entries(DOMAIN)
+    ):
+        hass.data[DOMAIN][DATA_DEBUG_FORCED] = True
+        integration_logger.setLevel(logging.DEBUG)
+    elif hass.data[DOMAIN].pop(DATA_DEBUG_FORCED, False):
+        # Отладку выключили. Раньше уровень не возвращался до перезапуска
+        # Home Assistant, и в home-assistant.log продолжало уходить всё, что
+        # интеграция пишет на debug, - тысячи строк в сутки на каждое
+        # недоступное устройство. Возвращаем INFO: ниже его панель не держит.
+        integration_logger.setLevel(logging.INFO)
 
     # The device panel and its API belong to the integration, not to one entry.
     async_register_websocket_api(hass)
@@ -1120,7 +1166,7 @@ def _run_async_listen(hass: HomeAssistant, entry: ConfigEntry):
     @callback
     def _event_filter(data: dr.EventDeviceRegistryUpdatedData) -> bool:
         device_reg = dr.async_get(hass).async_get(data["device_id"])
-        is_entry = device_reg and entry.entry_id in device_reg.config_entries
+        is_entry = device_reg and device_in_entry(device_reg, entry.entry_id)
         return data["action"] == "update" and is_entry
 
     async def device_state_changed(event: Event[dr.EventDeviceRegistryUpdatedData]):

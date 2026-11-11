@@ -445,6 +445,9 @@ def load_sensor():
             async def async_get_last_state(self):
                 return None
 
+            async def async_will_remove_from_hass(self):
+                return None
+
         helpers.restore_state = _mk(
             "homeassistant.helpers.restore_state", RestoreEntity=RestoreEntity
         )
@@ -561,7 +564,92 @@ class LightEntityFeature(enum.IntFlag):
     TRANSITION = 32
 
 
+class FanEntityFeature(enum.IntFlag):
+    SET_SPEED = 1
+    OSCILLATE = 2
+    DIRECTION = 4
+    PRESET_MODE = 8
+    TURN_OFF = 16
+    TURN_ON = 32
+
+
+class WaterHeaterEntityFeature(enum.IntFlag):
+    TARGET_TEMPERATURE = 1
+    OPERATION_MODE = 2
+    AWAY_MODE = 4
+    ON_OFF = 8
+
+
+_WATER_HEATER_CONST = {
+    "STATE_ECO": "eco",
+    "STATE_ELECTRIC": "electric",
+    "STATE_PERFORMANCE": "performance",
+    "STATE_HIGH_DEMAND": "high_demand",
+    "STATE_HEAT_PUMP": "heat_pump",
+    "STATE_GAS": "gas",
+}
+
+
+def _install_percentage() -> None:
+    """homeassistant.util.percentage для платформы вентилятора.
+
+    Формулы перенесены из ядра (util/scaling.py) как есть, вместе с делением:
+    тест обязан увидеть то же ZeroDivisionError, что увидит ядро.
+    """
+    if "homeassistant.util.percentage" in sys.modules:
+        return
+    util = sys.modules.get("homeassistant.util") or _mk("homeassistant.util")
+    util.__path__ = []
+    sys.modules["homeassistant"].util = util
+
+    def states_in_range(low_high_range):
+        return low_high_range[1] - low_high_range[0] + 1
+
+    def int_states_in_range(low_high_range):
+        return int(states_in_range(low_high_range))
+
+    def ranged_value_to_percentage(low_high_range, value):
+        source_offset = low_high_range[0] - 1
+        return int((value - source_offset) * 100 // states_in_range(low_high_range))
+
+    def percentage_to_ranged_value(low_high_range, percentage):
+        return percentage * states_in_range(low_high_range) / 100 + low_high_range[0] - 1
+
+    def ordered_list_item_to_percentage(ordered_list, item):
+        if item not in ordered_list:
+            raise ValueError(f'The item "{item}" is not in "{ordered_list}"')
+        return ((ordered_list.index(item) + 1) * 100) // len(ordered_list)
+
+    def percentage_to_ordered_list_item(ordered_list, percentage):
+        for offset, speed in enumerate(ordered_list):
+            if percentage <= ((offset + 1) * 100) // len(ordered_list):
+                return speed
+        return ordered_list[-1]
+
+    util.percentage = _mk(
+        "homeassistant.util.percentage",
+        states_in_range=states_in_range,
+        int_states_in_range=int_states_in_range,
+        ranged_value_to_percentage=ranged_value_to_percentage,
+        percentage_to_ranged_value=percentage_to_ranged_value,
+        ordered_list_item_to_percentage=ordered_list_item_to_percentage,
+        percentage_to_ordered_list_item=percentage_to_ordered_list_item,
+    )
+
+
 _PLATFORM_EXTRAS = {
+    "fan": {
+        "DIRECTION_FORWARD": "forward",
+        "DIRECTION_REVERSE": "reverse",
+        "FanEntityFeature": FanEntityFeature,
+    },
+    "water_heater": {
+        # Как в ядре: значения по умолчанию у водонагревателя - в °F.
+        "DEFAULT_MIN_TEMP": 110,
+        "DEFAULT_MAX_TEMP": 140,
+        "WaterHeaterEntityFeature": WaterHeaterEntityFeature,
+        **_WATER_HEATER_CONST,
+    },
     "light": {
         "ATTR_BRIGHTNESS": "brightness",
         "ATTR_COLOR_TEMP_KELVIN": "color_temp_kelvin",
@@ -610,6 +698,9 @@ def load_platform(name: str):
             _attr_has_entity_name = True
             _attr_should_poll = False
 
+            async def async_will_remove_from_hass(self):
+                return None
+
         class _Classes:
             def __getattr__(self, item):
                 return item.lower()
@@ -624,6 +715,10 @@ def load_platform(name: str):
             **_PLATFORM_EXTRAS.get(name, {}),
         )
         setattr(components, name, stub)
+
+        if name == "water_heater":
+            # Состояния режимов платформа берёт из подмодуля .const.
+            stub.const = _mk(f"{mod_name}.const", **_WATER_HEATER_CONST)
 
         if name == "climate":
             # Платформа берёт часть имён из подмодуля .const, а не из пакета.
@@ -640,5 +735,8 @@ def load_platform(name: str):
                     METRIC_SYSTEM=object(),
                 )
                 util.unit_system = unit_system
+
+    if name == "fan":
+        _install_percentage()
 
     return importlib.import_module(f"custom_components.bms_integration.{name}")

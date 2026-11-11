@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 from hashlib import md5
+from ipaddress import IPv4Address
 from socket import inet_aton
 
 from cryptography.hazmat.backends import default_backend
@@ -61,6 +62,21 @@ def decrypt_udp(message):
 # coming back, so retry patiently rather than giving up on the first refusal.
 RESTART_BACKOFF_SECONDS = (1, 5, 15, 30, 60)
 RESTART_MAX_ATTEMPTS = 30
+# После быстрых попыток не сдаёмся: коробка без присмотра работает месяцами, и
+# сдавшееся обнаружение означало, что смену адресов никто не заметит до
+# перезапуска Home Assistant. Дальше пробуем редко, но бесконечно.
+RESTART_SLOW_SECONDS = 300
+
+
+def _ipv4(value) -> bool:
+    """Строка с адресом IPv4 в полной записи."""
+    if not isinstance(value, str):
+        return False
+    try:
+        IPv4Address(value)
+    except ValueError:
+        return False
+    return True
 
 
 class TuyaDiscovery(asyncio.DatagramProtocol):
@@ -69,6 +85,9 @@ class TuyaDiscovery(asyncio.DatagramProtocol):
     def __init__(self, callback=None):
         """Initialize a new BaseDiscovery."""
         self.devices = {}
+        # Порядок, в котором устройства слышны в последний раз: первым идёт
+        # молчащее дольше всех - его и вытесняем, когда кэш полон.
+        self._heard: dict[str, None] = {}
         self._listeners = []
         self._callback = callback
         self._closing = False
@@ -137,24 +156,34 @@ class TuyaDiscovery(asyncio.DatagramProtocol):
             for transport, _ in self._listeners:
                 transport.close()
             self._listeners = []
-            for attempt in range(RESTART_MAX_ATTEMPTS):
+            attempt = 0
+            while True:
                 await asyncio.sleep(delay)
                 if self._closing:
                     return
                 try:
                     await self.start()
                 except Exception as ex:  # pylint: disable=broad-except
-                    delay = RESTART_BACKOFF_SECONDS[
-                        min(attempt + 1, len(RESTART_BACKOFF_SECONDS) - 1)
-                    ]
+                    attempt += 1
+                    if attempt < RESTART_MAX_ATTEMPTS:
+                        delay = RESTART_BACKOFF_SECONDS[
+                            min(attempt, len(RESTART_BACKOFF_SECONDS) - 1)
+                        ]
+                    else:
+                        if attempt == RESTART_MAX_ATTEMPTS:
+                            # Один раз, а не каждые 5 минут годами.
+                            _LOGGER.error(
+                                "Не удалось восстановить обнаружение устройств "
+                                "(%s). Пробую дальше раз в %d с; пока не "
+                                "восстановится, смена адресов не замечается.",
+                                ex,
+                                RESTART_SLOW_SECONDS,
+                            )
+                        delay = RESTART_SLOW_SECONDS
                     _LOGGER.debug("Discovery restart failed (%s), retrying", ex)
                     continue
                 _LOGGER.info("Обнаружение устройств восстановлено")
                 return
-            _LOGGER.error(
-                "Не удалось восстановить обнаружение устройств. Смена адресов "
-                "не будет замечена до перезапуска Home Assistant."
-            )
         except asyncio.CancelledError:
             raise
         finally:
@@ -177,6 +206,12 @@ class TuyaDiscovery(asyncio.DatagramProtocol):
         if not isinstance(decoded, dict) or not decoded.get("gwId"):
             _LOGGER.debug("Ignoring malformed broadcast from %r", addr[0])
             return
+        # Ниже адрес уходит в запись конфигурации как host устройства:
+        # объявление без адреса (или с мусором) переписало бы его на None и
+        # уронило бы подключение до ручной правки.
+        if not _ipv4(decoded.get("ip")):
+            _LOGGER.debug("Ignoring broadcast without an IPv4 address from %r", addr[0])
+            return
 
         # Separate try: an error raised by the callback used to be reported
         # as a decoding failure, hiding real bugs downstream.
@@ -191,12 +226,18 @@ class TuyaDiscovery(asyncio.DatagramProtocol):
         # If device found but the ip changed.
         if gwid in self.devices and (self.devices[gwid].get("ip") != ip):
             self.devices.pop(gwid)
+        self._heard.pop(gwid, None)
+        self._heard[gwid] = None
 
         if gwid not in self.devices:
             # Bound the cache: the network can announce devices that are not
-            # (and never will be) configured here.
-            if len(self.devices) >= MAX_TRACKED_DEVICES:
-                self.devices.pop(next(iter(self.devices)))
+            # (and never will be) configured here. Evict the one silent for
+            # longest: popping the first of the IP-sorted dict threw out the
+            # lowest address, a live device, on every new announcement.
+            while len(self.devices) >= MAX_TRACKED_DEVICES:
+                oldest = next(gw for gw in self._heard if gw in self.devices)
+                self.devices.pop(oldest)
+                self._heard.pop(oldest)
             self.devices[gwid] = device
             # Sort devices by ip. A non-IPv4 value must not raise here.
             def _ip_key(item):

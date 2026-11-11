@@ -101,6 +101,18 @@ class CloudTuyaLock(LockEntity):
     async def async_will_remove_from_hass(self) -> None:
         self._cancel_relock()
 
+    @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Переименование - на месте: таймер «заперт снова» с entity_id не связан.
+
+        Без этого хука ядро 2026.11 при переименовании снимает сущность и
+        добавляет заново (а в 2027.11 этот путь уберёт): отсчёт сбрасывался.
+        На старом ядре хука нет - его никто не зовёт.
+        """
+        parent = getattr(super(), "async_entity_id_changed", None)
+        if parent is not None:
+            parent(old_entity_id)
+
     def _cancel_relock(self) -> None:
         if self._relock:
             self._relock()

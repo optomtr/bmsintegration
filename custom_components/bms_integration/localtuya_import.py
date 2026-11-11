@@ -26,6 +26,7 @@ from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.storage import Store
 
 from .const import DOMAIN
+from .registry_compat import device_by_identifier
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -80,9 +81,11 @@ def _identifier_taken(dev_reg, identifier: tuple[str, str], device_id: str) -> b
     До 2026.9 идентификатор уникален на всё ядро. С 2026.9 - в пределах одной
     записи, а новая запись до переноса пуста: столкнуться не с кем.
     """
-    if hasattr(dev_reg, "async_get_device_by_identifier"):
+    if hasattr(dev_reg, "async_get_device_by_identifier") or hasattr(
+        dev_reg, "async_get_devices"
+    ):
         return False
-    other = dev_reg.async_get_device(identifiers={identifier})
+    other = device_by_identifier(dev_reg, identifier)
     return other is not None and other.id != device_id
 
 

@@ -43,6 +43,7 @@ import binascii
 import hmac
 import json
 import logging
+import re
 import struct
 import time
 import weakref
@@ -143,6 +144,28 @@ SUBDEVICE_ABSENT_CYCLES = 2
 # at INFO again. Long enough that a permanent fault cannot flood the log,
 # short enough that the fault stays visible to whoever reads it.
 INFO_REPEAT_SECONDS = 3600
+# The same for WARNING and ERROR: once a day is enough for a fault that never
+# goes away. A reconnect clears the memory, so every new outage is reported at
+# once (see ContextualLogger.info(clear_warning=True)).
+WARNING_REPEAT_SECONDS = 86400
+# Hard ceiling of non-debug lines per device per hour, whatever the reason.
+# Deduplication above only knows messages it has seen; this is what stands
+# between an unforeseen per-packet message and a disk filled over the years
+# (home-assistant.log is rotated at startup only, never by size).
+LOG_LINES_PER_HOUR = 30
+LOG_MEMORY_SLOTS = 64
+LOG_MEMORY_DEVICES = 4096
+
+# What was already said about a device, by device id: normalized message ->
+# monotonic time it was last written at its own level. Module level on
+# purpose. The state used to live on the logging object, and connect() builds
+# a new TuyaProtocol and MessageDispatcher for every attempt - so for them
+# every message was "new" on every reconnect, and a 3.5 device with a wrong
+# key wrote its two warnings on each of ~1400 attempts a day, forever.
+_LOG_MEMORY: dict[str, dict[str, float]] = {}
+# device id -> [window start, lines written, lines held back]
+_LOG_BUDGET: dict[str, list] = {}
+_DIGITS = re.compile(r"\d+")
 
 # DPS that are known to be safe to use with update_dps (0x12) command
 UPDATE_DPS_WHITELIST = [18, 19, 20]  # Socket (Wi-Fi)
@@ -225,18 +248,76 @@ class ContextualLogger:
         """Initialize a new ContextualLogger."""
         self._logger = None
         self._enable_debug = False
-
-        self._last_warning = ""
-        self._last_info = ""
-        self._last_info_at = 0.0
+        self._log_key = ""
 
     def set_logger(self, logger, device_id, enable_debug=False, name=None):
         """Set base logger to use."""
         self._enable_debug = enable_debug
+        self._log_key = str(device_id)
         self._logger = TuyaLoggingAdapter(
             logger, {"device_id": device_id, "name": name}
         )
         return self
+
+    def _said_recently(self, level: int, msg, args, window: float) -> bool:
+        """Was the same thing written for this device within the window?
+
+        "The same" ignores numbers: a timeout names its sequence number, a
+        still-offline notice its uptime, and with the number in the text no
+        two of them were ever equal - 690 identical warnings a day from one
+        sub-device its gateway would not answer for.
+        """
+        try:
+            text = msg % args if args else msg
+        except Exception:  # noqa: BLE001 - a bad format must not break logging
+            text = msg
+        key = f"{level}:{_DIGITS.sub('#', str(text))}"
+        memory = _LOG_MEMORY.get(self._log_key)
+        if memory is None:
+            if len(_LOG_MEMORY) >= LOG_MEMORY_DEVICES:
+                _LOG_MEMORY.pop(next(iter(_LOG_MEMORY)))
+            memory = _LOG_MEMORY[self._log_key] = {}
+        now = time.monotonic()
+        last = memory.pop(key, None)
+        if last is not None and now - last < window:
+            memory[key] = last
+            return True
+        if len(memory) >= LOG_MEMORY_SLOTS:
+            memory.pop(next(iter(memory)))
+        memory[key] = now
+        return False
+
+    def _over_budget(self) -> bool:
+        """Has this device used up its lines for the hour?"""
+        now = time.monotonic()
+        budget = _LOG_BUDGET.get(self._log_key)
+        if budget is None:
+            if len(_LOG_BUDGET) >= LOG_MEMORY_DEVICES:
+                _LOG_BUDGET.pop(next(iter(_LOG_BUDGET)))
+            budget = _LOG_BUDGET[self._log_key] = [now, 0, 0]
+        if now - budget[0] >= 3600:
+            held_back = budget[2]
+            budget[:] = [now, 0, 0]
+            if held_back:
+                budget[1] = 1
+                self._logger.log(
+                    logging.WARNING,
+                    "За прошедший час в журнал не попало %d сообщений этого "
+                    "устройства: превышен предел %d в час. Они есть на уровне debug.",
+                    held_back,
+                    LOG_LINES_PER_HOUR,
+                )
+        if budget[1] >= LOG_LINES_PER_HOUR:
+            budget[2] += 1
+            return True
+        budget[1] += 1
+        return False
+
+    def _log(self, level: int, window: float, msg, args, exc_info=False):
+        """Write at `level`, or at debug if it was said recently or too much."""
+        if self._said_recently(level, msg, args, window) or self._over_budget():
+            level = logging.DEBUG
+        return self._logger.log(level, msg, *args, exc_info=exc_info)
 
     def debug(self, msg, *args, force=False):
         """Debug level log for device. force will ignore device debug check."""
@@ -247,7 +328,7 @@ class ContextualLogger:
     def info(self, msg, *args, clear_warning=False):
         """Info level log. clear_warning to re-enable warnings msgs if duplicated.
 
-        An exact repeat is demoted to debug for a while. A permanent fault -
+        A repeat is demoted to debug for a while. A permanent fault -
         a device that is simply gone, a gateway whose key was rotated - hits
         the same INFO line on every reconnect attempt, i.e. once a minute for
         as long as it lasts; over a year of an unattended installation that
@@ -255,37 +336,31 @@ class ContextualLogger:
         enough to keep the fault visible.
         """
         if clear_warning:
-            self._last_warning = ""
-            self._last_info = ""
+            _LOG_MEMORY.pop(self._log_key, None)
 
-        now = time.monotonic()
-        if msg == self._last_info and (now - self._last_info_at) < INFO_REPEAT_SECONDS:
-            return self._logger.log(logging.DEBUG, msg, *args)
-
-        self._last_info = msg
-        self._last_info_at = now
-        return self._logger.log(logging.INFO, msg, *args)
+        return self._log(logging.INFO, INFO_REPEAT_SECONDS, msg, args)
 
     def warning(self, msg, *args):
         """Warning method log. A repeated warning is demoted, never dropped.
 
         Dropping repeats hides a failure that keeps repeating: a device stuck
         in a reconnect loop logged its reason once and then went silent, which
-        made the loop invisible in the log for as long as it lasted.
+        made the loop invisible in the log for as long as it lasted. A repeat
+        goes to debug and comes back at WARNING once a day.
         """
-        if msg != self._last_warning:
-            self._last_warning = msg
-            return self._logger.log(logging.WARNING, msg, *args)
-
-        return self._logger.log(logging.DEBUG, msg, *args)
+        return self._log(logging.WARNING, WARNING_REPEAT_SECONDS, msg, args)
 
     def error(self, msg, *args):
-        """Error level log."""
-        return self._logger.log(logging.ERROR, msg, *args)
+        """Error level log; repeats are demoted like warnings."""
+        return self._log(logging.ERROR, WARNING_REPEAT_SECONDS, msg, args)
 
     def exception(self, msg, *args):
-        """Exception level log."""
-        return self._logger.exception(msg, *args)
+        """Exception level log, with the traceback; repeats are demoted.
+
+        This is the one that hurt most when repeated: a traceback is a couple
+        of kilobytes, and the callers are per-frame and per-attempt paths.
+        """
+        return self._log(logging.ERROR, WARNING_REPEAT_SECONDS, msg, args, exc_info=True)
 
 
 class MessageDispatcher(ContextualLogger):
@@ -304,6 +379,9 @@ class MessageDispatcher(ContextualLogger):
         super().__init__()
         self.buffer = b""
         self.listeners: dict[str, asyncio.Future] = {}
+        # Номера кадров, чьё ожидание нельзя закрывать отчётом о состоянии
+        # (см. wait_for, accept_push).
+        self.ack_only: set[int] = set()
         self.callback_status_update = callback_status_update
         self.version = protocol_version
         self.local_key = local_key
@@ -326,8 +404,18 @@ class MessageDispatcher(ContextualLogger):
             if isinstance(future, asyncio.Future) and not future.done():
                 future.set_exception(ConnectionError(reason))
 
-    async def wait_for(self, seqno, cmd, timeout=TIMEOUT_REPLY):
-        """Wait for response to a sequence number to be received and return it."""
+    async def wait_for(self, seqno, cmd, timeout=TIMEOUT_REPLY, accept_push=True):
+        """Wait for response to a sequence number to be received and return it.
+
+        accept_push=False: отчёт о состоянии (STATUS) с тем же номером ответом
+        не считается. Свой счётчик мы подстраиваем под счётчик устройства
+        (_status_update), поэтому следующий отчёт шлюза несёт тот же номер,
+        что и наша следующая команда. За шлюзом сидят десятки устройств, и
+        отчёт ЛЮБОГО из них, успевший раньше подтверждения, закрывал ожидание
+        чужой команды: она считалась принятой, даже если шлюз её потерял, -
+        показ оставался «выключено», сверка по таймауту не запускалась, а
+        лампа горела.
+        """
         if seqno in self.listeners:
             # The special sequence numbers are shared by every caller of that
             # command, so overwriting the entry orphaned the waiter already
@@ -339,6 +427,8 @@ class MessageDispatcher(ContextualLogger):
         self.debug("Command %d waiting for seq. number %d", cmd, seqno)
         future = asyncio.Future()
         self.listeners[seqno] = future
+        if not accept_push:
+            self.ack_only.add(seqno)
         try:
             response = await asyncio.wait_for(future, timeout=timeout)
             return response
@@ -356,6 +446,7 @@ class MessageDispatcher(ContextualLogger):
             # sequence number must keep its listener when we time out.
             if self.listeners.get(seqno) is future:
                 self.listeners.pop(seqno, None)
+                self.ack_only.discard(seqno)
 
     def _release_listener(self, seqno, msg):
         if seqno not in self.listeners:
@@ -476,8 +567,15 @@ class MessageDispatcher(ContextualLogger):
             self.debug("Device returned error retcode %s for CMD %r", msg.retcode, msg.cmd)
 
         if msg.seqno in self.listeners:
-            self.debug("Dispatching sequence number %d", msg.seqno)
-            self._release_listener(msg.seqno, msg)
+            if msg.cmd == CMDType.STATUS and msg.seqno in self.ack_only:
+                self.debug(
+                    "Status push shares seq. number %d with a pending command: "
+                    "it is not that command's acknowledgement",
+                    msg.seqno,
+                )
+            else:
+                self.debug("Dispatching sequence number %d", msg.seqno)
+                self._release_listener(msg.seqno, msg)
 
         if msg.cmd == CMDType.HEART_BEAT:
             self.debug("Got heartbeat response")
@@ -507,12 +605,20 @@ class MessageDispatcher(ContextualLogger):
                 )
                 self.callback_status_update(msg, ack=True)
             elif msg.seqno not in self.listeners:
-                self.debug(
-                    "Got message type %d for unknown listener %d: %s",
-                    msg.cmd,
-                    msg.seqno,
-                    msg,
-                )
+                if msg.cmd in (CMDType.DP_QUERY, CMDType.DP_QUERY_NEW):
+                    # Ответ на запрос состояния, которого уже никто не ждёт:
+                    # запрос истёк на занятом шлюзе или его ожидание закрыл
+                    # отчёт с тем же номером. Раньше такой ответ выбрасывался -
+                    # а это свежая правда о состоянии, ради которой и спрашивали.
+                    self.debug("Late reply to a status query: using it as a status update")
+                    self.callback_status_update(msg)
+                else:
+                    self.debug(
+                        "Got message type %d for unknown listener %d: %s",
+                        msg.cmd,
+                        msg.seqno,
+                        msg,
+                    )
 
 
 class TuyaListener(ABC):
@@ -697,11 +803,17 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         if not isinstance(data, dict):
             return
 
-        on_devs = data.get("online", []) or []
-        off_devs = data.get("offline", []) or []
+        def _cids(key):
+            # Только список строк: число или null вместо списка роняли
+            # set.update, и это писалось ошибкой на каждый цикл опроса.
+            value = data.get(key)
+            return [c for c in value if isinstance(c, str)] if isinstance(value, list) else []
+
+        on_devs = _cids("online")
+        off_devs = _cids("offline")
         # "nearby" means the gateway still knows the device exists; it must not
         # count as absent even though it carries no online/offline verdict.
-        nearby = data.get("nearby", []) or []
+        nearby = _cids("nearby")
 
         # Record what this frame proves, synchronously, before the async task -
         # so a straggler frame later in the cycle cannot be missed.
@@ -805,8 +917,18 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
             if "dps" not in decoded_message:
                 return
 
-            if dps_payload := decoded_message.get("dps"):
-                if cid := decoded_message.get("cid"):
+            dps_payload = decoded_message.get("dps")
+            cid = decoded_message.get("cid")
+            if (dps_payload and not isinstance(dps_payload, dict)) or (
+                cid and not isinstance(cid, str)
+            ):
+                # dps не словарём или cid не строкой - в кэш это класть
+                # нельзя (dict.update и setdefault падают), а падение здесь
+                # давало ERROR с трассировкой на каждый кадр.
+                return self.debug(f"Ignoring a status with odd dps/cid: {decoded_message!r}")
+
+            if dps_payload:
+                if cid:
                     self.dps_cache.setdefault(cid, {})
                     self.dps_cache[cid].update(dps_payload)
                 else:
@@ -920,8 +1042,16 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
         self.debug("Closing connection")
         self.clean_up_session()
 
-        if self.heartbeater:
-            await self.heartbeater
+        if heartbeater := self.heartbeater:
+            # Задача, отменённая до первого шага, своего except не выполняет:
+            # она завершается отменённой, и голый await поднимал CancelledError
+            # в ТОГО, КТО ЗАКРЫВАЕТ (переподключение, смена адреса, сторож) -
+            # а тот принимал её за собственную отмену и бросал дело на
+            # полпути. Ссылка при этом не обнулялась, и так было при каждом
+            # следующем close() этого соединения.
+            await asyncio.gather(heartbeater, return_exceptions=True)
+            if self.heartbeater is heartbeater:
+                self.heartbeater = None
 
         if self._sub_devs_query_tasks:
             await asyncio.gather(
@@ -1053,7 +1183,15 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
             # never reached.
             self.clean_up_session()
             raise ConnectionError(f"Failed to send command {real_cmd}: {ex}") from ex
-        msg = await self.dispatcher.wait_for(seqno, payload.cmd)
+        # Команде дочернему устройству нужен настоящий ответ шлюза: за шлюзом
+        # много устройств, и чужой отчёт с совпавшим номером - не подтверждение
+        # (см. wait_for). Запросам и устройствам со своим сокетом отчёт годится
+        # как раньше: там он приходит от того же устройства и несёт то самое
+        # состояние, о котором спрашивали.
+        accept_push = not (command == CMDType.CONTROL and nodeID)
+        msg = await self.dispatcher.wait_for(
+            seqno, payload.cmd, accept_push=accept_push
+        )
         if msg is None:
             self.debug("Wait was aborted for seqno %d", seqno)
             return None
@@ -1315,16 +1453,26 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
             #     )
             # json_payload = self.error_json(ERR_JSON, payload)
 
+        if not isinstance(json_payload, dict):
+            # Кадр подписан верно, а внутри не объект: null, число, строка,
+            # список. Раньше следующая же строка падала на `in`, и это
+            # исключение писалось в журнал с трассировкой на КАЖДЫЙ такой
+            # кадр - у устройства, которое шлёт их раз в секунды, это
+            # гигабайты home-assistant.log за год. Такой ответ - не данные.
+            self.debug("Ignoring a payload that is not a JSON object: %r", json_payload)
+            return None
+
         # v3.4 stuffs it into {"data":{"dps":{"1":true}}, ...}
+        data = json_payload.get("data")
         if (
             "dps" not in json_payload
-            and "data" in json_payload
-            and "dps" in json_payload["data"]
+            and isinstance(data, dict)
+            and "dps" in data
         ):
-            json_payload["dps"] = json_payload["data"]["dps"]
+            json_payload["dps"] = data["dps"]
 
-            if "cid" in json_payload["data"]:
-                json_payload["cid"] = json_payload["data"]["cid"]
+            if "cid" in data:
+                json_payload["cid"] = data["cid"]
 
         # We will store the payload to trigger an event in HA.
         if "dps" in json_payload:
@@ -1463,7 +1611,11 @@ class TuyaProtocol(asyncio.Protocol, ContextualLogger):
                     Affix.prefix_6699.value,
                     True,
                 )
-                self.seqno += 1  # increase message sequence number
+                # Та же маска, что в ветке 55AA ниже. Без неё счётчик после
+                # 0xFFFFFFFF (устройство само может прислать такой номер, и мы
+                # подстраиваемся под него) выходил за 32 бита, и каждая
+                # следующая отправка падала в struct.pack до переподключения.
+                self.seqno = (self.seqno + 1) & 0xFFFFFFFF
                 data = parser.pack_message(msg, hmac_key=self.local_key)
                 self.debug("payload encrypted=%r", binascii.hexlify(data))
                 return data

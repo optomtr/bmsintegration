@@ -3,9 +3,11 @@
 import asyncio
 import inspect
 import logging
+import re
+import time
 from typing import Any, Coroutine, Callable
 
-from homeassistant.core import HomeAssistant, State
+from homeassistant.core import HomeAssistant, State, callback
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.exceptions import HomeAssistantError
 
@@ -33,6 +35,7 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .core import pytuya
+from .registry_compat import device_by_identifier
 from .coordinator import HassLocalTuyaData, TuyaDevice
 from .const import (
     device_registry_fields,
@@ -154,6 +157,15 @@ VIA_DEVICE_ID_SUPPORTED = _core_takes_via_device_id()
 # Пауза между слитыми командами одному Zigbee-устройству (см. _send_queued).
 ZIGBEE_COMMAND_GAP = 0.5
 
+# Как часто повторять в журнале ту же ошибку разбора отчёта (см.
+# _status_updated_contained). Реже - неисправность не видна, чаще - журнал
+# пухнет: отчёты идут всё время, пока прибор включён.
+STATUS_ERROR_REPEAT_SECONDS = 3600
+# Сколько разных ошибок одна сущность помнит. Больше не бывает: это дыры в
+# разборе, а не поток данных; предел - чтобы память не росла годами.
+STATUS_ERROR_MEMORY = 16
+_DIGITS = re.compile(r"\d+")
+
 
 class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
     """Representation of a Tuya entity."""
@@ -166,6 +178,7 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
     _latest_command_wins = False
     _queued_command: tuple | None = None
     _command_sender = None
+    _status_errors: dict | None = None
 
     def __init__(
         self, device: TuyaDevice, device_config: dict, dp_id: str, logger, **kwargs
@@ -226,7 +239,7 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
                 self.connection_made()
 
             if status:
-                self.status_updated()
+                self._status_updated_contained()
 
             # Always write the state: HA's state machine deduplicates identical
             # state+attribute writes on its own. Suppressing writes here froze
@@ -244,6 +257,61 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
 
         signal = f"{DOMAIN}_entity_{self._device_config.id}"
         async_dispatcher_send(self.hass, signal, self.entity_id)
+
+    def _status_updated_contained(self) -> None:
+        """status_updated, ошибка которого не уходит в ядро.
+
+        Обработчик отчётов зовёт ядро на каждый толчок устройства. Ошибка
+        разбора, выпущенная наружу, - это ERROR с трассировкой в журнале на
+        КАЖДЫЙ отчёт, а запись состояния после неё не происходила, и сущность
+        замирала. Одно странное значение от прибора - и годы журнала по
+        несколько килобайт на отчёт. Здесь та же ошибка пишется один раз (и
+        снова через час, чтобы длящаяся неисправность оставалась видна),
+        повторы - на уровне debug, а состояние записывается всё равно.
+        """
+        try:
+            self.status_updated()
+        except Exception as ex:  # pylint: disable=broad-except
+            # Числа в тексте ошибки - это значения из отчёта: без них «то же
+            # самое» никогда не совпало бы.
+            key = f"{type(ex).__name__}: {_DIGITS.sub('#', str(ex))}"
+            now = time.monotonic()
+            if self._status_errors is None:
+                self._status_errors = {}
+            last = self._status_errors.get(key)
+            if last is not None and now - last < STATUS_ERROR_REPEAT_SECONDS:
+                self._logger.debug(
+                    "Отчёт устройства не разобран для %s (повтор): %s",
+                    self.entity_id,
+                    key,
+                )
+                return
+            if key not in self._status_errors and (
+                len(self._status_errors) >= STATUS_ERROR_MEMORY
+            ):
+                self._status_errors.pop(next(iter(self._status_errors)))
+            self._status_errors[key] = now
+            self._logger.error(
+                "Отчёт устройства не разобран для %s, состояние может отставать: %s",
+                self.entity_id,
+                ex,
+                exc_info=True,
+            )
+
+    @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Переименование entity_id - на месте, без снятия и повторного добавления.
+
+        Ничего у сущности не привязано к entity_id: подписка на отчёты идёт по
+        id устройства, состояние для восстановления переносит ядро. Без этого
+        хука ядро 2026.11 переименовывает класс с собственными
+        async_added_to_hass/async_will_remove_from_hass, снимая сущность и
+        добавляя заново, а в 2027.11 этот путь уберёт. Хук ядра появился в
+        2026.11 - на старом ядре его никто не зовёт, но и падать он не должен.
+        """
+        parent = getattr(super(), "async_entity_id_changed", None)
+        if parent is not None:
+            parent(old_entity_id)
 
     @property
     def extra_state_attributes(self):
@@ -286,9 +354,16 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
             # switch.lk_lenta_dnd), а в 2027.8 его уберут совсем. Запись
             # шлюза к этому моменту есть: async_setup_entry регистрирует
             # шлюзы до того, как поднимаются платформы.
+            #
+            # Поиск - через registry_compat: async_get_device в 2027.8
+            # перестанет работать, а на 2026.1 нового поиска ещё нет. Шлюз
+            # регистрируется в той же записи конфигурации, что и мы.
             gateway_ident = (DOMAIN, f"local_{self._device.gateway.id}")
-            gateway = async_get_dev_reg(self.hass).async_get_device(
-                identifiers={gateway_ident}
+            entry = getattr(self._device, "_entry", None)
+            gateway = device_by_identifier(
+                async_get_dev_reg(self.hass),
+                gateway_ident,
+                getattr(entry, "entry_id", None),
             )
             if gateway is not None:
                 if VIA_DEVICE_ID_SUPPORTED:

@@ -54,9 +54,26 @@ def _arm_watchdog(hass: HomeAssistant, entity_id: str) -> None:
         entity = _light(hass, entity_id)
         if snapshot and entity is not None:
             _LOGGER.warning("Калибровка %s брошена - лента возвращена как была", entity_id)
-            hass.async_create_task(entity.async_send_calibration_dps(snapshot))
+            hass.async_create_task(_restore(entity, entity_id, snapshot))
 
     _watchdogs[entity_id] = hass.loop.call_later(ABANDONED_AFTER, _abandoned)
+
+
+async def _restore(entity, entity_id: str, snapshot: dict) -> None:
+    """Вернуть ленту; выключенная лента - не повод для «never retrieved».
+
+    Через 10 минут тишины лампы может уже не быть в сети. Исключение задачи,
+    которую никто не ждёт, ядро печатает как «Task exception was never
+    retrieved» без смысла для человека - здесь оно названо одной строкой.
+    """
+    try:
+        await entity.async_send_calibration_dps(snapshot)
+    except Exception as ex:  # pylint: disable=broad-except
+        _LOGGER.warning(
+            "Ленту %s не удалось вернуть после брошенной калибровки: %s",
+            entity_id,
+            ex,
+        )
 
 
 def _disarm_watchdog(entity_id: str) -> None:

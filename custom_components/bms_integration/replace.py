@@ -50,6 +50,7 @@ from .const import (
     CONF_PROTOCOL_VERSION,
     DOMAIN,
 )
+from .registry_compat import device_by_identifier
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -63,6 +64,12 @@ _CONFIG_LOCK = asyncio.Lock()
 # Хранилище выученных ИК-кодов: верхний ключ — device_id пульта.
 IR_CODES_STORAGE_KEY = "bms_integration_remotes_codes"
 IR_CODES_STORAGE_VERSION = 1
+# Файл кодов общий для всех пультов, и каждый пульт пишет его как «перечитать,
+# вписать свою ветку, сохранить». Перенос кодов при замене делает то же самое
+# своим Store: без общего замка пульт, выучивший код в ту же секунду, сохранил
+# бы снимок до переноса, и коды заменённого пульта пропали бы. Замок живёт
+# здесь, а не в remote.py: replace грузится без платформы пульта.
+IR_CODES_STORAGE_LOCK = asyncio.Lock()
 
 # Поля, которые описывают ЖЕЛЕЗО и потому берутся у нового устройства.
 HARDWARE_FIELDS = (
@@ -113,8 +120,8 @@ def describe_device(hass: HomeAssistant, entry: ConfigEntry, dev_id: str) -> dic
     from homeassistant.helpers import area_registry as ar
 
     dev_reg = dr.async_get(hass)
-    registry_device = dev_reg.async_get_device(
-        identifiers={(DOMAIN, unique_id_prefix(dev_id))}
+    registry_device = device_by_identifier(
+        dev_reg, (DOMAIN, unique_id_prefix(dev_id)), entry.entry_id
     )
     area_name = None
     if registry_device is not None and registry_device.area_id:
@@ -178,11 +185,12 @@ def compare_datapoints(entry: ConfigEntry, dev_id: str, available: list[str]) ->
 async def _async_move_ir_codes(hass: HomeAssistant, old_id: str, new_id: str) -> bool:
     """Перенести выученные ИК-коды: они хранятся под device_id пульта."""
     store = Store(hass, IR_CODES_STORAGE_VERSION, IR_CODES_STORAGE_KEY)
-    data = await store.async_load()
-    if not data or old_id not in data:
-        return False
-    data[new_id] = data.pop(old_id)
-    await store.async_save(data)
+    async with IR_CODES_STORAGE_LOCK:
+        data = await store.async_load()
+        if not data or old_id not in data:
+            return False
+        data[new_id] = data.pop(old_id)
+        await store.async_save(data)
     _LOGGER.info("Выученные ИК-коды перенесены с %s на %s", old_id, new_id)
     return True
 
@@ -239,9 +247,9 @@ def _async_rewrite_registries(
         moved_entities += 1
 
     moved_devices = 0
-    registry_device = dev_reg.async_get_device(identifiers={(DOMAIN, old_prefix)})
+    registry_device = device_by_identifier(dev_reg, (DOMAIN, old_prefix), entry.entry_id)
     if registry_device is not None:
-        occupied = dev_reg.async_get_device(identifiers={(DOMAIN, new_prefix)})
+        occupied = device_by_identifier(dev_reg, (DOMAIN, new_prefix), entry.entry_id)
         if occupied is not None:
             # Запись без сущностей ничего не держит: это остаток прерванной
             # замены или устройства, которое так и не поднялось. Поглощаем её,
@@ -617,8 +625,8 @@ async def async_remove_device(
             removed += 1
 
         dev_reg = dr.async_get(hass)
-        registry_device = dev_reg.async_get_device(
-            identifiers={(DOMAIN, unique_id_prefix(dev_id))}
+        registry_device = device_by_identifier(
+            dev_reg, (DOMAIN, unique_id_prefix(dev_id)), entry.entry_id
         )
         if registry_device is not None:
             dev_reg.async_remove_device(registry_device.id)

@@ -31,6 +31,66 @@ the license text.
 
 ## What changed
 
+- **Longevity audit (November 2026): built to run unattended for years.**
+  Five independent code reviews, a soak on a real Home Assistant core (260
+  entry reloads, 15 gateway drops, idle with dead devices), a protocol fuzzer
+  and the 720-device stress stand. What it changed:
+  - *Home Assistant 2027 will not break it.* Core 2026.11 announces four
+    removals the integration depended on: `DeviceRegistry.async_get_device`
+    (gone in 2027.8, eight call sites), `DeviceEntry.config_entries`
+    (2027.10), the climate / water heater temperature properties (2027.11,
+    now provided under both the old and the `native_*` names) and the
+    remove-and-re-add path on an entity-id rename (2027.11, entities now
+    implement `async_entity_id_changed`). All four work on 2026.1 as well.
+    `tools/core_canary.py` runs the integration on a real core against the
+    simulator - entry loads, entities get state, a command makes the round
+    trip - and fails on any deprecation core reports; CI runs it weekly on
+    the current core and on the beta of the next one.
+  - *A command is acknowledged only by its own acknowledgement.* The client
+    follows the gateway's frame counter, so the gateway's next status report
+    carries the same number as our next command. A report from ANY other
+    sub-device that arrived first closed the wait: the command counted as
+    accepted even when the gateway had dropped it, the display stayed "off"
+    and the lamp stayed on. A command to a sub-device now needs a real reply;
+    a missing one takes the existing "keep the value, verify later" path. A
+    late reply to a status query is used instead of being thrown away.
+  - *A motion sensor no longer fires on a battery report.* With a reset timer
+    the trigger value stayed in the device cache and came back with every
+    unrelated report of that device - a fake motion event, automations
+    included. The reset now clears it from the device and protocol caches.
+  - *The log cannot fill the disk.* home-assistant.log is rotated at startup
+    only. Repeats are now remembered per device (not per connection object,
+    which is rebuilt on every attempt), numbers in the text do not make a
+    message new, errors and tracebacks are de-duplicated like warnings, a
+    recovery makes the next outage loud again, and no device writes more than
+    30 non-debug lines an hour whatever happens. An exception while parsing a
+    device report is contained in the entity (logged once, state still
+    written) instead of a traceback from core on every push. Oddly shaped but
+    correctly signed JSON from a device is ignored quietly. Turning the debug
+    switch off lowers the logger again. The availability journal de-duplicates
+    alternating events and is capped at 20 lines per device per hour.
+  - *Nothing gives up for good.* Discovery keeps retrying forever (it stopped
+    after 30 attempts, or after a failed first bind, until the next restart);
+    an address frozen for flapping thaws after a day; a connect task that
+    finished without clearing its reference no longer blocks recovery; closing
+    a connection cannot cancel the caller; the 3.5 frame counter wraps at 32
+    bits instead of failing every send.
+  - *Clocks.* Cloud token and device-list ages and time-based cover travel use
+    the monotonic clock: a wall clock corrected by NTP after boot left the
+    token "valid" for years or snapped a curtain to 0/100. A cloud answer
+    "token invalid" now drops the token.
+  - *Platforms survive odd values:* text on a numeric sensor, a non-string
+    colour mode, zero-width ranges, a string brightness, an enum fan speed
+    (warned once, not on every push), a water heater stuck at "Off".
+  - *Smaller ones:* a device that never came up shows `unavailable` once the
+    startup window is over, instead of staying `unknown` for good (entities
+    only write state on a device signal, and such a device never gave one);
+    a 3.3 device re-paired in the app is sent for its new key like 3.4/3.5; a broadcast without an address no longer raises on every
+    packet, and a product-key change needs the same confirmations as an
+    address; diagnostics never spend cloud quota; a failed re-read of the IR
+    codes file refuses to save instead of wiping every other remote; a stale
+    "gateway down" notification is cleared on reload; interval polling timers
+    are not leaked.
 - A LocalTuya entry can be taken over from the UI, while Home Assistant
   runs. With LocalTuya installed, adding BMS Integration offers «Перенести
   запись из LocalTuya»: the new entry gets the old entry's data and, before

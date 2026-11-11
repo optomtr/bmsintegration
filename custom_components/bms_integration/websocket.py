@@ -52,6 +52,7 @@ from .coordinator import (
     TuyaDevice,
 )
 from .panel import DATA_LOG_BUFFER
+from .registry_compat import device_by_identifier
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -135,8 +136,10 @@ def ws_assign_area(hass: HomeAssistant, connection, msg: dict) -> None:
     from homeassistant.helpers import area_registry as ar
 
     dev_reg = dr.async_get(hass)
-    registry_device = dev_reg.async_get_device(
-        identifiers={(DOMAIN, f"local_{msg['device_id']}")}
+    # Записи под рукой нет: идентификатор содержит домен интеграции, так что
+    # первое совпадение по всем записям - наше устройство.
+    registry_device = device_by_identifier(
+        dev_reg, (DOMAIN, f"local_{msg['device_id']}")
     )
     if registry_device is None:
         connection.send_error(
@@ -754,8 +757,8 @@ def _device_rows(
                     else "устройство не создано — проверьте конфигурацию записи"
                 )
 
-            registry_device = dev_reg.async_get_device(
-                identifiers={(DOMAIN, f"local_{dev_id}")}
+            registry_device = device_by_identifier(
+                dev_reg, (DOMAIN, f"local_{dev_id}"), entry_id
             )
             entities = []
             if registry_device is not None:

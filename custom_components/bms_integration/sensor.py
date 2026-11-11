@@ -3,6 +3,7 @@
 import logging
 import base64
 import binascii
+import math
 from functools import partial
 from .config_flow import col_to_select
 
@@ -46,6 +47,23 @@ def _restored_value(state: str):
     return int(number) if number.is_integer() and "." not in str(state) else number
 
 DEFAULT_PRECISION = 2
+
+# Классы устройства, у которых ядро НЕ ждёт число (sensor/const.py,
+# NON_NUMERIC_DEVICE_CLASSES).
+NON_NUMERIC_DEVICE_CLASSES = ("date", "enum", "timestamp", "uptime")
+
+
+def _is_finite_number(value) -> bool:
+    """Примет ли ядро значение как число - тем же разбором, что и ядро."""
+    if isinstance(value, (int, float)):
+        return math.isfinite(value)
+    if not isinstance(value, str):
+        return False
+    try:
+        number = float(value)
+    except ValueError:
+        return False
+    return math.isfinite(number)
 
 ATTR_POWER = "power"
 ATTR_VOLTAGE = "voltage"
@@ -94,7 +112,32 @@ class LocalTuyaSensor(LocalTuyaEntity, SensorEntity):
     @property
     def native_value(self):
         """Return sensor state."""
-        return self._state
+        state = self._state
+        if state is not None and self._numeric_expected() and not _is_finite_number(state):
+            # С единицей, классом состояния или числовым классом устройства
+            # ядро требует число и на "", "error", "nan", "inf" бросает
+            # ValueError - при КАЖДОЙ записи состояния, пока прибор шлёт
+            # такое (а прошивки шлют его на старте и при обрыве датчика).
+            # Такое значение - не показание: «неизвестно».
+            return None
+        return state
+
+    def _numeric_expected(self) -> bool:
+        """Ждёт ли ядро у этого датчика число (sensor/entity.py,
+        _numeric_state_expected): те же проверки в том же порядке."""
+        device_class = self.device_class
+        if device_class in NON_NUMERIC_DEVICE_CLASSES:
+            return False
+        if self.state_class is not None or self.native_unit_of_measurement is not None:
+            return True
+        if not device_class:
+            return False
+        # Свой (не из ядра) класс устройства ядро сводит к None - числа не ждёт.
+        try:
+            SensorDeviceClass(device_class)
+        except ValueError:
+            return False
+        return True
 
     @property
     def state_class(self) -> str | None:

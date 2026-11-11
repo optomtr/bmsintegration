@@ -6,6 +6,7 @@ from functools import partial
 import voluptuous as vol
 from homeassistant.components import persistent_notification
 from homeassistant.components.button import DOMAIN, ButtonEntity
+from homeassistant.core import callback
 from homeassistant.const import (
     CONF_DEVICES,
     CONF_ENTITIES,
@@ -90,6 +91,24 @@ class CoverCalibrateButton(ButtonEntity):
             ),
             None,
         )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Калибровка не переживает кнопку.
+
+        Иначе после перезагрузки записи она до 240 с гоняла шторы от имени
+        снятой сущности, а в конце переписывала запись конфигурации - поверх
+        того, что успела записать новая.
+        """
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+        await super().async_will_remove_from_hass()
+
+    @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Переименование - на месте, калибровка не прерывается (см. entity.py)."""
+        parent = getattr(super(), "async_entity_id_changed", None)
+        if parent is not None:
+            parent(old_entity_id)
 
     async def async_press(self) -> None:
         # Калибровка идёт десятки секунд. Нажатие не держит: результат

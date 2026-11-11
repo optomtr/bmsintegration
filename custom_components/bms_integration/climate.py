@@ -31,6 +31,7 @@ from homeassistant.const import (
     PRECISION_WHOLE,
     UnitOfTemperature,
 )
+from homeassistant.core import callback
 from homeassistant.util.unit_system import US_CUSTOMARY_SYSTEM
 from .entity import LocalTuyaEntity, async_setup_entry
 from .const import (
@@ -339,10 +340,22 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
         """Return the precision of the system."""
         return self._precision
 
+    # Имена температур - парами. Ядро 2026.11 объявило прежние имена
+    # (temperature_unit, current_temperature, target_temperature) устаревшими
+    # и в 2027.11 перестанет их читать; ядро 2026.1, которое стоит на
+    # объектах, знает только их. Смысл тот же - значение в единице прибора,
+    # перевод делает ядро. Класс, у которого есть оба имени, ядро 2026.11
+    # читает по native_ и не ругает (helpers/deprecation.py,
+    # migrate_deprecated_entity_members); 2026.1 читает прежнее имя.
     @property
-    def temperature_unit(self):
+    def native_temperature_unit(self):
         """Return the unit of measurement used by the platform."""
         return self._temperature_unit
+
+    @property
+    def temperature_unit(self):
+        """Return the unit of measurement used by the platform (ядро до 2026.11)."""
+        return self.native_temperature_unit
 
     @property
     def min_temp(self):
@@ -445,14 +458,24 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
         return presets
 
     @property
-    def current_temperature(self):
+    def native_current_temperature(self):
         """Return the current temperature."""
         return self._current_temperature
 
     @property
-    def target_temperature(self):
+    def current_temperature(self):
+        """Return the current temperature (ядро до 2026.11)."""
+        return self.native_current_temperature
+
+    @property
+    def native_target_temperature(self):
         """Return the temperature we try to reach."""
         return self._target_temperature
+
+    @property
+    def target_temperature(self):
+        """Return the temperature we try to reach (ядро до 2026.11)."""
+        return self.native_target_temperature
 
     @property
     def target_temperature_step(self):
@@ -730,6 +753,22 @@ class LocalTuyaClimate(LocalTuyaEntity, ClimateEntity):
 
     def _start_seed(self, value: float) -> None:
         self._seed_task = self.hass.async_create_task(self._async_seed_target(value))
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Толчок и досылка уставки не переживают сущность.
+
+        После перезагрузки записи они продолжали слать команды кондиционеру
+        от имени снятой сущности - вперемешку с командами новой.
+        """
+        for task in (self._nudge_task, self._seed_task):
+            if task is not None and not task.done():
+                task.cancel()
+        await super().async_will_remove_from_hass()
+
+    @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Переименование - на месте: задачи с entity_id не связаны (см. entity.py)."""
+        super().async_entity_id_changed(old_entity_id)
 
     def _restored_target(self) -> float | None:
         """Уставка, с которой термостат остался в Home Assistant до перезапуска."""

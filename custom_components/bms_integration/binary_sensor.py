@@ -24,10 +24,13 @@ CONF_STATE_OFF = "state_off"
 _LOGGER = logging.getLogger(__name__)
 
 
+DEFAULT_STATE_ON = "true,1,pir,on"
+
+
 def flow_schema(dps):
     """Return schema used in config flow."""
     return {
-        vol.Required(CONF_STATE_ON, default="true,1,pir,on"): str,
+        vol.Required(CONF_STATE_ON, default=DEFAULT_STATE_ON): str,
         # vol.Required(CONF_STATE_OFF, default="False"): str,
         vol.Optional(CONF_DEVICE_CLASS): DEVICE_CLASSES_SCHEMA,
         vol.Optional(CONF_RESET_TIMER, default=0): NumberSelector(
@@ -63,6 +66,15 @@ class LocalTuyaBinarySensor(LocalTuyaEntity, BinarySensorEntity):
         self.async_on_remove(self._cancel_reset_timer)
 
     @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Переименование - на месте (см. entity.py).
+
+        Снятие сущности при переименовании отменяло таймер сброса: датчик
+        движения оставался «сработал» до следующего движения.
+        """
+        super().async_entity_id_changed(old_entity_id)
+
+    @callback
     def _cancel_reset_timer(self) -> None:
         """Cancel a pending off-timer, if any."""
         if self._reset_timer_interval is not None:
@@ -88,7 +100,10 @@ class LocalTuyaBinarySensor(LocalTuyaEntity, BinarySensorEntity):
 
         state = str(raw).lower()
         # users may set wrong on states, But we assume that must devices use this on states.
-        if state in self._config[CONF_STATE_ON].lower().split(","):
+        # .get с тем же умолчанием, что в форме: у сущности из старой или
+        # правленной руками записи ключа может не быть, а KeyError здесь - это
+        # ошибка в журнале на каждый отчёт устройства.
+        if state in self._config.get(CONF_STATE_ON, DEFAULT_STATE_ON).lower().split(","):
             self._is_on = True
         else:
             self._is_on = False
@@ -105,6 +120,9 @@ class LocalTuyaBinarySensor(LocalTuyaEntity, BinarySensorEntity):
                 # restored ATTR_STATE. Removing the key makes the next
                 # identical trigger from the device count as a change again.
                 self._status.pop(self._dp_id, None)
+                # И из кэшей устройства: наша копия статуса заменяется его
+                # полным кэшем при каждом отчёте (см. TuyaDevice.forget_dp).
+                self._device.forget_dp(self._dp_id)
                 self._is_on = False
                 self.async_write_ha_state()
 

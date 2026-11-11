@@ -26,11 +26,16 @@ from homeassistant.components.remote import (
 from homeassistant.components import persistent_notification
 from homeassistant.const import STATE_OFF
 from homeassistant.core import ServiceCall, State, callback, HomeAssistant
-from homeassistant.exceptions import ServiceValidationError, NoEntitySpecifiedError
+from homeassistant.exceptions import (
+    HomeAssistantError,
+    NoEntitySpecifiedError,
+    ServiceValidationError,
+)
 from homeassistant.helpers.storage import Store
 
 from .entity import LocalTuyaEntity, async_setup_entry
 from .const import CONF_RECEIVE_DP, CONF_KEY_STUDY_DP, DATA_REMOTE_ENTITIES, DOMAIN
+from .replace import IR_CODES_STORAGE_LOCK
 
 NSDP_CONTROL = "control"  # The control commands
 NSDP_TYPE = "type"  # The identifier of an IR library
@@ -95,8 +100,10 @@ SOTRAGE_KEY = "bms_integration_remotes_codes"
 
 # Every remote entity writes the SAME storage file from its own in-memory
 # snapshot. Serialize those read-modify-write cycles so two remotes learning
-# codes cannot overwrite each other's commands with a stale snapshot.
-_CODES_STORAGE_LOCK = asyncio.Lock()
+# codes cannot overwrite each other's commands with a stale snapshot. The lock
+# is shared with replace.py, which moves a replaced remote's codes in the same
+# file.
+_CODES_STORAGE_LOCK = IR_CODES_STORAGE_LOCK
 
 
 def flow_schema(dps):
@@ -456,8 +463,15 @@ class LocalTuyaRemote(LocalTuyaEntity, RemoteEntity):
             try:
                 stored = await self._codes_storage.async_load() or {}
             except Exception as ex:  # pylint: disable=broad-except
+                # Saving on top of an empty dict here used to wipe every other
+                # remote's learned codes for good: one unreadable moment of the
+                # shared file cost the whole house its IR commands. Refuse the
+                # write instead; the file on disk is still intact.
                 self.debug(f"Failed to re-read the codes storage: {ex}")
-                stored = {}
+                raise HomeAssistantError(
+                    "Не удалось прочитать файл ИК-кодов, изменение не сохранено, "
+                    "чтобы не стереть коды других пультов. Повторите позже."
+                ) from ex
 
             stored[self._device_id] = self._codes.get(self._device_id, {})
             # Keep in sync with what is now on disk.

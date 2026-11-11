@@ -52,6 +52,30 @@ class FakeRegistry:
         return self.known[ident]
 
 
+class NewCoreRegistry(FakeRegistry):
+    """Реестр ядра 2026.9+: идентификатор уникален в пределах записи.
+
+    async_get_device в 2027.8 уберут - здесь его уже нет, чтобы тест поймал
+    обращение к нему.
+    """
+
+    def __init__(self, known=(), entry_id="entry-1"):
+        super().__init__(known)
+        self.entry_id = entry_id
+        self.asked_entries = []
+
+    def __getattribute__(self, name):
+        if name == "async_get_device":
+            raise AttributeError(name)
+        return super().__getattribute__(name)
+
+    def async_get_devices(self, *, identifiers=None, connections=None, config_entry_id=None):
+        self.asked_entries.append(config_entry_id)
+        if config_entry_id not in (None, self.entry_id):
+            return []
+        return [self.known[i] for i in identifiers or () if i in self.known]
+
+
 def config(dev_id, name="Лампа", model="TS0505"):
     return const_mod.DeviceConfig(
         {
@@ -187,6 +211,36 @@ class TheParentIsSetTheNewWay(unittest.TestCase):
         """В 2027.8 ключ уберут; импорт константы - признак, что он где-то жив."""
         with open(entity_mod.__file__, encoding="utf-8") as fh:
             self.assertNotIn("ATTR_VIA_DEVICE", fh.read())
+
+
+class BothRegistryCoresAreServed(unittest.TestCase):
+    """Поиск шлюза идёт через registry_compat: старое ядро - async_get_device,
+    новое - async_get_devices в пределах своей записи конфигурации."""
+
+    def test_old_core_path(self):
+        gateway = FakeDevice("gw1")
+        child = FakeDevice("lamp1", gateway=gateway)
+        info = device_info_of(child, FakeRegistry(known=[(DOMAIN, "local_gw1")]))
+        self.assertEqual(info.get("via_device_id"), "reg-local_gw1")
+
+    def test_new_core_path_searches_our_own_entry(self):
+        gateway = FakeDevice("gw1")
+        child = FakeDevice("lamp1", gateway=gateway)
+        child._entry = Entry()
+        registry = NewCoreRegistry(known=[(DOMAIN, "local_gw1")])
+
+        info = device_info_of(child, registry)
+
+        self.assertEqual(info.get("via_device_id"), "reg-local_gw1")
+        self.assertEqual(registry.asked_entries, ["entry-1"])
+
+    def test_new_core_does_not_borrow_a_gateway_from_another_entry(self):
+        gateway = FakeDevice("gw1")
+        child = FakeDevice("lamp1", gateway=gateway)
+        child._entry = Entry()
+        registry = NewCoreRegistry(known=[(DOMAIN, "local_gw1")], entry_id="other")
+
+        self.assertNotIn("via_device_id", device_info_of(child, registry))
 
 
 class GatewaysAreRegisteredUpFront(unittest.TestCase):

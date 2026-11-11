@@ -191,7 +191,10 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
         self._open_cmd = commands_set.split("_")[0]
         self._close_cmd = commands_set.split("_")[1]
         self._stop_cmd = commands_set.split("_")[2]
-        self._timer_start = time.time()
+        # Часы хода - монотонные: системное время на коробке без батарейки
+        # часов прыгает при синхронизации NTP после загрузки, и положение
+        # шторы по времени срывалось в 0 или 100.
+        self._timer_start = time.monotonic()
         self._state = None
         self._previous_state = None
         self._current_cover_position = 0
@@ -274,7 +277,7 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
         supported_features = CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE
         if not isinstance(self._open_cmd, bool):
             supported_features |= CoverEntityFeature.STOP
-            if self._config[CONF_POSITIONING_MODE] != MODE_NONE:
+            if self._config.get(CONF_POSITIONING_MODE, DEF_POS_MODE) != MODE_NONE:
                 supported_features |= CoverEntityFeature.SET_POSITION
         return supported_features
 
@@ -312,7 +315,7 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
         """Return current cover position in percent."""
         if (sensor_state := self._gate_sensor_state) is not None:
             return 100 if sensor_state == "opened" else 0
-        if self._config[CONF_POSITIONING_MODE] == MODE_NONE:
+        if self._config.get(CONF_POSITIONING_MODE, DEF_POS_MODE) == MODE_NONE:
             return None
         return self._current_cover_position
 
@@ -339,7 +342,7 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
             return False
         if isinstance(self._open_cmd, bool):
             return self._current_cover_position == 0
-        if self._config[CONF_POSITIONING_MODE] == MODE_NONE:
+        if self._config.get(CONF_POSITIONING_MODE, DEF_POS_MODE) == MODE_NONE:
             return None
         return self.current_cover_position == 0 and self._current_state == STATE_STOPPED
 
@@ -350,12 +353,12 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
             await self.async_stop_cover()
 
         self.debug("Setting cover position: %r", kwargs[ATTR_POSITION])
-        if self._config[CONF_POSITIONING_MODE] == MODE_TIME_BASED:
+        if self._config.get(CONF_POSITIONING_MODE, DEF_POS_MODE) == MODE_TIME_BASED:
             newpos = float(kwargs[ATTR_POSITION])
 
             currpos = self.current_cover_position
             posdiff = abs(newpos - currpos)
-            mydelay = posdiff / 100.0 * self._config[CONF_SPAN_TIME]
+            mydelay = posdiff / 100.0 * self._config.get(CONF_SPAN_TIME, DEFAULT_SPAN_TIME)
             if newpos > currpos:
                 self.debug("Opening to %f: delay %f", newpos, mydelay)
                 await self.async_open_cover(delay=mydelay)
@@ -366,7 +369,7 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
                 self.update_state(STATE_CLOSING)
             self.debug("Done")
 
-        elif self._config[CONF_POSITIONING_MODE] == MODE_SET_POSITION:
+        elif self._config.get(CONF_POSITIONING_MODE, DEF_POS_MODE) == MODE_SET_POSITION:
             converted_position = position_to_device(
                 int(kwargs[ATTR_POSITION]), self._config
             )
@@ -388,6 +391,15 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
             self._current_task.cancel()
             self._current_task = None
         await super().async_will_remove_from_hass()
+
+    @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Переименование - на месте (см. entity.py).
+
+        Снятие сущности при переименовании отменяло таймер остановки: штора,
+        посланная «на 50 %» по времени, уезжала до упора.
+        """
+        super().async_entity_id_changed(old_entity_id)
 
     def _clear_own_task(self):
         """Drop the task reference only if it still points at this task.
@@ -414,7 +426,7 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
         """Open the cover."""
         self.debug("Launching command %s to cover ", self._open_cmd)
         await self._device.set_dp(self._open_cmd, self._dp_id)
-        if self._config[CONF_POSITIONING_MODE] == MODE_TIME_BASED:
+        if self._config.get(CONF_POSITIONING_MODE, DEF_POS_MODE) == MODE_TIME_BASED:
             if self._current_task is not None:
                 self._current_task.cancel()
             # for timed positioning, stop the cover after a full opening timespan
@@ -422,7 +434,7 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
             self._current_task = self.hass.async_create_task(
                 self.async_stop_after_timeout(
                     kwargs.get(
-                        "delay", self._config[CONF_SPAN_TIME] + COVER_TIMEOUT_TOLERANCE
+                        "delay", self._config.get(CONF_SPAN_TIME, DEFAULT_SPAN_TIME) + COVER_TIMEOUT_TOLERANCE
                     )
                 )
             )
@@ -432,7 +444,7 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
         """Close cover."""
         self.debug("Launching command %s to cover ", self._close_cmd)
         await self._device.set_dp(self._close_cmd, self._dp_id)
-        if self._config[CONF_POSITIONING_MODE] == MODE_TIME_BASED:
+        if self._config.get(CONF_POSITIONING_MODE, DEF_POS_MODE) == MODE_TIME_BASED:
             if self._current_task is not None:
                 self._current_task.cancel()
             # for timed positioning, stop the cover after a full opening timespan
@@ -440,7 +452,7 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
             self._current_task = self.hass.async_create_task(
                 self.async_stop_after_timeout(
                     kwargs.get(
-                        "delay", self._config[CONF_SPAN_TIME] + COVER_TIMEOUT_TOLERANCE
+                        "delay", self._config.get(CONF_SPAN_TIME, DEFAULT_SPAN_TIME) + COVER_TIMEOUT_TOLERANCE
                     )
                 )
             )
@@ -613,7 +625,7 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
 
     def status_restored(self, stored_state):
         """Restore the last stored cover status."""
-        if self._config[CONF_POSITIONING_MODE] == MODE_TIME_BASED:
+        if self._config.get(CONF_POSITIONING_MODE, DEF_POS_MODE) == MODE_TIME_BASED:
             stored_pos = stored_state.attributes.get("current_position")
             if stored_pos is not None:
                 self._current_cover_position = stored_pos
@@ -685,8 +697,11 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
                         curr_pos, self._config
                     )
 
+        # .get с тем же значением по умолчанию, что у формы настроек: у
+        # сущности, правленной руками или перенесённой, ключа может не быть, и
+        # [] бросал KeyError на каждом отчёте и в supported_features.
         if (
-            self._config[CONF_POSITIONING_MODE] == MODE_TIME_BASED
+            self._config.get(CONF_POSITIONING_MODE, DEF_POS_MODE) == MODE_TIME_BASED
             and self._state != self._previous_state
         ):
             if self._previous_state is None or self._device.is_connecting:
@@ -697,8 +712,8 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
                 self.debug("Skipping the time-based estimate on the first status")
             elif self._previous_state != self._stop_cmd:
                 # the state has changed, and the cover was moving
-                time_diff = time.time() - self._timer_start
-                pos_diff = round(time_diff / self._config[CONF_SPAN_TIME] * 100.0)
+                time_diff = time.monotonic() - self._timer_start
+                pos_diff = round(time_diff / self._config.get(CONF_SPAN_TIME, DEFAULT_SPAN_TIME) * 100.0)
                 if self._previous_state == self._close_cmd:
                     pos_diff = -pos_diff
                 self._current_cover_position = min(
@@ -714,7 +729,7 @@ class LocalTuyaCover(LocalTuyaEntity, CoverEntity):
                 )
 
             # store the time of the last movement change
-            self._timer_start = time.time()
+            self._timer_start = time.monotonic()
 
         # Keep record in last_state as long as not during connection/re-connection,
         # as last state will be used to restore the previous state

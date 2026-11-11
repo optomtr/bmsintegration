@@ -27,6 +27,7 @@ from homeassistant.const import (
     PRECISION_HALVES,
     PRECISION_TENTHS,
     PRECISION_WHOLE,
+    STATE_ON,
     UnitOfTemperature,
 )
 from .entity import LocalTuyaEntity, async_setup_entry
@@ -106,7 +107,9 @@ class LocalTuyaWaterHeater(LocalTuyaEntity, WaterHeaterEntity):
     """Tuya WaterHeater device."""
 
     _enable_turn_on_off_backwards_compatibility = False
-    _attr_current_operation = False
+    # None - «неизвестно», пока прибор не сообщил состояние. Было False: это
+    # не режим, и ядро показывало его строкой.
+    _attr_current_operation = None
 
     def __init__(
         self,
@@ -120,6 +123,8 @@ class LocalTuyaWaterHeater(LocalTuyaEntity, WaterHeaterEntity):
         self._state = None
         self._target_temperature = None
         self._current_temperature = None
+        self._target_temperature_high = None
+        self._target_temperature_low = None
         self._dp_mode = self._config.get(CONF_MODE_DP, None)
 
         self._available_modes = DictSelector(self._config.get(CONF_MODES, {}))
@@ -147,10 +152,22 @@ class LocalTuyaWaterHeater(LocalTuyaEntity, WaterHeaterEntity):
         """Return the precision of the system."""
         return self._precision
 
+    # Имена температур - парами. Ядро 2026.11 объявило прежние имена
+    # (temperature_unit, current_temperature, target_temperature*)
+    # устаревшими и в 2027.11 перестанет их читать; ядро 2026.1, которое
+    # стоит на объектах, знает только их. Смысл тот же - значение в единице
+    # прибора, перевод делает ядро. Класс, у которого есть оба имени, ядро
+    # 2026.11 читает по native_ и не ругает (helpers/deprecation.py,
+    # migrate_deprecated_entity_members); 2026.1 читает прежнее имя.
     @property
-    def temperature_unit(self):
+    def native_temperature_unit(self):
         """Return the unit of measurement used by the platform."""
         return config_unit(self._config.get(CONF_TEMPERATURE_UNIT))
+
+    @property
+    def temperature_unit(self):
+        """Return the unit of measurement used by the platform (ядро до 2026.11)."""
+        return self.native_temperature_unit
 
     @property
     def min_temp(self):
@@ -168,24 +185,46 @@ class LocalTuyaWaterHeater(LocalTuyaEntity, WaterHeaterEntity):
         return self._available_modes.names + [OFF_MODE]
 
     @property
-    def current_temperature(self):
+    def native_current_temperature(self):
         """Return the current temperature."""
         return self._current_temperature
 
     @property
-    def target_temperature(self):
+    def current_temperature(self):
+        """Return the current temperature (ядро до 2026.11)."""
+        return self.native_current_temperature
+
+    @property
+    def native_target_temperature(self):
         """Return the temperature we try to reach."""
         return self._target_temperature
 
     @property
-    def target_temperature_high(self) -> float | None:
+    def target_temperature(self):
+        """Return the temperature we try to reach (ядро до 2026.11)."""
+        return self.native_target_temperature
+
+    # Свои поля, а не _attr_target_temperature_high/_low: в 2026.11 запись в
+    # них - обращение к устаревшему имени, о котором ядро сообщает в журнал.
+    @property
+    def native_target_temperature_high(self) -> float | None:
         """Return the highbound target temperature we try to reach."""
-        return self._attr_target_temperature_high
+        return self._target_temperature_high
+
+    @property
+    def target_temperature_high(self) -> float | None:
+        """Return the highbound target temperature (ядро до 2026.11)."""
+        return self.native_target_temperature_high
+
+    @property
+    def native_target_temperature_low(self) -> float | None:
+        """Return the lowbound target temperature we try to reach."""
+        return self._target_temperature_low
 
     @property
     def target_temperature_low(self) -> float | None:
-        """Return the lowbound target temperature we try to reach."""
-        return self._attr_target_temperature_low
+        """Return the lowbound target temperature (ядро до 2026.11)."""
+        return self.native_target_temperature_low
 
     async def async_set_temperature(self, **kwargs):
         """Set new target temperature."""
@@ -247,16 +286,21 @@ class LocalTuyaWaterHeater(LocalTuyaEntity, WaterHeaterEntity):
             self._attr_current_operation = OFF_MODE
         elif self._dp_mode is not None and (mode := self.dp_value(CONF_MODE_DP)):
             self._attr_current_operation = self._available_modes.to_ha(mode)
+        elif self._attr_current_operation in (OFF_MODE, None):
+            # Включён, а режима не знаем: датапоинта режима нет в настройках
+            # или прибор его ещё не прислал. Раньше здесь оставалось «Off» от
+            # прошлого выключения - навсегда, пока нагреватель работал.
+            self._attr_current_operation = STATE_ON
 
         if (
             target_high := self.dp_value(CONF_TARGET_TEMPERATURE_HIGH_DP)
         ) or target_high is not None:
-            self._attr_target_temperature_high = target_high
+            self._target_temperature_high = target_high
 
         if (
             target_low := self.dp_value(CONF_TARGET_TEMPERATURE_LOW_DP)
         ) or target_low is not None:
-            self._attr_target_temperature_low = target_low
+            self._target_temperature_low = target_low
 
 
 async_setup_entry = partial(
