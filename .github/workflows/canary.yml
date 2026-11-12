@@ -37,4 +37,7 @@ jobs:
           fi
           "$RUNNER_TEMP/ha/bin/hass" --version
       - name: Run the integration on this core
-        run: python3 tools/core_canary.py --hass "$RUNNER_TEMP/ha/bin/hass"
+        # With the environment's own Python: the device simulator needs the
+        # `cryptography` package, which core brings with it.
+        run: |
+          "$RUNNER_TEMP/ha/bin/python" tools/core_canary.py --hass "$RUNNER_TEMP/ha/bin/hass"
